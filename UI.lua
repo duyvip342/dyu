@@ -196,6 +196,28 @@ do
         if launchConfig then upgrade.setSelection(initial) end
         createToggle(event, "auto pumpkin upgrade", "EventAutoPumpkinUpgrade")
     end
+
+    -- Chọn boost dùng tự động trong Pumpkin Tycoon.
+    local boost = features.EventAutoEquipBoost
+    if boost then
+        local options, initial = boost.getOptions(), {}
+        local preset = launchConfig and launchConfig.boosts
+        if type(preset) == "table" then
+            for _, name in ipairs(options) do
+                if table.find(preset, name) then table.insert(initial, name) end
+            end
+        end
+        event:CreateDropdown({
+            name = "Boosts",
+            flag = "EventBoostSelection",
+            options = options,
+            multiSelect = true,
+            value = initial,
+            callback = boost.setSelection,
+        })
+        if launchConfig then boost.setSelection(initial) end
+        createToggle(event, "auto equip boost", "EventAutoEquipBoost")
+    end
 end
 
 -- Tạo giao diện cho các tính năng farm.
