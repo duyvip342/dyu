@@ -202,7 +202,9 @@ do
     if boost then
         local options, initial = boost.getOptions(), {}
         local preset = launchConfig and launchConfig.boosts
-        if type(preset) == "table" then
+        if boost.resolveSelection then
+            initial = boost.resolveSelection(preset)
+        elseif type(preset) == "table" then
             for _, name in ipairs(options) do
                 if table.find(preset, name) then table.insert(initial, name) end
             end
