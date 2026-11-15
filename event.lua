@@ -712,12 +712,12 @@ do
     local owners = {}
     local original = setmetatable({}, { __mode = "k" })
     local invisible = NumberSequence.new(1)
+    local watched = {}
+    local queue, first, last = {}, 1, 0
     local protectedGeometry = {
-        ground = true,
         paths = true,
         breaks_zones = true,
         break_zones = true,
-        shorefill = true,
         safety_net = true,
         interactable = true,
         spawnposition = true,
@@ -748,7 +748,7 @@ do
     end
 
     -- Giữ viền farm, nút thưởng và các part mở khóa.
-    local function hideVisual(object, scope, hideScenery, debrisPosition)
+    local function hideVisual(object, scope, mode, debrisPosition)
         local isPart = object:IsA("BasePart")
         local isSurface = object:IsA("Decal") or object:IsA("Texture")
         local isParticle = object:IsA("ParticleEmitter")
@@ -758,7 +758,7 @@ do
             or object:IsA("Sparkles") or object:IsA("Highlight")
         if not (isPart or isSurface or isEffect or isExplosion) then return end
 
-        local keepGeometry = not hideScenery
+        local keepGeometry = mode ~= "scenery"
         local debrisPart
         local parent = object
         while parent and parent ~= scope do
@@ -770,13 +770,16 @@ do
                 return
             end
             if protectedGeometry[name] then keepGeometry = true end
-            if debrisPosition and not debrisPart and parent:IsA("BasePart") then debrisPart = parent end
+            if mode == "breakers" and parent.Parent == scope
+                and parent:GetAttribute("ParentID") ~= instanceId then return end
+            if mode == "debris" and not debrisPart and parent:IsA("BasePart") then debrisPart = parent end
             parent = parent.Parent
         end
 
-        if debrisPosition then
+        if mode == "debris" then
             local position = isExplosion and object.Position or (debrisPart and debrisPart.Position)
-            if not (isEffect or isExplosion) or not position or (position - debrisPosition).Magnitude > 220 then return end
+            if not (isEffect or isExplosion) or not position or not debrisPosition
+                or (position - debrisPosition).Magnitude > 220 then return end
         elseif not keepGeometry and isPart and object.Transparency < 1 then
             hideProperty(object, "LocalTransparencyModifier", 1)
         elseif not keepGeometry and isSurface then
@@ -788,33 +791,80 @@ do
         if isExplosion then hideProperty(object, "Visible", false) end
     end
 
-    -- Quét hiệu ứng mới tải trong các thư mục của sự kiện.
-    local function optimizeEvent()
+    -- Xếp object vào hàng đợi để xử lý theo ngân sách mỗi frame.
+    local function enqueue(object, scope, binding, walk)
+        last += 1
+        queue[last] = {object = object, scope = scope, binding = binding, walk = walk}
+    end
+
+    -- Gỡ listener và dọn hàng đợi khi rời sự kiện hoặc tắt tối ưu.
+    local function clearWatches()
+        for _, binding in pairs(watched) do binding.connection:Disconnect() end
+        table.clear(watched)
+        table.clear(queue)
+        first, last = 1, 0
+    end
+
+    -- Gắn listener cho từng cây map khi cây đó xuất hiện.
+    local function updateWatches()
         local instance = instancing.Get()
         if not instance or instance.instanceID ~= instanceId then
+            if next(watched) then clearWatches() end
             if next(original) then restore() end
             return
         end
-        local function scan(root, hideScenery, debrisPosition)
-            if not root then return end
-            for _, object in ipairs(root:GetDescendants()) do
-                hideVisual(object, root, hideScenery, debrisPosition)
-            end
+        local roots = {}
+        local function add(root, mode)
+            if root then roots[root] = mode end
         end
-        scan(instance.model, true)
-        scan(workspace:FindFirstChild("PumpkinTycoonIslands"), true)
+        add(instance.model, "scenery")
+        add(workspace:FindFirstChild("PumpkinTycoonIslands"), "scenery")
         local plot = tycoon.Feature("Island").Plot()
-        scan(plot and plot:GetModel(), true)
-        scan(workspace:FindFirstChild("PumpkinTycoonPumpkins"))
+        add(plot and plot:GetModel(), "scenery")
+        add(workspace:FindFirstChild("PumpkinTycoonPumpkins"), "effects")
         local things = workspace:FindFirstChild("__THINGS")
-        local breakerFolder = things and things:FindFirstChild("Breakables")
-        if breakerFolder then
-            for _, model in ipairs(breakerFolder:GetChildren()) do
-                if model:GetAttribute("ParentID") == instanceId then scan(model) end
+        add(things and things:FindFirstChild("Breakables"), "breakers")
+        add(workspace:FindFirstChild("__DEBRIS"), "debris")
+
+        for root, binding in pairs(watched) do
+            if not roots[root] then
+                binding.connection:Disconnect()
+                watched[root] = nil
             end
         end
-        local character = player.Character
-        if character then scan(workspace:FindFirstChild("__DEBRIS"), false, character:GetPivot().Position) end
+        for root, mode in pairs(roots) do
+            if not watched[root] then
+                local binding = {mode = mode}
+                watched[root] = binding
+                binding.connection = root.DescendantAdded:Connect(function(object)
+                    if watched[root] == binding then enqueue(object, root, binding, false) end
+                end)
+                enqueue(root, root, binding, true)
+            end
+        end
+    end
+
+    -- Dàn lượt quét đầu ra nhiều frame rồi chỉ xử lý object mới.
+    local function processQueue()
+        local deadline = os.clock() + 0.002
+        local rootPart = player.Character and player.Character.PrimaryPart
+        local position = rootPart and rootPart.Position
+        for _ = 1, 100 do
+            if first > last or os.clock() >= deadline then break end
+            local entry = queue[first]
+            queue[first] = nil
+            first += 1
+            local object, scope = entry.object, entry.scope
+            if watched[scope] == entry.binding and (object == scope or object:IsDescendantOf(scope)) then
+                if object ~= scope then hideVisual(object, scope, entry.binding.mode, position) end
+                if entry.walk then
+                    for _, child in ipairs(object:GetChildren()) do
+                        enqueue(child, scope, entry.binding, true)
+                    end
+                end
+            end
+        end
+        if first > last then first, last = 1, 0 end
     end
 
     -- Chia sẻ Optimize Event giữa toggle riêng và Stats Event.
@@ -823,14 +873,21 @@ do
         if next(owners) then
             if job then return end
             job = task.defer(function()
+                local nextWatchAt = 0
                 while true do
-                    optimizeEvent()
-                    task.wait(1)
+                    local now = os.clock()
+                    if now >= nextWatchAt then
+                        updateWatches()
+                        nextWatchAt = now + 0.25
+                    end
+                    processQueue()
+                    if first <= last then task.wait() else task.wait(0.1) end
                 end
             end)
         elseif job then
             task.cancel(job)
             job = nil
+            clearWatches()
             restore()
         end
     end
