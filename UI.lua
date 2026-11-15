@@ -274,10 +274,12 @@ do
     createToggle(mail, "Tự nhận thư", "MailAutoClaim")
     local gift = features.MailAutoGift
     if not gift then return end
+    local preset = launchConfig and launchConfig.mailGift
+    local recipient = type(preset) == "table" and type(preset.recipient) == "string" and preset.recipient or ""
     mail:CreateInput({
         name = "User Name",
         flag = "MailUserName",
-        value = "",
+        value = recipient,
         placeholder = "...",
         callback = gift.setRecipient,
     })
@@ -342,6 +344,17 @@ do
             updateGiftText()
         end,
     })
+    -- Nạp người nhận và danh sách trước khi launcher bật Auto Gift.
+    if type(preset) == "table" then
+        gift.setRecipient(recipient)
+        for _, rule in ipairs(type(preset.items) == "table" and preset.items or {}) do
+            if type(rule) == "table" then
+                local added, reason = gift.add(rule.class, rule.name, tostring(rule.amount), tostring(rule.keep))
+                if not added then warn("[Auto Gift] " .. reason) end
+            end
+        end
+        updateGiftText()
+    end
     createToggle(mail, "auto gift", "MailAutoGift")
 end
 
