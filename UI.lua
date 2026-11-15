@@ -92,7 +92,7 @@ local urls = {
     "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/optimize.lua",
     "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/mail.lua",
     "https://raw.githubusercontent.com/duyvip453/dyu/main/webhook.lua",
-    "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/event.lua",
+    "https://raw.githubusercontent.com/duyvip453/dyu/main/event.lua",
 }
 
 -- Gộp tính năng từ các module theo tên flag.
