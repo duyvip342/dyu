@@ -113,44 +113,33 @@ local function findGiftStock(inventory, rule)
     return stock, largestUid, largest
 end
 
--- Gửi một quy tắc Auto Gift theo số lượng khả dụng.
+-- Gửi đúng Amount trong một thư khi stack và phần Keep đều đủ.
 local function sendRule(rule, revision)
-    local remaining
-    while giftEnabled and revision == giftRevision do
-        local inventory, data = giftInventory()
-        if not data then break end
-        local stock, uid, stack = findGiftStock(inventory, rule)
-        local fee = mailFee(data)
-        if not uid or countDiamonds(inventory) < fee then break end
-        local isDiamonds = rule.class == "Currency" and rule.name == "Diamonds"
-        -- Trừ phần giữ lại và phí Diamonds khỏi lượng có thể gửi.
-        local available = stock - rule.keep - (isDiamonds and fee or 0)
-        if not remaining then
-            -- Chọn toàn bộ số dư khả dụng khi Keep bằng 0.
-            remaining = rule.keep == 0 and available or rule.amount
-            if remaining <= 0 or available < remaining then break end
-        end
-        local quantity = math.min(remaining, stack, available)
-        if quantity <= 0 then break end
-        if not giftEnabled or revision ~= giftRevision then break end
+    local inventory, data = giftInventory()
+    if not data then return end
+    local stock, uid, stack = findGiftStock(inventory, rule)
+    local quantity = rule.amount
+    if not uid or stack < quantity then return end
+    local fee = mailFee(data)
+    if countDiamonds(inventory) < fee then return end
+    local isDiamonds = rule.class == "Currency" and rule.name == "Diamonds"
+    local available = stock - rule.keep - (isDiamonds and fee or 0)
+    if available < quantity or not giftEnabled or revision ~= giftRevision then return end
 
-        -- Gửi thư với tham số người nhận, tiêu đề, Class, UID và số lượng.
-        local ok, accepted = pcall(net.Invoke, "EF_Relay", recipient, "", rule.class, uid, quantity)
-        if not ok or not accepted then
-            -- Kết quả lỗi có thể tới sau khi server đã xử lý thư. Chờ trước khi đọc lại kho.
-            task.wait(5)
-            return
-        end
-        remaining -= quantity
-        -- Đợi kho xác nhận trừ stack này trước khi gửi thư kế tiếp.
-        repeat
-            task.wait(0.25)
-            local live, liveData = giftInventory()
-            local entry = live[rule.class] and live[rule.class][uid]
-            if liveData and (not entry or (entry._am or 1) < stack) then break end
-        until not giftEnabled or revision ~= giftRevision
-        if remaining == 0 then break end
+    -- Chờ trước khi đọc lại kho nếu server báo gửi lỗi.
+    local ok, accepted = pcall(net.Invoke, "EF_Relay", recipient, "", rule.class, uid, quantity)
+    if not ok or not accepted then
+        task.wait(5)
+        return
     end
+
+    -- Đợi kho xác nhận trừ stack trước khi gửi thư kế tiếp.
+    repeat
+        task.wait(0.25)
+        local live, liveData = giftInventory()
+        local entry = live[rule.class] and live[rule.class][uid]
+        if liveData and (not entry or (entry._am or 1) < stack) then break end
+    until not giftEnabled or revision ~= giftRevision
 end
 
 -- Duyệt lần lượt các quy tắc gửi quà khi Auto Gift đang bật.
