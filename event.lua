@@ -694,6 +694,41 @@ do
     }
 end
 
+-- Auto Flannel Gift / Mở từng hộp Flannel Gift bằng API của game.
+do
+    local giftId = "Flannel Gift"
+    local inventory = require(client.InventoryCmds)
+    local lootboxItem = require(library.Items.LootboxItem)
+    local lootboxCmds = require(client.LootboxCmds)
+    local opening = false
+    local job
+
+    -- Chỉ lấy stack Lootbox mang đúng ID Flannel Gift.
+    local function openOne()
+        if not inventory.Container() then return 1 end
+        local matches = lootboxItem(giftId):FindAny()
+        local item = matches and matches[1]
+        if not item or item:GetId() ~= giftId or item:GetAmount() < 1 then return 1 end
+        local success = lootboxCmds.Open(item, 1)
+        return success and 1 or 3
+    end
+
+    -- Chạy một vòng mở để mỗi lần chỉ gửi một yêu cầu.
+    features.EventAutoFlannelGift = {
+        duy = function(on)
+            opening = on
+            if not on or job then return end
+            job = task.defer(function()
+                while opening do
+                    local ok, delay = pcall(openOne)
+                    task.wait(ok and delay or 3)
+                end
+                job = nil
+            end)
+        end,
+    }
+end
+
 -- Auto Equip Boost / Dùng boost đã chọn khi hiệu ứng cũ hết.
 do
     local boostUtil = require(library.Util.PumpkinTycoonBoosts)
