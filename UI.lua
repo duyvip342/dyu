@@ -385,11 +385,20 @@ end
 do
     -- Webhook chung: URL, loại thông báo và nút điều khiển.
     local petWebhook = features.WebhookEnabled
+    local petPreset = launchConfig and type(launchConfig.petWebhook) == "table" and launchConfig.petWebhook or {}
+    local initialPetUrl = type(petPreset.url) == "string" and petPreset.url or ""
+    local petOptions = petWebhook and petWebhook.getOptions() or {}
+    local initialPetEvents = {}
+    if type(petPreset.events) == "table" then
+        for _, category in ipairs(petOptions) do
+            if table.find(petPreset.events, category) then table.insert(initialPetEvents, category) end
+        end
+    end
     webhook:CreateSection({ name = "webhook" })
     webhook:CreateInput({
         name = "Webhook URL",
         flag = "WebhookUrl",
-        value = "",
+        value = initialPetUrl,
         placeholder = "Dán link webhook",
         callback = function(value)
             if petWebhook then petWebhook.setUrl(value) end
@@ -398,14 +407,19 @@ do
     webhook:CreateDropdown({
         name = "Webhook Events",
         flag = "WebhookEvents",
-        options = petWebhook and petWebhook.getOptions() or {},
+        options = petOptions,
         multiSelect = true,
-        value = {},
+        value = initialPetEvents,
         placeholder = "Chọn loại pet muốn báo",
         callback = function(values)
             if petWebhook then petWebhook.setSelection(values) end
         end,
     })
+    -- Nạp URL và loại pet trước khi launcher bật webhook.
+    if petWebhook and launchConfig then
+        petWebhook.setUrl(initialPetUrl)
+        petWebhook.setSelection(initialPetEvents)
+    end
     createToggle(webhook, "Start Webhook", "WebhookEnabled")
     webhook:CreateButton({
         name = "Test Webhook",
