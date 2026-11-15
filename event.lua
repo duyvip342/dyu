@@ -1124,6 +1124,23 @@ do
         return string.reverse((reversed:gsub("(%d%d%d)", "%1."):gsub("%.$", "")))
     end
 
+    -- Tách tên tiền và số dư để mỗi dòng tự co chữ trên mobile.
+    local function balanceRow(parent, name, y)
+        local heading = label(parent, UDim2.fromScale(0.08, y), UDim2.fromScale(0.84, 0.045), Enum.TextXAlignment.Center, 16)
+        heading.Text = name
+        local value = label(parent, UDim2.fromScale(0.08, y + 0.045), UDim2.fromScale(0.84, 0.08), Enum.TextXAlignment.Center, 24)
+        value.Text = "—"
+        for _, object in ipairs({ heading, value }) do
+            object.TextWrapped = false
+            object.TextScaled = true
+            local constraint = Instance.new("UITextSizeConstraint")
+            constraint.MinTextSize = 1
+            constraint.MaxTextSize = object.TextSize
+            constraint.Parent = object
+        end
+        return value
+    end
+
     -- Hiện thời gian chạy script theo giờ, phút và giây.
     local function uptimeText()
         local seconds = math.floor(os.clock() - scriptStartedAt)
@@ -1179,7 +1196,8 @@ do
         zoneTextSize.MinTextSize = 1
         zoneTextSize.MaxTextSize = 14
         zoneTextSize.Parent = zones
-        local balance = label(content, UDim2.fromScale(0.08, 0.30), UDim2.fromScale(0.84, 0.29), Enum.TextXAlignment.Center, 24)
+        local diamonds = balanceRow(content, "Diamonds", 0.30)
+        local coins = balanceRow(content, "Pumpkin Coins", 0.44)
         local uptime = label(content, UDim2.new(0.03, 0, 0, 58), UDim2.new(0.43, 0, 0, 40), Enum.TextXAlignment.Left, 14)
         uptime.Text = uptimeText()
         local stock = label(content, UDim2.fromScale(0.49, 0.03), UDim2.fromScale(0.48, 0.26), Enum.TextXAlignment.Right, 14)
@@ -1202,11 +1220,11 @@ do
         local nextPetsAt = 0
         local function refresh()
             uptime.Text = uptimeText()
+            diamonds.Text = formatBalance(currency.Get("Diamonds"))
+            coins.Text = formatBalance(currency.Get(tycoonTypes.COIN))
             local data = save.Get()
             if not data then return end
             zones.Text, stock.Text = eventBoostText() .. "\n\n" .. zoneText(data), stockText()
-            balance.Text = ("Diamonds\n%s\n\nPumpkin Coins\n%s"):format(
-                formatBalance(currency.Get("Diamonds")), formatBalance(currency.Get(tycoonTypes.COIN)))
             if os.clock() < nextPetsAt then return end
             nextPetsAt = os.clock() + 5
             local rows = petRows(data.Inventory and data.Inventory.Pet)
