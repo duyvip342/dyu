@@ -9,6 +9,7 @@ local tycoon = require(client.PumpkinTycoonCmds)
 local tycoonTypes = require(library.Types.PumpkinTycoon)
 local buttons = require(library.Util.PumpkinTycoonButtons)
 local customEggs = require(client.CustomEggsCmds)
+local eggs = require(client.EggCmds)
 local currency = require(client.CurrencyCmds)
 local eggPrice = require(library.Balancing.CalcEggPricePlayer)
 local network = require(client.Network)
@@ -24,6 +25,7 @@ local pressTimeout = 2
 local retryDelay = 5
 local yellowRetryDelay = 15
 local lastZone = tycoonTypes.PART1_ZONES
+local finalEggPosition = Vector3.new(7303.31689453125, 2007.86083984375, 6487.1064453125)
 local hatchGoal = 15
 local hatchInterval = 1
 local hatchCounts = {}
@@ -241,17 +243,25 @@ local function farmZone(state, zone, plotId)
 end
 
 -- Tìm trứng theo zone và tên cấu hình của game.
-local function findZoneEgg(zone)
+local function findZoneEgg(zone, nearPosition)
     local things = workspace:FindFirstChild("__THINGS")
     local folder = things and things:FindFirstChild("CustomEggs")
     if not folder then return end
     local eggName = tycoonTypes.ZONES[zone].Egg
+    local closest, closestDistance
     for _, model in ipairs(folder:GetChildren()) do
         if model:GetAttribute("ZoneNumber") == zone then
             local egg = customEggs.Get(model.Name)
-            if egg and egg._id == eggName and egg:IsHatchable() then return egg end
+            if egg and egg._id == eggName and egg:IsHatchable() then
+                if not nearPosition then return egg end
+                local distance = (egg:GetPosition() - nearPosition).Magnitude
+                if not closestDistance or distance < closestDistance then
+                    closest, closestDistance = egg, distance
+                end
+            end
         end
     end
+    return closest
 end
 
 -- Mở đúng một quả khi đủ xu và đếm lượt server xác nhận.
@@ -266,6 +276,31 @@ local function hatchOne(state, zone, egg)
     if success == true then hatchCounts[zone] = (hatchCounts[zone] or 0) + 1 end
 end
 
+-- Mở trứng zone cuối theo giới hạn hiện tại của game.
+local function hatchFinalEgg(state, egg)
+    local now = os.clock()
+    if now < state.nextHatch then return end
+    state.nextHatch = now + hatchInterval
+
+    local directory = egg:Directory()
+    local count = egg:GetMaxEggCount() or eggs.GetMaxHatch(directory)
+    if type(count) ~= "number" or count < 1 then return end
+    local price = eggPrice(directory, nil, not egg._allowChargedAndGolden)
+    if currency.CanAfford(directory.currency, price * count) then
+        network.Invoke("CustomEggs_Hatch", egg._uid, count)
+    end
+end
+
+-- Đặt HumanoidRootPart tại điểm đứng mở trứng zone cuối.
+local function moveToFinalEgg(character, root)
+    if (root.Position - finalEggPosition).Magnitude <= 3 then return false end
+    local offset = root.CFrame:ToObjectSpace(character:GetPivot())
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    character:PivotTo(CFrame.new(finalEggPosition) * root.CFrame.Rotation * offset)
+    return true
+end
+
 -- Tạm dừng mở pad trong lúc chuẩn bị đủ 15 trứng của zone.
 local function updateEvent(state, character, humanoid, root)
     local zone, slab, plotId, owned = getFarmZone()
@@ -276,7 +311,16 @@ local function updateEvent(state, character, humanoid, root)
         end
         return
     end
-    if zone and slab then
+    local finalEgg = zone == lastZone and findZoneEgg(zone, finalEggPosition)
+    if finalEgg then
+        if moveToFinalEgg(character, root) then
+            state.nextHatch = os.clock() + scanInterval
+            return
+        end
+        farmZone(state, zone, plotId)
+        hatchFinalEgg(state, finalEgg)
+        if not enabled or player.Character ~= character or not isInEvent() then return end
+    elseif zone and slab then
         local egg
         local waitingForEgg = false
         if zone < lastZone and (hatchCounts[zone] or 0) < hatchGoal then
