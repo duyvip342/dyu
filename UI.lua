@@ -155,13 +155,14 @@ local function createToggle(tab, name, flag)
         end
     end
 
-    tab:CreateToggle({
+    local control = tab:CreateToggle({
         name = name,
         flag = flag,
         value = initial,
         callback = apply,
     })
     if initial then table.insert(startupActions, function() apply(true) end) end
+    return control
 end
 
 -- 5. Cấu hình các tab
@@ -173,6 +174,11 @@ do
     createToggle(event, "auto buy pumkin", "EventAutoBuyPumpkin")
     createToggle(event, "optimize event", "EventOptimize")
     createToggle(event, "fast farm event", "EventFastFarm")
+    local stats = features.EventStatsGui
+    if stats then
+        local control = createToggle(event, "stats event", "EventStatsGui")
+        stats.setQuickClose(function() control:Set(false) end)
+    end
 
     -- Chọn các mục nâng cấp Pumpkin Tycoon.
     local upgrade = features.EventAutoPumpkinUpgrade
