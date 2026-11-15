@@ -1,5 +1,7 @@
 -- Khai báo các tính năng Event theo flag của UI.
 local features = {}
+local startedAt = ...
+local scriptStartedAt = type(startedAt) == "number" and startedAt or os.clock()
 
 local player = game:GetService("Players").LocalPlayer
 local library = game:GetService("ReplicatedStorage").Library
@@ -991,6 +993,13 @@ do
         return string.reverse((reversed:gsub("(%d%d%d)", "%1."):gsub("%.$", "")))
     end
 
+    -- Hiện thời gian chạy script theo giờ, phút và giây.
+    local function uptimeText()
+        local seconds = math.floor(os.clock() - scriptStartedAt)
+        return ("Thời gian hoạt động · %02d:%02d:%02d"):format(
+            math.floor(seconds / 3600), math.floor(seconds / 60) % 60, seconds % 60)
+    end
+
     -- Xóa overlay để chạy phần phục hồi hiển thị.
     local function stop()
         if activeGui then activeGui:Destroy() end
@@ -1035,6 +1044,8 @@ do
         local zones = label(content, UDim2.fromScale(0.03, 0.62), UDim2.fromScale(0.43, 0.35), Enum.TextXAlignment.Left, 14)
         zones.TextYAlignment = Enum.TextYAlignment.Bottom
         local balance = label(content, UDim2.fromScale(0.08, 0.30), UDim2.fromScale(0.84, 0.29), Enum.TextXAlignment.Center, 24)
+        local uptime = label(content, UDim2.new(0.03, 0, 0, 58), UDim2.new(0.43, 0, 0, 40), Enum.TextXAlignment.Left, 14)
+        uptime.Text = uptimeText()
         local stock = label(content, UDim2.fromScale(0.49, 0.03), UDim2.fromScale(0.48, 0.26), Enum.TextXAlignment.Right, 14)
         stock.TextYAlignment = Enum.TextYAlignment.Top
         local title = label(content, UDim2.fromScale(0.49, 0.59), UDim2.fromScale(0.48, 0.045), Enum.TextXAlignment.Right, 14)
@@ -1054,6 +1065,7 @@ do
         local previousRows
         local nextPetsAt = 0
         local function refresh()
+            uptime.Text = uptimeText()
             local data = save.Get()
             if not data then return end
             zones.Text, stock.Text = zoneText(data), stockText()
