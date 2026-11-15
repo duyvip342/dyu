@@ -173,6 +173,7 @@ do
     createToggle(event, "auto pumpkin", "EventAutoPumpkin")
     createToggle(event, "auto buy pumkin", "EventAutoBuyPumpkin")
     createToggle(event, "optimize event", "EventOptimize")
+    createToggle(event, "auto fannel gift", "EventAutoFlannelGift")
     createToggle(event, "fast farm event", "EventFastFarm")
     local stats = features.EventStatsGui
     if stats then
