@@ -355,10 +355,30 @@ local function findPumpkin(position)
     return target
 end
 
+-- Kiểm tra bảng My Pumpkin và nút Auto đã hiện.
+local function isMyPumpkinOpen(merchant)
+    if not merchant.IsOpen() or merchant.CurrentTab() ~= "Pumpkins" then return false end
+    local gui = merchant.Gui()
+    local frame = gui and gui:FindFirstChild("Frame")
+    local page = frame and frame:FindFirstChild("PumpkinsFrame")
+    return page and page.Visible
+end
+
+-- Mở đúng tab My Pumpkin bằng luồng mở merchant của game.
+local function openMyPumpkin(merchant)
+    if not merchant.Enabled() or not merchant.Unlocked() then return end
+    if not merchant.IsOpen() then merchant.OpenRemote() end
+    if pumpkinEnabled and isInEvent() and merchant.IsOpen() and not isMyPumpkinOpen(merchant) then
+        merchant.ShowTab("Pumpkins")
+    end
+end
+
 -- Lưu vị trí trước khi đứng cạnh bí ngô.
 local function attackPumpkin(target, character, humanoid, root)
     local original = character:GetPivot()
     local assigned = {}
+    local merchant = tycoon.Feature("Merchant")
+    local nextOpenAt = 0
     local ok, err = pcall(function()
         petCmds.EquipBest()
         while pumpkinEnabled and isInEvent() and player.Character == character
@@ -376,6 +396,12 @@ local function attackPumpkin(target, character, humanoid, root)
                 root.AssemblyLinearVelocity = Vector3.zero
                 character:PivotTo(CFrame.new(breaker.position + offset + Vector3.new(0, height, 0))
                     * root.CFrame.Rotation * rootOffset)
+            end
+            if os.clock() >= nextOpenAt then
+                nextOpenAt = os.clock() + 2
+                local opened, openError = pcall(openMyPumpkin, merchant)
+                if not opened then warn("[Auto Pumpkin] My Pumpkin: " .. tostring(openError)) end
+                if not pumpkinEnabled or not isInEvent() or player.Character ~= character then break end
             end
             local batch = {}
             for _, pet in pairs(playerPet.GetByPlayer(player) or {}) do
@@ -476,7 +502,8 @@ local function syncPumpkinSettings(state)
     end
 
     local stock = tycoon.Feature("Stock")
-    if island.Get(nil, stock.AUTO_PLACE_VAR) == false and os.clock() >= (state.retryAt.auto or 0) then
+    if island.Get(nil, stock.AUTO_PLACE_VAR) == false and os.clock() >= (state.retryAt.auto or 0)
+        and isMyPumpkinOpen(tycoon.Feature("Merchant")) then
         state.retryAt.auto = os.clock() + 2
         plot:Invoke(stock.VERB_AUTO_PLACE, true)
     end
