@@ -1017,12 +1017,29 @@ end
 -- Stats Event / Số dư, zone, kho bí ngô và pet trên nền đen.
 do
     local save = require(client.Save)
+    local boostUtil = require(library.Util.PumpkinTycoonBoosts)
     local items = require(library.Items)
     local merchant = require(library.Types.PumpkinTycoon.Merchant)
     local runService = game:GetService("RunService")
     local activeGui
     local onQuickClose
     local accent = Color3.fromRGB(255, 191, 105)
+
+    -- Hiện phần trăm hiệu lực của ba boost Pumpkin Tycoon.
+    local function eventBoostText()
+        local available = isInEvent() and boostUtil.Enabled(player)
+        local function status(family)
+            local power = available and boostUtil.Power(player, family)
+            if type(power) ~= "number" or power <= 0 then return "Tắt" end
+            return ("+%g%%"):format(power)
+        end
+        return table.concat({
+            "BOOST EVENT",
+            "Patch Coin Boost · " .. status("Coins"),
+            "Pumpkin Damage Boost · " .. status("Damage"),
+            "Island Luck Boost · " .. status("IslandLuck"),
+        }, "\n")
+    end
 
     -- Đọc các zone đã mua và tên trong cấu hình sự kiện.
     local function zoneText(data)
@@ -1155,8 +1172,13 @@ do
             if onQuickClose then onQuickClose() end
         end)
 
-        local zones = label(content, UDim2.fromScale(0.03, 0.62), UDim2.fromScale(0.43, 0.35), Enum.TextXAlignment.Left, 14)
+        local zones = label(content, UDim2.fromScale(0.03, 0.48), UDim2.fromScale(0.43, 0.49), Enum.TextXAlignment.Left, 14)
         zones.TextYAlignment = Enum.TextYAlignment.Bottom
+        zones.TextScaled = true
+        local zoneTextSize = Instance.new("UITextSizeConstraint")
+        zoneTextSize.MinTextSize = 1
+        zoneTextSize.MaxTextSize = 14
+        zoneTextSize.Parent = zones
         local balance = label(content, UDim2.fromScale(0.08, 0.30), UDim2.fromScale(0.84, 0.29), Enum.TextXAlignment.Center, 24)
         local uptime = label(content, UDim2.new(0.03, 0, 0, 58), UDim2.new(0.43, 0, 0, 40), Enum.TextXAlignment.Left, 14)
         uptime.Text = uptimeText()
@@ -1182,7 +1204,7 @@ do
             uptime.Text = uptimeText()
             local data = save.Get()
             if not data then return end
-            zones.Text, stock.Text = zoneText(data), stockText()
+            zones.Text, stock.Text = eventBoostText() .. "\n\n" .. zoneText(data), stockText()
             balance.Text = ("Diamonds\n%s\n\nPumpkin Coins\n%s"):format(
                 formatBalance(currency.Get("Diamonds")), formatBalance(currency.Get(tycoonTypes.COIN)))
             if os.clock() < nextPetsAt then return end
