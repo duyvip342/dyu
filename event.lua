@@ -25,7 +25,6 @@ local pressTimeout = 2
 local retryDelay = 5
 local yellowRetryDelay = 15
 local lastZone = tycoonTypes.PART1_ZONES
-local finalEggPosition = Vector3.new(7303.31689453125, 2007.86083984375, 6487.1064453125)
 local hatchGoal = 15
 local hatchInterval = 1
 local hatchCounts = {}
@@ -151,7 +150,7 @@ local function standInZone(character, humanoid, root, slab, eggPosition)
     local floor = slab.CFrame:PointToWorldSpace(Vector3.new(
         math.clamp(point.X, -x, x), slab.Size.Y / 2, math.clamp(point.Z, -z, z)))
     local current = slab.CFrame:PointToObjectSpace(root.Position)
-    if math.abs(current.X) <= x and math.abs(current.Z) <= z and math.abs(current.Y) < 12
+    if math.abs(current.X) <= x + 0.25 and math.abs(current.Z) <= z + 0.25 and math.abs(current.Y) < 12
         and (not eggPosition or (Vector3.new(root.Position.X, 0, root.Position.Z) - Vector3.new(floor.X, 0, floor.Z)).Magnitude < 3) then
         return
     end
@@ -161,6 +160,7 @@ local function standInZone(character, humanoid, root, slab, eggPosition)
     local offset = root.CFrame:ToObjectSpace(character:GetPivot())
     root.AssemblyLinearVelocity = Vector3.zero
     character:PivotTo(CFrame.new(floor + Vector3.new(0, height, 0)) * root.CFrame.Rotation * offset)
+    return true
 end
 
 -- Gửi pet đánh breaker thuộc đúng zone và đảo hiện tại.
@@ -291,16 +291,6 @@ local function hatchFinalEgg(state, egg)
     end
 end
 
--- Đặt HumanoidRootPart tại điểm đứng mở trứng zone cuối.
-local function moveToFinalEgg(character, root)
-    if (root.Position - finalEggPosition).Magnitude <= 3 then return false end
-    local offset = root.CFrame:ToObjectSpace(character:GetPivot())
-    root.AssemblyLinearVelocity = Vector3.zero
-    root.AssemblyAngularVelocity = Vector3.zero
-    character:PivotTo(CFrame.new(finalEggPosition) * root.CFrame.Rotation * offset)
-    return true
-end
-
 -- Tạm dừng mở pad trong lúc chuẩn bị đủ 15 trứng của zone.
 local function updateEvent(state, character, humanoid, root)
     local zone, slab, plotId, owned = getFarmZone()
@@ -311,9 +301,9 @@ local function updateEvent(state, character, humanoid, root)
         end
         return
     end
-    local finalEgg = zone == lastZone and findZoneEgg(zone, finalEggPosition)
+    local finalEgg = zone == lastZone and slab and findZoneEgg(zone, slab.Position)
     if finalEgg then
-        if moveToFinalEgg(character, root) then
+        if standInZone(character, humanoid, root, slab, finalEgg:GetPosition()) then
             state.nextHatch = os.clock() + scanInterval
             return
         end
