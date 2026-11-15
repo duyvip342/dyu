@@ -585,26 +585,29 @@ do
     local save = require(client.Save)
     local directory = require(library.Directory).Consumables
     local catalog = {
-        { name = "Patch Coin Boost", family = "Coins" },
-        { name = "Pumpkin Damage Boost", family = "Damage" },
-        { name = "Island Luck Boost", family = "IslandLuck" },
+        { name = "Patch Coin Boost II", id = "Patch Coin Boost", family = "Coins", tier = 2 },
+        { name = "Patch Coin Boost I", id = "Patch Coin Boost", family = "Coins", tier = 1 },
+        { name = "Pumpkin Damage Boost II", id = "Pumpkin Damage Boost", family = "Damage", tier = 2 },
+        { name = "Pumpkin Damage Boost I", id = "Pumpkin Damage Boost", family = "Damage", tier = 1 },
+        { name = "Island Luck Boost II", id = "Island Luck Boost", family = "IslandLuck", tier = 2 },
+        { name = "Island Luck Boost I", id = "Island Luck Boost", family = "IslandLuck", tier = 1 },
     }
     local options, selected, retryAt = {}, {}, {}
+    local refreshAt = {}
     local enabled = false
     local job
 
     for _, entry in ipairs(catalog) do table.insert(options, entry.name) end
 
-    -- Tìm stack boost cấp cao nhất còn dùng được trong kho.
-    local function findBoost(inventory, name)
-        local bestUid, bestTier
+    -- Tìm stack có đúng ID và cấp được chọn.
+    local function findBoost(inventory, entry)
         for uid, item in pairs(inventory) do
-            if item.id == name and not item._lk and (item._am or 1) > 0 then
-                local tier = item.tn or 1
-                if not bestTier or tier > bestTier then bestUid, bestTier = uid, tier end
+            if item.id == entry.id and (item.tn or 1) == entry.tier
+                and not item._lk and (item._am or 1) > 0 then
+                return uid
             end
         end
-        return bestUid
+        return nil
     end
 
     -- Dùng một boost mỗi lượt sau khi kiểm tra điều kiện và hiệu ứng đang chạy.
@@ -616,26 +619,42 @@ do
 
         for _, entry in ipairs(catalog) do
             local name = entry.name
-            if not selected[name] or os.clock() < (retryAt[name] or 0)
+            local now = os.clock()
+            if not selected[name] or now < (retryAt[name] or 0) or now < (refreshAt[entry.family] or 0)
                 or boostUtil.Power(player, entry.family) > 0 then continue end
-            local definition = directory[name]
+            local definition = directory[entry.id]
             if not definition or (definition.Requirement and not definition.Requirement(player)) then continue end
-            local uid = findBoost(inventory, name)
+            local uid = findBoost(inventory, entry)
             if uid then
-                retryAt[name] = os.clock() + 10
-                network.Invoke("Consumables_Consume", uid, 1)
+                retryAt[name] = now + 10
+                if network.Invoke("Consumables_Consume", uid, 1) == true then
+                    refreshAt[entry.family] = os.clock() + 10
+                end
                 return
             end
         end
     end
 
+    -- Đọc tên cũ không có hậu tố như lựa chọn cả hai cấp.
+    local function resolveSelection(values)
+        local names = {}
+        if type(values) ~= "table" then return names end
+        for _, entry in ipairs(catalog) do
+            if table.find(values, entry.name) or table.find(values, entry.id) then
+                table.insert(names, entry.name)
+            end
+        end
+        return names
+    end
+
     -- Đồng bộ lựa chọn từ dropdown hoặc launcher.
     features.EventAutoEquipBoost = {
         getOptions = function() return table.clone(options) end,
+        resolveSelection = resolveSelection,
         setSelection = function(values)
             table.clear(selected)
-            for _, name in ipairs(type(values) == "table" and values or {}) do
-                if table.find(options, name) then selected[name] = true end
+            for _, name in ipairs(resolveSelection(values)) do
+                selected[name] = true
             end
         end,
         duy = function(on)
