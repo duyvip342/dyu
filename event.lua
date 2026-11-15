@@ -23,6 +23,7 @@ local petCmds = require(client.PetCmds)
 local instanceId = "PumpkinTycoon"
 local entryRetryDelay = 10
 local scanInterval = 0.5
+local fastFarmInterval = 0.2
 local pressTimeout = 2
 local retryDelay = 5
 local yellowRetryDelay = 15
@@ -182,7 +183,7 @@ end
 local function farmZone(state, zone, plotId)
     local now = os.clock()
     if now < state.nextFarm then return end
-    state.nextFarm = now + (fastFarmEnabled and 0.2 or 1)
+    state.nextFarm = now + (fastFarmEnabled and fastFarmInterval or 1)
     if now >= state.nextEquip then
         petCmds.EquipBest()
         state.nextEquip = now + 15
@@ -379,6 +380,7 @@ local function attackPumpkin(target, character, humanoid, root)
     local assigned = {}
     local merchant = tycoon.Feature("Merchant")
     local nextOpenAt = 0
+    local nextAssignAt = 0
     local ok, err = pcall(function()
         petCmds.EquipBest()
         while pumpkinEnabled and isInEvent() and player.Character == character
@@ -403,14 +405,18 @@ local function attackPumpkin(target, character, humanoid, root)
                 if not opened then warn("[Auto Pumpkin] My Pumpkin: " .. tostring(openError)) end
                 if not pumpkinEnabled or not isInEvent() or player.Character ~= character then break end
             end
-            local batch = {}
-            for _, pet in pairs(playerPet.GetByPlayer(player) or {}) do
-                if pet.euid then
-                    batch[pet.euid] = target.uid
-                    assigned[pet.euid] = true
+            -- Duy trì lệnh gán pet mỗi giây để các hit không gửi lại cả batch.
+            if os.clock() >= nextAssignAt then
+                nextAssignAt = os.clock() + 1
+                local batch = {}
+                for _, pet in pairs(playerPet.GetByPlayer(player) or {}) do
+                    if pet.euid then
+                        batch[pet.euid] = target.uid
+                        assigned[pet.euid] = true
+                    end
                 end
+                if next(batch) then network.Fire("Breakables_JoinPetBulk", batch) end
             end
-            if next(batch) then network.Fire("Breakables_JoinPetBulk", batch) end
             network.UnreliableFire("Breakables_PlayerDealDamage", target.uid)
             task.wait(0.25)
         end
@@ -452,9 +458,10 @@ local function startWorker()
             local character = player.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             local root = humanoid and humanoid.RootPart
-            if not isInEvent() or not (enabled or fastFarmEnabled) then clearFarmTargets(state) end
+            local inEvent = isInEvent()
+            if not inEvent or not (enabled or fastFarmEnabled) then clearFarmTargets(state) end
             if root and humanoid.Health > 0 then
-                if isInEvent() then
+                if inEvent then
                     local pumpkin = pumpkinEnabled and findPumpkin(root.Position)
                     if pumpkin then
                         clearFarmTargets(state)
@@ -471,7 +478,8 @@ local function startWorker()
                     nextEntryAt = os.clock() + entryRetryDelay
                 end
             end
-            task.wait(fastFarmEnabled and 0.05 or scanInterval)
+            -- Chạy điều phối nhanh theo đúng chu kỳ đánh của Fast Farm.
+            task.wait(inEvent and fastFarmEnabled and fastFarmInterval or scanInterval)
         end
         clearFarmTargets(state)
         workerRunning = false
@@ -616,6 +624,7 @@ end
 -- Auto Pumpkin Upgrade / Nâng cấp các mục đã chọn trong máy.
 do
     local definitions = require(library.Types.PumpkinTycoon.Upgrades)
+    local eventUpgrades = require(library.Directory.EventUpgrades)
     -- Sửa danh sách dropdown tại đây bằng tên hiển thị và ID nâng cấp.
     local catalog = {
         { name = "Spawn Luck", track = "SpawnLuck" },
@@ -654,7 +663,8 @@ do
             local track = entry.track
             if not selected[track] or now < (retryAt[track] or 0) then continue end
             local definition = definitions.ROWS[track]
-            if not definition then continue end
+            -- Bỏ qua mục chưa được game đăng ký để các nâng cấp khác vẫn chạy.
+            if not definition or not rawget(eventUpgrades, instanceId .. track) then continue end
             local tier = upgrades.Tier(track)
             if tier >= #definition.Powers or upgrades.Capped(track, tier) then continue end
             local cost = upgrades.Cost(track, tier + 1)
@@ -829,6 +839,9 @@ do
     local original = setmetatable({}, { __mode = "k" })
     local invisible = NumberSequence.new(1)
     local touchClient = game:GetService("UserInputService").TouchEnabled
+    local frameBudget = touchClient and 0.001 or 0.002
+    local optimizing = false
+    local nextWatchAt = 0
     local watched = {}
     local queue, first, last = {}, 1, 0
     local hatchEnvironment, originalHatchAnimation, skipHatchAnimation
@@ -900,16 +913,21 @@ do
         object[property] = value
     end
 
-    -- Khôi phục hiển thị khi tắt toggle hoặc rời sự kiện.
-    local function restore()
-        for object, record in pairs(original) do
+    -- Khôi phục theo lô để lúc rời sự kiện không dồn việc vào một frame.
+    local function restoreBatch()
+        local deadline = os.clock() + frameBudget
+        local object, record = next(original)
+        for _ = 1, 100 do
+            if not object or os.clock() >= deadline then break end
             if object.Parent then
                 for property, saved in pairs(record) do
                     if object[property] == saved.hidden then object[property] = saved.previous end
                 end
             end
+            original[object] = nil
+            object, record = next(original, object)
         end
-        table.clear(original)
+        if not next(original) then table.clear(original) end
     end
 
     -- Giữ viền farm, nút thưởng và các part mở khóa.
@@ -964,6 +982,8 @@ do
             hideProperty(object, "Transparency", 1)
         end
 
+        -- Tắt bóng của vật thể event để giảm render mà vẫn thấy breaker.
+        if keepGeometry and isPart and object.Transparency < 1 then hideProperty(object, "CastShadow", false) end
         if isEffect then hideProperty(object, "Enabled", false) end
         if isParticle then hideProperty(object, "Transparency", invisible) end
         if isExplosion then hideProperty(object, "Visible", false) end
@@ -996,8 +1016,7 @@ do
         if not instance or instance.instanceID ~= instanceId then
             if skipHatchAnimation then restoreHatchAnimation() end
             if next(watched) then clearWatches() end
-            if next(original) then restore() end
-            return
+            return false
         end
         suppressHatchAnimation()
         local roots = {}
@@ -1019,6 +1038,18 @@ do
         add(game:GetService("Lighting"), "lighting")
         add(workspace:FindFirstChildOfClass("Terrain"), "lighting")
 
+        -- Dùng cây cha nếu cây con có cùng cách ẩn.
+        for root, mode in pairs(roots) do
+            local parent = root.Parent
+            while parent do
+                if roots[parent] == mode then
+                    roots[root] = nil
+                    break
+                end
+                parent = parent.Parent
+            end
+        end
+
         for root, binding in pairs(watched) do
             if not roots[root] then
                 binding.connection:Disconnect()
@@ -1036,11 +1067,12 @@ do
                 enqueue(root, root, binding, true)
             end
         end
+        return true
     end
 
     -- Dàn lượt quét đầu ra nhiều frame rồi chỉ xử lý object mới.
     local function processQueue()
-        local deadline = os.clock() + (touchClient and 0.001 or 0.002)
+        local deadline = os.clock() + frameBudget
         local rootPart = player.Character and player.Character.PrimaryPart
         local position = rootPart and rootPart.Position
         for _ = 1, 100 do
@@ -1074,33 +1106,41 @@ do
 
     -- Chia sẻ Optimize Event giữa toggle riêng và Stats Event.
     local function request(owner, on)
+        local wasEnabled = next(owners) ~= nil
         owners[owner] = on and true or nil
-        if next(owners) then
-            if job then return end
-            job = task.defer(function()
-                local nextWatchAt = 0
-                local nextTrimAt = os.clock() + 3
-                while true do
-                    local now = os.clock()
-                    if now >= nextWatchAt then
-                        updateWatches()
-                        nextWatchAt = now + 0.5
-                    end
-                    if first <= last then processQueue() end
-                    if now >= nextTrimAt then
-                        trimQueue()
-                        nextTrimAt = now + 3
-                    end
-                    if first <= last then task.wait() else task.wait(0.1) end
-                end
-            end)
-        elseif job then
-            task.cancel(job)
-            job = nil
+        local isEnabled = next(owners) ~= nil
+        if wasEnabled and not isEnabled then
+            optimizing = false
             restoreHatchAnimation()
             clearWatches()
-            restore()
         end
+        if isEnabled and not wasEnabled then nextWatchAt = 0 end
+        if job or not isEnabled then return end
+        job = task.defer(function()
+            local nextTrimAt = os.clock() + 3
+            while next(owners) or next(original) do
+                local now = os.clock()
+                if next(owners) and now >= nextWatchAt then
+                    optimizing = updateWatches()
+                    nextWatchAt = now + 0.5
+                end
+                if optimizing then
+                    if first <= last then processQueue() end
+                elseif next(original) then
+                    restoreBatch()
+                end
+                if now >= nextTrimAt then
+                    trimQueue()
+                    nextTrimAt = now + 3
+                end
+                if first <= last or (not optimizing and next(original)) then
+                    task.wait()
+                elseif next(owners) then
+                    task.wait(0.1)
+                end
+            end
+            job = nil
+        end)
     end
 
     features.EventOptimize = {
@@ -1114,11 +1154,15 @@ do
     local save = require(client.Save)
     local boostUtil = require(library.Util.PumpkinTycoonBoosts)
     local items = require(library.Items)
+    local petDirectory = require(library.Directory.Pets)
+    local calcPetPower = require(library.Balancing.CalcPetPower)
+    local petConstants = require(library.Balancing.Constants)
     local merchant = require(library.Types.PumpkinTycoon.Merchant)
     local runService = game:GetService("RunService")
     local activeGui
     local onQuickClose
     local accent = Color3.fromRGB(255, 191, 105)
+    local petRefreshInterval = 12
 
     -- Hiện phần trăm hiệu lực của ba boost Pumpkin Tycoon.
     local function eventBoostText()
@@ -1166,14 +1210,24 @@ do
         return table.concat(lines, "\n")
     end
 
-    -- Gộp các pet cùng ảnh và tên rồi thêm một pet thường mạnh nhất.
-    local function petRows(inventory)
+    -- Lọc pet cần hiển thị bằng Directory trước khi tạo PetItem.
+    local function petRows(inventory, gui)
         local byName, rows = {}, {}
-        local best, bestPower
-        for _, entry in pairs(inventory or {}) do
-            local pet = items.From("Pet", table.clone(entry))
-            local kind = pet:IsGargantuan() and "Gargantuan" or pet:IsTitanic() and "Titanic" or pet:IsHuge() and "Huge"
+        local bestEntry, bestPower
+        local scanned = 0
+        for _, entry in pairs(inventory and table.clone(inventory) or {}) do
+            scanned += 1
+            if scanned % 64 == 0 then
+                task.wait()
+                if activeGui ~= gui then return nil end
+            end
+            local definition = rawget(petDirectory, entry.id)
+            if not definition then continue end
+            local kind = definition.gargantuan == true and "Gargantuan"
+                or definition.titanic == true and "Titanic"
+                or definition.huge == true and "Huge"
             if kind then
+                local pet = items.From("Pet", table.clone(entry))
                 local name, icon = pet:GetName(), pet:GetIcon()
                 local key = kind .. name .. tostring(icon)
                 if not byName[key] then
@@ -1181,9 +1235,11 @@ do
                     table.insert(rows, byName[key])
                 end
                 byName[key].amount += entry._am or 1
-            elseif pet:GetExclusiveLevel() == 0 then
-                local power = pet:CalculatePower()
-                if not bestPower or power > bestPower then best, bestPower = pet, power end
+            elseif (definition.exclusiveLevel or 0) == 0 then
+                local multiplier = petConstants.DamageMultipliers[entry.pt or 0] or 1
+                if entry.sh == true then multiplier *= petConstants.ShinyDamageMultiplier end
+                local power = calcPetPower(definition, multiplier)
+                if not bestPower or power > bestPower then bestEntry, bestPower = entry, power end
             end
         end
         table.sort(rows, function(a, b)
@@ -1191,7 +1247,8 @@ do
             if a.name ~= b.name then return a.name < b.name end
             return tostring(a.icon) < tostring(b.icon)
         end)
-        if best then
+        if bestEntry then
+            local best = items.From("Pet", table.clone(bestEntry))
             table.insert(rows, 1, { kind = "Pet thường mạnh nhất", name = best:GetName(), icon = best:GetIcon(), amount = 1 })
         end
         return rows
@@ -1321,8 +1378,9 @@ do
             if not data then return end
             zones.Text, stock.Text = eventBoostText() .. "\n\n" .. zoneText(data), stockText()
             if os.clock() < nextPetsAt then return end
-            nextPetsAt = os.clock() + 5
-            local rows = petRows(data.Inventory and data.Inventory.Pet)
+            nextPetsAt = os.clock() + petRefreshInterval
+            local rows = petRows(data.Inventory and data.Inventory.Pet, gui)
+            if not rows then return end
             local keys = {}
             for _, row in ipairs(rows) do
                 table.insert(keys, table.concat({ row.kind, row.name, row.icon or "", row.amount }, "|"))
