@@ -34,7 +34,15 @@ features.MailAutoClaim = {
 -- Sửa Class và ID nội bộ của món tại đây. Thứ tự ID trong mỗi nhóm là thứ tự dropdown.
 local giftCatalog = {
     Currency = { "Diamonds" },
-    Pet = { "Wisp Griffin" },
+    Pet = { "Stingray" },
+    Consumable = { "Patch Coin Boost II", "Pumpkin Damage Boost II", "Island Luck Boost II" },
+}
+
+-- Ghép tên boost cấp II với ID gốc và cấp trong inventory.
+local tierTwoBoostIds = {
+    ["Patch Coin Boost II"] = "Patch Coin Boost",
+    ["Pumpkin Damage Boost II"] = "Pumpkin Damage Boost",
+    ["Island Luck Boost II"] = "Island Luck Boost",
 }
 
 -- Giữ các dòng Auto Gift theo thứ tự Add Item.
@@ -96,7 +104,7 @@ end
 local function findGiftStock(inventory, rule)
     local stock, largestUid, largest = 0, nil, 0
     for uid, entry in pairs(inventory[rule.class] or {}) do
-        if entry.id == rule.name and canGiftItem(rule.class, entry) then
+        if entry.id == rule.id and (not rule.tier or entry.tn == rule.tier) and canGiftItem(rule.class, entry) then
             local amount = entry._am or 1
             stock += amount
             if amount > largest then largestUid, largest = uid, amount end
@@ -186,7 +194,15 @@ features.MailAutoGift = {
         if not amount or amount <= 0 or keep == nil then
             return false, "Amount phải lớn hơn 0 và Keep từ 0 trở lên"
         end
-        rules[#rules + 1] = { class = class, name = name, amount = amount, keep = keep }
+        local boostId = class == "Consumable" and tierTwoBoostIds[name]
+        rules[#rules + 1] = {
+            class = class,
+            name = name,
+            id = boostId or name,
+            tier = boostId and 2 or nil,
+            amount = amount,
+            keep = keep,
+        }
         giftRevision += 1
         return true
     end,
