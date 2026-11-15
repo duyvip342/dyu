@@ -828,16 +828,65 @@ do
     local owners = {}
     local original = setmetatable({}, { __mode = "k" })
     local invisible = NumberSequence.new(1)
+    local touchClient = game:GetService("UserInputService").TouchEnabled
     local watched = {}
     local queue, first, last = {}, 1, 0
+    local hatchEnvironment, originalHatchAnimation, skipHatchAnimation
+    local hatching = require(client.HatchingCmds)
+    local signal = require(library.Signal)
     local protectedGeometry = {
-        paths = true,
         breaks_zones = true,
         break_zones = true,
         safety_net = true,
         interactable = true,
         spawnposition = true,
     }
+
+    -- Bỏ animation trước khi game dựng trứng và màn hình Click to open.
+    local function suppressHatchAnimation()
+        if skipHatchAnimation or type(getsenv) ~= "function" then return end
+        local playerScripts = player:FindFirstChild("PlayerScripts")
+        local scripts = playerScripts and playerScripts:FindFirstChild("Scripts")
+        local gameScripts = scripts and scripts:FindFirstChild("Game")
+        local frontend = gameScripts and gameScripts:FindFirstChild("Egg Opening Frontend")
+        if not frontend then return end
+        local ok, environment = pcall(getsenv, frontend)
+        if not ok or type(environment) ~= "table" then return end
+        local play = environment.PlayNormalEggAnimation
+        if type(play) ~= "function" then return end
+
+        local function skip(eggName, ...)
+            local instance = instancing.Get()
+            if not next(owners) or not instance or instance.instanceID ~= instanceId then
+                return play(eggName, ...)
+            end
+
+            -- Tiếp tục Auto Hatch của game sau khi callback nhận pet chạy xong.
+            local egg = hatching.GetEggDirectory()
+            if hatching.IsHatching() and egg and (egg._id == eggName or egg._id == "Infinity Egg") then
+                task.defer(function()
+                    local current = instancing.Get()
+                    if current ~= instance or not hatching.IsHatching() or hatching.GetEggDirectory() ~= egg then return end
+                    signal.Fire("Hatching", eggName)
+                    hatching.AttemptHatch()
+                end)
+            end
+            return nil
+        end
+
+        ok = pcall(function() environment.PlayNormalEggAnimation = skip end)
+        if ok then
+            hatchEnvironment, originalHatchAnimation, skipHatchAnimation = environment, play, skip
+        end
+    end
+
+    -- Trả lại hàm animation khi tắt Optimize Event hoặc rời event.
+    local function restoreHatchAnimation()
+        if hatchEnvironment and hatchEnvironment.PlayNormalEggAnimation == skipHatchAnimation then
+            hatchEnvironment.PlayNormalEggAnimation = originalHatchAnimation
+        end
+        hatchEnvironment, originalHatchAnimation, skipHatchAnimation = nil, nil, nil
+    end
 
     -- Lưu thuộc tính gốc trước khi đổi hiển thị.
     local function hideProperty(object, property, value)
@@ -869,10 +918,12 @@ do
         local isSurface = object:IsA("Decal") or object:IsA("Texture")
         local isParticle = object:IsA("ParticleEmitter")
         local isExplosion = object:IsA("Explosion")
+        local isAtmosphere = object:IsA("Atmosphere")
+        local isLightingEffect = object:IsA("PostEffect") or object:IsA("Clouds")
         local isEffect = isParticle or object:IsA("Beam") or object:IsA("Trail")
             or object:IsA("Light") or object:IsA("Smoke") or object:IsA("Fire")
             or object:IsA("Sparkles") or object:IsA("Highlight")
-        if not (isPart or isSurface or isEffect or isExplosion) then return end
+        if not (isPart or isSurface or isEffect or isExplosion or isAtmosphere or isLightingEffect) then return end
 
         local keepGeometry = mode ~= "scenery"
         local debrisPart
@@ -892,12 +943,23 @@ do
             parent = parent.Parent
         end
 
-        if mode == "debris" then
+        if mode == "lighting" then
+            if isAtmosphere then
+                hideProperty(object, "Density", 0)
+                hideProperty(object, "Haze", 0)
+                hideProperty(object, "Glare", 0)
+            elseif isLightingEffect then
+                hideProperty(object, "Enabled", false)
+            end
+            return
+        elseif mode == "debris" then
             local position = isExplosion and object.Position or (debrisPart and debrisPart.Position)
             if not (isEffect or isExplosion) or not position or not debrisPosition
                 or (position - debrisPosition).Magnitude > 220 then return end
-        elseif not keepGeometry and isPart and object.Transparency < 1 then
+        elseif not keepGeometry and isPart then
+            -- Ẩn cả part đang fade để nó không hiện lại khi tải xong.
             hideProperty(object, "LocalTransparencyModifier", 1)
+            if touchClient then hideProperty(object, "Transparency", 1) end
         elseif not keepGeometry and isSurface then
             hideProperty(object, "Transparency", 1)
         end
@@ -909,8 +971,15 @@ do
 
     -- Xếp object vào hàng đợi để xử lý theo ngân sách mỗi frame.
     local function enqueue(object, scope, binding, walk)
+        local pending = binding.pending[object]
+        if pending then
+            pending.walk = pending.walk or walk
+            return
+        end
         last += 1
-        queue[last] = {object = object, scope = scope, binding = binding, walk = walk}
+        local entry = {object = object, scope = scope, binding = binding, walk = walk}
+        queue[last] = entry
+        binding.pending[object] = entry
     end
 
     -- Gỡ listener và dọn hàng đợi khi rời sự kiện hoặc tắt tối ưu.
@@ -925,10 +994,12 @@ do
     local function updateWatches()
         local instance = instancing.Get()
         if not instance or instance.instanceID ~= instanceId then
+            if skipHatchAnimation then restoreHatchAnimation() end
             if next(watched) then clearWatches() end
             if next(original) then restore() end
             return
         end
+        suppressHatchAnimation()
         local roots = {}
         local function add(root, mode)
             if root then roots[root] = mode end
@@ -940,17 +1011,24 @@ do
         add(workspace:FindFirstChild("PumpkinTycoonPumpkins"), "effects")
         local things = workspace:FindFirstChild("__THINGS")
         add(things and things:FindFirstChild("Breakables"), "breakers")
+        add(things and things:FindFirstChild("AnimatedBreakables"), "breakers")
+        add(things and things:FindFirstChild("__FAKE_INSTANCE_GROUND"), "scenery")
+        add(things and things:FindFirstChild("VFX"), "debris")
+        add(things and things:FindFirstChild("VictoryScene"), "debris")
         add(workspace:FindFirstChild("__DEBRIS"), "debris")
+        add(game:GetService("Lighting"), "lighting")
+        add(workspace:FindFirstChildOfClass("Terrain"), "lighting")
 
         for root, binding in pairs(watched) do
             if not roots[root] then
                 binding.connection:Disconnect()
+                table.clear(binding.pending)
                 watched[root] = nil
             end
         end
         for root, mode in pairs(roots) do
             if not watched[root] then
-                local binding = {mode = mode}
+                local binding = {mode = mode, pending = {}}
                 watched[root] = binding
                 binding.connection = root.DescendantAdded:Connect(function(object)
                     if watched[root] == binding then enqueue(object, root, binding, false) end
@@ -962,7 +1040,7 @@ do
 
     -- Dàn lượt quét đầu ra nhiều frame rồi chỉ xử lý object mới.
     local function processQueue()
-        local deadline = os.clock() + 0.002
+        local deadline = os.clock() + (touchClient and 0.001 or 0.002)
         local rootPart = player.Character and player.Character.PrimaryPart
         local position = rootPart and rootPart.Position
         for _ = 1, 100 do
@@ -971,16 +1049,27 @@ do
             queue[first] = nil
             first += 1
             local object, scope = entry.object, entry.scope
+            entry.binding.pending[object] = nil
             if watched[scope] == entry.binding and (object == scope or object:IsDescendantOf(scope)) then
                 if object ~= scope then hideVisual(object, scope, entry.binding.mode, position) end
-                if entry.walk then
+                if entry.walk and (entry.binding.mode ~= "breakers" or object.Parent ~= scope
+                    or object:GetAttribute("ParentID") == instanceId) then
                     for _, child in ipairs(object:GetChildren()) do
                         enqueue(child, scope, entry.binding, true)
                     end
                 end
             end
         end
-        if first > last then first, last = 1, 0 end
+    end
+
+    -- Thu gọn bộ nhớ hàng đợi theo lô nhẹ mỗi ba giây.
+    local function trimQueue()
+        local remaining = last - first + 1
+        if remaining > 128 then return end
+        if first == 1 and remaining > 0 then return end
+        local compact = {}
+        for index = 1, remaining do compact[index] = queue[first + index - 1] end
+        queue, first, last = compact, 1, remaining
     end
 
     -- Chia sẻ Optimize Event giữa toggle riêng và Stats Event.
@@ -990,19 +1079,25 @@ do
             if job then return end
             job = task.defer(function()
                 local nextWatchAt = 0
+                local nextTrimAt = os.clock() + 3
                 while true do
                     local now = os.clock()
                     if now >= nextWatchAt then
                         updateWatches()
-                        nextWatchAt = now + 0.25
+                        nextWatchAt = now + 0.5
                     end
-                    processQueue()
+                    if first <= last then processQueue() end
+                    if now >= nextTrimAt then
+                        trimQueue()
+                        nextTrimAt = now + 3
+                    end
                     if first <= last then task.wait() else task.wait(0.1) end
                 end
             end)
         elseif job then
             task.cancel(job)
             job = nil
+            restoreHatchAnimation()
             clearWatches()
             restore()
         end
