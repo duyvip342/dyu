@@ -104,7 +104,7 @@ for _, url in ipairs(urls) do
     if filename == "webhook.lua" and not source:find("%S") then continue end
     local loadTab = assert(loadstring(source, "@" .. filename))
     local moduleFeatures
-    if filename == "rank.lua" then
+    if filename == "rank.lua" or filename == "event.lua" then
         moduleFeatures = loadTab(scriptStartedAt)
     else
         moduleFeatures = loadTab()
