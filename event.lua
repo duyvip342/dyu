@@ -719,6 +719,7 @@ end
 -- Optimize Event / Chỉ thay đổi hiển thị của Pumpkin Tycoon.
 do
     local job
+    local owners = {}
     local original = setmetatable({}, { __mode = "k" })
     local invisible = NumberSequence.new(1)
     local protectedGeometry = {
@@ -826,24 +827,247 @@ do
         if character then scan(workspace:FindFirstChild("__DEBRIS"), false, character:GetPivot().Position) end
     end
 
-    -- Chạy một vòng tối ưu riêng cho toggle Event.
-    features.EventOptimize = {
-        duy = function(on)
-            if job then
-                if on then return end
-                task.cancel(job)
-                job = nil
-            end
-            if not on then
-                restore()
-                return
-            end
+    -- Chia sẻ Optimize Event giữa toggle riêng và Stats Event.
+    local function request(owner, on)
+        owners[owner] = on and true or nil
+        if next(owners) then
+            if job then return end
             job = task.defer(function()
                 while true do
                     optimizeEvent()
                     task.wait(1)
                 end
             end)
+        elseif job then
+            task.cancel(job)
+            job = nil
+            restore()
+        end
+    end
+
+    features.EventOptimize = {
+        duy = function(on) request("toggle", on) end,
+        request = request,
+    }
+end
+
+-- Stats Event / Số dư, zone, kho bí ngô và pet trên nền đen.
+do
+    local save = require(client.Save)
+    local items = require(library.Items)
+    local merchant = require(library.Types.PumpkinTycoon.Merchant)
+    local runService = game:GetService("RunService")
+    local activeGui
+    local onQuickClose
+    local accent = Color3.fromRGB(255, 191, 105)
+
+    -- Đọc các zone đã mua và tên trong cấu hình sự kiện.
+    local function zoneText(data)
+        local lines = { "ZONE ĐÃ MỞ" }
+        local owned = isInEvent() and tycoon.Feature("Buttons").State()
+        local event = data.InstanceVars and data.InstanceVars[instanceId]
+        local paid = event and event.ZonePaid
+        for index, zone in ipairs(tycoonTypes.ZONES) do
+            if (owned and buttons.Owned(owned, zone.Section .. "_Zone"))
+                or (paid and (paid[tostring(index)] or paid[index])) then
+                table.insert(lines, ("%d · %s"):format(index, zone.DisplayName))
+            end
+        end
+        if #lines == 1 then table.insert(lines, "—") end
+        return table.concat(lines, "\n")
+    end
+
+    -- Đọc số bí ngô chờ mọc theo cấp trong My Pumpkin.
+    local function stockText()
+        if not isInEvent() then return "MY PUMPKIN\n—" end
+        local stock = tycoon.Feature("Stock")
+        local held = stock.Stock()
+        local offers = merchant.Config()
+        local lines = { ("MY PUMPKIN · %d/%d"):format(#held, stock.Slots()) }
+        for _, row in ipairs(stock.Grouped(held)) do
+            local offer = offers[row.band]
+            table.insert(lines, ("%s ×%d"):format(offer and offer.Display or row.band, row.count))
+        end
+        return table.concat(lines, "\n")
+    end
+
+    -- Gộp các pet cùng ảnh và tên rồi thêm một pet thường mạnh nhất.
+    local function petRows(inventory)
+        local byName, rows = {}, {}
+        local best, bestPower
+        for _, entry in pairs(inventory or {}) do
+            local pet = items.From("Pet", table.clone(entry))
+            local kind = pet:IsGargantuan() and "Gargantuan" or pet:IsTitanic() and "Titanic" or pet:IsHuge() and "Huge"
+            if kind then
+                local name, icon = pet:GetName(), pet:GetIcon()
+                local key = kind .. name .. tostring(icon)
+                if not byName[key] then
+                    byName[key] = { kind = kind, name = name, icon = icon, amount = 0 }
+                    table.insert(rows, byName[key])
+                end
+                byName[key].amount += entry._am or 1
+            elseif pet:GetExclusiveLevel() == 0 then
+                local power = pet:CalculatePower()
+                if not bestPower or power > bestPower then best, bestPower = pet, power end
+            end
+        end
+        table.sort(rows, function(a, b)
+            if a.kind ~= b.kind then return a.kind < b.kind end
+            if a.name ~= b.name then return a.name < b.name end
+            return tostring(a.icon) < tostring(b.icon)
+        end)
+        if best then
+            table.insert(rows, 1, { kind = "Pet thường mạnh nhất", name = best:GetName(), icon = best:GetIcon(), amount = 1 })
+        end
+        return rows
+    end
+
+    -- Tạo nhãn chữ cho từng vùng của bảng thống kê.
+    local function label(parent, position, size, alignment, textSize)
+        local object = Instance.new("TextLabel")
+        object.Position, object.Size = position, size
+        object.BackgroundTransparency = 1
+        object.Font = Enum.Font.GothamBold
+        object.TextColor3 = Color3.fromRGB(245, 245, 245)
+        object.TextSize = textSize
+        object.TextWrapped = true
+        object.TextXAlignment = alignment
+        object.Text = ""
+        object.Parent = parent
+        return object
+    end
+
+    -- Định dạng số dư đầy đủ theo nhóm ba chữ số.
+    local function formatBalance(value)
+        if type(value) ~= "number" then return "—" end
+        local reversed = string.reverse(("%.0f"):format(value))
+        return string.reverse((reversed:gsub("(%d%d%d)", "%1."):gsub("%.$", "")))
+    end
+
+    -- Xóa overlay để chạy phần phục hồi hiển thị.
+    local function stop()
+        if activeGui then activeGui:Destroy() end
+    end
+
+    -- Dựng overlay và cập nhật dữ liệu theo thời gian.
+    local function start()
+        if activeGui then return end
+        local playerGui = player:FindFirstChildOfClass("PlayerGui")
+        if not playerGui then return end
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "PumpkinTycoonStats"
+        gui.ResetOnSpawn = false
+        gui.DisplayOrder = 1000
+        gui.ClipToDeviceSafeArea = false
+        gui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets
+        local cover = Instance.new("Frame")
+        cover.BackgroundColor3 = Color3.new(0, 0, 0)
+        cover.BorderSizePixel = 0
+        cover.Position = UDim2.fromOffset(-256, -256)
+        cover.Size = UDim2.new(1, 512, 1, 512)
+        cover.Parent = gui
+        local content = Instance.new("Frame")
+        content.Size = UDim2.fromScale(1, 1)
+        content.BackgroundTransparency = 1
+        content.Parent = gui
+
+        local close = Instance.new("TextButton")
+        close.Position = UDim2.fromOffset(12, 12)
+        close.Size = UDim2.fromOffset(70, 40)
+        close.BackgroundColor3 = Color3.fromRGB(38, 38, 38)
+        close.TextColor3 = Color3.new(1, 1, 1)
+        close.Font = Enum.Font.GothamBold
+        close.TextSize = 14
+        close.Text = "Tắt Stats"
+        close.Parent = content
+        close.Activated:Connect(function()
+            stop()
+            if onQuickClose then onQuickClose() end
+        end)
+
+        local zones = label(content, UDim2.fromScale(0.03, 0.62), UDim2.fromScale(0.43, 0.35), Enum.TextXAlignment.Left, 14)
+        zones.TextYAlignment = Enum.TextYAlignment.Bottom
+        local balance = label(content, UDim2.fromScale(0.08, 0.30), UDim2.fromScale(0.84, 0.29), Enum.TextXAlignment.Center, 24)
+        local stock = label(content, UDim2.fromScale(0.49, 0.03), UDim2.fromScale(0.48, 0.26), Enum.TextXAlignment.Right, 14)
+        stock.TextYAlignment = Enum.TextYAlignment.Top
+        local title = label(content, UDim2.fromScale(0.49, 0.59), UDim2.fromScale(0.48, 0.045), Enum.TextXAlignment.Right, 14)
+        title.Text, title.TextColor3 = "PET TRONG KHO", accent
+
+        local list = Instance.new("ScrollingFrame")
+        list.Position = UDim2.fromScale(0.49, 0.64)
+        list.Size = UDim2.fromScale(0.48, 0.33)
+        list.BackgroundTransparency = 1
+        list.BorderSizePixel = 0
+        list.ScrollBarThickness = 3
+        list.CanvasSize = UDim2.new()
+        list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        list.Parent = content
+        Instance.new("UIListLayout", list).SortOrder = Enum.SortOrder.LayoutOrder
+
+        local previousRows
+        local nextPetsAt = 0
+        local function refresh()
+            local data = save.Get()
+            if not data then return end
+            zones.Text, stock.Text = zoneText(data), stockText()
+            balance.Text = ("Diamonds\n%s\n\nPumpkin Coins\n%s"):format(
+                formatBalance(currency.Get("Diamonds")), formatBalance(currency.Get(tycoonTypes.COIN)))
+            if os.clock() < nextPetsAt then return end
+            nextPetsAt = os.clock() + 5
+            local rows = petRows(data.Inventory and data.Inventory.Pet)
+            local keys = {}
+            for _, row in ipairs(rows) do
+                table.insert(keys, table.concat({ row.kind, row.name, row.icon or "", row.amount }, "|"))
+            end
+            local signature = table.concat(keys, "\n")
+            if signature == previousRows then return end
+            previousRows = signature
+            for _, child in ipairs(list:GetChildren()) do
+                if child:IsA("Frame") then child:Destroy() end
+            end
+            for index, row in ipairs(rows) do
+                local card = Instance.new("Frame")
+                card.Size = UDim2.new(1, -6, 0, 44)
+                card.BackgroundTransparency = 1
+                card.LayoutOrder = index
+                local icon = Instance.new("ImageLabel")
+                icon.AnchorPoint = Vector2.new(1, 0)
+                icon.Position = UDim2.fromScale(1, 0)
+                icon.Size = UDim2.fromOffset(42, 42)
+                icon.BackgroundTransparency = 1
+                icon.Image = row.icon or ""
+                icon.Parent = card
+                local caption = label(card, UDim2.new(), UDim2.new(1, -46, 1, 0), Enum.TextXAlignment.Right, 12)
+                caption.Text = ("%s\n%s%s"):format(row.kind, row.name, row.amount > 1 and (" ×" .. row.amount) or "")
+                card.Parent = list
+            end
+        end
+
+        activeGui = gui
+        local rendered = pcall(function() runService:Set3dRenderingEnabled(false) end)
+        if not rendered then features.EventOptimize.request(gui, true) end
+        gui.Destroying:Connect(function()
+            activeGui = nil
+            if rendered then
+                pcall(function() runService:Set3dRenderingEnabled(true) end)
+            else
+                features.EventOptimize.request(gui, false)
+            end
+        end)
+        gui.Parent = playerGui
+        task.defer(function()
+            while activeGui == gui do
+                local ok, err = pcall(refresh)
+                if not ok then warn("[Stats Event] " .. tostring(err)) end
+                task.wait(ok and 1 or 5)
+            end
+        end)
+    end
+
+    features.EventStatsGui = {
+        setQuickClose = function(callback) onQuickClose = callback end,
+        duy = function(on)
+            if on then start() else stop() end
         end,
     }
 end
