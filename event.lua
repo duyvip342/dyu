@@ -579,6 +579,80 @@ do
     }
 end
 
+-- Auto Equip Boost / Dùng boost đã chọn khi hiệu ứng cũ hết.
+do
+    local boostUtil = require(library.Util.PumpkinTycoonBoosts)
+    local save = require(client.Save)
+    local directory = require(library.Directory).Consumables
+    local catalog = {
+        { name = "Patch Coin Boost", family = "Coins" },
+        { name = "Pumpkin Damage Boost", family = "Damage" },
+        { name = "Island Luck Boost", family = "IslandLuck" },
+    }
+    local options, selected, retryAt = {}, {}, {}
+    local enabled = false
+    local job
+
+    for _, entry in ipairs(catalog) do table.insert(options, entry.name) end
+
+    -- Tìm stack boost cấp cao nhất còn dùng được trong kho.
+    local function findBoost(inventory, name)
+        local bestUid, bestTier
+        for uid, item in pairs(inventory) do
+            if item.id == name and not item._lk and (item._am or 1) > 0 then
+                local tier = item.tn or 1
+                if not bestTier or tier > bestTier then bestUid, bestTier = uid, tier end
+            end
+        end
+        return bestUid
+    end
+
+    -- Dùng một boost mỗi lượt sau khi kiểm tra điều kiện và hiệu ứng đang chạy.
+    local function equipBoost()
+        if not isInEvent() or not boostUtil.Enabled(player) then return end
+        local data = save.Get()
+        local inventory = data and data.Inventory and data.Inventory.Consumable
+        if not inventory then return end
+
+        for _, entry in ipairs(catalog) do
+            local name = entry.name
+            if not selected[name] or os.clock() < (retryAt[name] or 0)
+                or boostUtil.Power(player, entry.family) > 0 then continue end
+            local definition = directory[name]
+            if not definition or (definition.Requirement and not definition.Requirement(player)) then continue end
+            local uid = findBoost(inventory, name)
+            if uid then
+                retryAt[name] = os.clock() + 10
+                network.Invoke("Consumables_Consume", uid, 1)
+                return
+            end
+        end
+    end
+
+    -- Đồng bộ lựa chọn từ dropdown hoặc launcher.
+    features.EventAutoEquipBoost = {
+        getOptions = function() return table.clone(options) end,
+        setSelection = function(values)
+            table.clear(selected)
+            for _, name in ipairs(type(values) == "table" and values or {}) do
+                if table.find(options, name) then selected[name] = true end
+            end
+        end,
+        duy = function(on)
+            enabled = on
+            if not on or job then return end
+            job = task.defer(function()
+                while enabled do
+                    local ok, err = pcall(equipBoost)
+                    if not ok then warn("[Auto Equip Boost] " .. tostring(err)) end
+                    task.wait(ok and 1 or 3)
+                end
+                job = nil
+            end)
+        end,
+    }
+end
+
 -- Optimize Event / Chỉ thay đổi hiển thị của Pumpkin Tycoon.
 do
     local job
