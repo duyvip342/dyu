@@ -462,11 +462,63 @@ features.EventAutoOpenMap = {
     end,
 }
 
--- Bật ưu tiên đánh bí ngô trong sự kiện.
+-- Auto Pumpkin / Đồng bộ Lock và chế độ My Pumpkin trên đảo của mình.
+local pumpkinSettingsJob
+
+-- Dùng trạng thái đã lưu của game để chỉ gửi lệnh khi cần sửa.
+local function syncPumpkinSettings(state)
+    local island = tycoon.Feature("Island")
+    local plot = island.Plot()
+    if not plot then return end
+    if state.plot ~= plot then
+        state.plot = plot
+        table.clear(state.retryAt)
+    end
+
+    local stock = tycoon.Feature("Stock")
+    if island.Get(nil, stock.AUTO_PLACE_VAR) == false and os.clock() >= (state.retryAt.auto or 0) then
+        state.retryAt.auto = os.clock() + 2
+        plot:Invoke(stock.VERB_AUTO_PLACE, true)
+    end
+
+    if not pumpkinEnabled or island.Plot() ~= plot then return end
+    local lock = tycoon.Feature("Lock")
+    for index = 1, tycoonTypes.MAX_PEDESTALS do
+        if not pumpkinEnabled or island.Plot() ~= plot then return end
+        if lock.Locked(index) then
+            if os.clock() >= (state.retryAt[index] or 0) then
+                state.retryAt[index] = os.clock() + 2
+                plot:Invoke(lock.VERB_LOCK, index, false)
+            end
+        else
+            state.retryAt[index] = nil
+        end
+    end
+    if island.Get(nil, stock.AUTO_PLACE_VAR) ~= false then state.retryAt.auto = nil end
+end
+
+-- Theo dõi cài đặt ngay cả khi vòng đánh bí ngô đang chạy.
+local function startPumpkinSettings()
+    if pumpkinSettingsJob then return end
+    pumpkinSettingsJob = task.defer(function()
+        local state = { retryAt = {} }
+        while pumpkinEnabled do
+            local ok, err = pcall(syncPumpkinSettings, state)
+            if not ok then warn("[Auto Pumpkin] " .. tostring(err)) end
+            task.wait(ok and 0.25 or 2)
+        end
+        pumpkinSettingsJob = nil
+    end)
+end
+
+-- Bật đánh bí ngô và giữ cài đặt tự động.
 features.EventAutoPumpkin = {
     duy = function(on)
         pumpkinEnabled = on
-        if on then startWorker() end
+        if on then
+            startPumpkinSettings()
+            startWorker()
+        end
     end,
 }
 
