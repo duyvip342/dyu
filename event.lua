@@ -501,28 +501,28 @@ end
 -- Auto Pumpkin Upgrade / Nâng cấp các mục đã chọn trong máy.
 do
     local definitions = require(library.Types.PumpkinTycoon.Upgrades)
+    -- Sửa danh sách dropdown tại đây bằng tên hiển thị và ID nâng cấp.
+    local catalog = {
+        { name = "Spawn Luck", track = "SpawnLuck" },
+        { name = "Patch Coin Payout", track = "PumpkinCoins" },
+        { name = "Pumpkin Damage", track = "PumpkinDamage" },
+        { name = "Faster Spawns", track = "RespawnSpeed" },
+        { name = "Merchant Stock", track = "StockSlots" },
+        { name = "Pumpkin Chase Odds", track = "ChaseOdds" },
+        { name = "Island Luck", track = "EggLuck" },
+        { name = "Merchant Luck", track = "MerchantLuck" },
+        { name = "Auto Break", track = "AutoBreakRules" },
+    }
     local options, tracksByName = {}, {}
     local selected = {}
     local retryAt = {}
     local upgrading = false
     local upgradeJob
 
-    -- Lấy cả các mục mua được nằm ngoài danh sách hiển thị của máy.
-    local tracks = table.clone(definitions.TRACKS)
-    local extraTracks = {}
-    for track, row in pairs(definitions.ROWS) do
-        if #row.Powers > 0 and #row.Costs > 0 and not table.find(tracks, track) then
-            table.insert(extraTracks, track)
-        end
-    end
-    table.sort(extraTracks)
-    for _, track in ipairs(extraTracks) do table.insert(tracks, track) end
-
-    -- Dùng tên trong game cho dropdown và cấu hình launcher.
-    for _, track in ipairs(tracks) do
-        local name = definitions.ROWS[track].Name
-        table.insert(options, name)
-        tracksByName[name] = track
+    -- Dùng cùng tên cho dropdown và cấu hình launcher.
+    for _, entry in ipairs(catalog) do
+        table.insert(options, entry.name)
+        tracksByName[entry.name] = entry.track
     end
 
     -- Tìm một cấp đã chọn mà ví Pumpkin Tokens trả được.
@@ -535,10 +535,13 @@ do
 
         local tokens = upgrades.Tokens()
         local now = os.clock()
-        for _, track in ipairs(tracks) do
+        for _, entry in ipairs(catalog) do
+            local track = entry.track
             if not selected[track] or now < (retryAt[track] or 0) then continue end
+            local definition = definitions.ROWS[track]
+            if not definition then continue end
             local tier = upgrades.Tier(track)
-            if tier >= #definitions.ROWS[track].Powers or upgrades.Capped(track, tier) then continue end
+            if tier >= #definition.Powers or upgrades.Capped(track, tier) then continue end
             local cost = upgrades.Cost(track, tier + 1)
             if cost and tokens >= cost then
                 local success = plot:Invoke(upgrades.VERB_BUY, track)
