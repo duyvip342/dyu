@@ -112,6 +112,9 @@ local function postWebhook(url, buildPayload, value)
     return true
 end
 
+-- Chia sẻ luồng gửi Discord với tab Trading.
+features.WebhookDelivery = { post = postWebhook }
+
 -- Gửi thông báo pet tới URL webhook chung.
 local function postDrop(record)
     return postWebhook(webhookUrl, buildDropPayload, record)
