@@ -93,6 +93,7 @@ local urls = {
     "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/mail.lua",
     "https://raw.githubusercontent.com/duyvip453/dyu/main/webhook.lua",
     "https://raw.githubusercontent.com/duyvip453/dyu/main/event.lua",
+    "https://raw.githubusercontent.com/duyvip453/dyu/main/trading.lua",
 }
 
 -- Gộp tính năng từ các module theo tên flag.
@@ -398,6 +399,30 @@ end
 do
     local boothSnipe = trading:CreateGroup({ direction = "column" })
     boothSnipe:CreateSection({ name = "Săn món ở gian hàng" })
+    local sniper = features.TradingSniperBooth
+    if sniper then
+        local config = launchConfig and launchConfig.trading
+        trading:CreateText({ text = sniper.configure(config) })
+        createToggle(trading, "Sniper Booth", "TradingSniperBooth")
+        local report = features.TradingWebhook
+        if report then
+            config = type(config) == "table" and config or {}
+            -- Nhập URL và số dư cảnh báo cho webhook giao dịch.
+            trading:CreateInput({
+                name = "Trading Webhook URL",
+                flag = "TradingWebhookUrl",
+                value = type(config.webhookUrl) == "string" and config.webhookUrl or "",
+                callback = report.setUrl,
+            })
+            trading:CreateInput({
+                name = "Min Diamonds",
+                flag = "TradingMinDiamond",
+                value = tostring(config.minDiamond or 0),
+                callback = report.setMinimum,
+            })
+            createToggle(trading, "Webhook Trading", "TradingWebhook")
+        end
+    end
 
     local boothSeller = trading:CreateGroup({ direction = "column" })
     boothSeller:CreateSection({ name = "Bán ở gian hàng" })
