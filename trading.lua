@@ -7,6 +7,7 @@ local teleport = game:GetService("TeleportService")
 local http = game:GetService("HttpService")
 local network = require(client.Network)
 local currency = require(client.CurrencyCmds)
+local inventory = require(client.InventoryCmds)
 local signal = require(library.Signal)
 local items = require(library.Items)
 local petTypes = require(library.Items.PetItem).Types
@@ -108,13 +109,13 @@ local function webhookReady()
 end
 
 -- Gửi một embed qua luồng HTTP của webhook hiện có.
-local function emit(embed)
+local function emit(buildEmbed)
     if not webhookEnabled or not webhookReady() then return end
     local url = webhookUrl
     local post = delivery.post
     task.defer(function()
         local ran, ok, reason = pcall(post, url, function()
-            return { embeds = { embed }, allowed_mentions = { parse = {} }, attachments = {} }
+            return { embeds = { buildEmbed() }, allowed_mentions = { parse = {} }, attachments = {} }
         end)
         if not ran then
             warn("[Webhook Trading] Không gọi được hàm gửi Discord.")
@@ -124,17 +125,45 @@ local function emit(embed)
     end)
 end
 
+-- Đếm theo nhóm stack của game để giữ đúng cấp và biến thể.
+local function inventoryAmount(item)
+    local ok, amount = pcall(function()
+        if inventory.Container() then return item:CountAny() end
+    end)
+    if ok and type(amount) == "number" then return amount end
+end
+
+-- Chờ kho đồng bộ lượt mua trên luồng gửi webhook.
+local function purchaseInventoryText(item, before, quantity)
+    local deadline = os.clock() + 2
+    local latest
+    repeat
+        local amount = inventoryAmount(item)
+        if amount ~= nil then
+            latest = amount
+            if before ~= nil and amount >= before + quantity then return formatDiamonds(amount) end
+        end
+        task.wait(0.15)
+    until os.clock() >= deadline
+    if latest == nil then return "Chưa đọc được kho" end
+    if before == nil then return formatDiamonds(latest) end
+    return formatDiamonds(latest) .. " (đang đồng bộ)"
+end
+
 -- Chỉ ghi nhận giao dịch sau khi server báo mua thành công.
-local function reportPurchase(name, quantity, price)
+local function reportPurchase(item, name, quantity, price, before)
     local priceText = formatDiamonds(price) .. " 💎/món"
     if quantity > 1 then priceText ..= " · Tổng " .. formatDiamonds(quantity * price) .. " 💎" end
-    emit({
-        title = "Sale!",
-        description = ("**you just bought:**\n%s\nx%d\n**price:**\n%s\n\n**time: %s**"):format(
-            name, quantity, priceText, timeInVietnam()),
-        color = 15595273,
-        thumbnail = { url = saleIcon },
-    })
+    local boughtAt = timeInVietnam()
+    emit(function()
+        return {
+            title = "Sale!",
+            description = ("**you just bought:**\n%s\nx%d\n**price:**\n%s\n**Trong kho:** %s\n\n**time: %s**"):format(
+                name, quantity, priceText, purchaseInventoryText(item, before, quantity), boughtAt),
+            color = 15595273,
+            thumbnail = { url = saleIcon },
+        }
+    end)
 end
 
 -- Chỉ báo hết tiền khi số dư đi từ trên ngưỡng xuống dưới ngưỡng.
@@ -142,12 +171,14 @@ local function checkBalance(balance)
     if not webhookEnabled or type(balance) ~= "number" then return end
     local below = balance < minDiamond
     if below and belowMinimum == false then
-        emit({
-            title = "out of diamond !",
-            description = ("hết tiền 🤣\n**time: %s**"):format(timeInVietnam()),
-            color = 393185,
-            thumbnail = { url = diamondIcon },
-        })
+        emit(function()
+            return {
+                title = "out of diamond !",
+                description = ("hết tiền 🤣\n**time: %s**"):format(timeInVietnam()),
+                color = 393185,
+                thumbnail = { url = diamondIcon },
+            }
+        end)
     end
     belowMinimum = below
 end
@@ -294,14 +325,16 @@ local function buyListing(booths, candidate)
     local now = workspace:GetServerTimeNow()
     local quantity = quantityFor(row, candidate.rule, balance, now)
     if quantity < 1 then return end
-    local price, name, amount = row.DiamondCost, row.Item:GetName(), row.Item:GetAmount()
+    local item = row.Item
+    local price, name, amount = row.DiamondCost, item:GetName(), item:GetAmount()
+    local before = webhookEnabled and inventoryAmount(item) or nil
     pending[candidate.key] = { untilAt = now + 4 }
     local accepted, reason = network.Invoke("Booths_RequestPurchase", booth.PlayerID or candidate.owner.UserId,
         { [candidate.id] = quantity }, scanner.Create(-1))
     if accepted then
         pending[candidate.key] = { amount = amount, untilAt = workspace:GetServerTimeNow() + 12 }
         lastNotice = nil
-        reportPurchase(name, quantity, price)
+        if webhookEnabled then reportPurchase(item, name, quantity, price, before) end
     else
         notice(tostring(reason or "Game từ chối mua listing."))
     end
