@@ -625,11 +625,19 @@ end
 do
     local cocoaData = require(library.Util.PumpkinTycoonCocoa)
     local boosts = require(client.BoostCmds)
-    local minimumCoins = 40000000000
+    local minimumCoins = 40_000_000_000
+    local environment = type(getgenv) == "function" and getgenv() or _G
+    local runToken = {}
+    environment.RobloxHubHotCocoaRun = runToken
     local offers = {}
     local nextAxis = "Coins"
     local enabled = false
     local job
+
+    -- Chỉ phiên vừa nạp được phép chạy Auto Hot Coca.
+    local function isActive()
+        return enabled and environment.RobloxHubHotCocoaRun == runToken
+    end
 
     -- Lấy đúng hai offer Coin và Island Luck từ cấu hình quầy.
     for _, offer in ipairs(cocoaData.OFFERS) do
@@ -638,20 +646,22 @@ do
         end
     end
 
-    -- Chỉ mua một boost khi cả hai timer đã về 0.
+    -- Xét timer riêng cho Coin và Island Luck khi số dư trên 40B.
     local function buyCocoa()
-        if not isInEvent() then return 5 end
+        if not isActive() or not isInEvent() then return 5 end
         local cocoa = tycoon.Feature("Cocoa")
         if not cocoa.Enabled() or not cocoa.Unlocked() then return 5 end
-        local coins = currency.Get(tycoonTypes.COIN)
-        if type(coins) ~= "number" or coins <= minimumCoins then return 5 end
-        local coinOffer, luckOffer = offers.Coins, offers.IslandLuck
-        if not coinOffer or not luckOffer then return 5 end
-        if boosts.GetTimer(coinOffer.Id) ~= 0 or boosts.GetTimer(luckOffer.Id) ~= 0 then return 5 end
+        local coins = cocoa.Coins()
+        if type(coins) ~= "number" or not (coins > minimumCoins) then return 5 end
+        local offer = offers[nextAxis]
+        if not offer or boosts.GetTimer(offer.Id) ~= 0 then
+            local otherAxis = nextAxis == "Coins" and "IslandLuck" or "Coins"
+            offer = offers[otherAxis]
+            if not offer or boosts.GetTimer(offer.Id) ~= 0 then return 5 end
+        end
 
         local plot = tycoon.Feature("Island").Plot()
         if not plot then return 5 end
-        local offer = offers[nextAxis]
         local costPerMinute = cocoaData.CostPerMinute(offer.Tier)
         if type(costPerMinute) ~= "number" or costPerMinute <= 0 then return 15 end
 
@@ -659,12 +669,16 @@ do
         local budget = math.floor(coins / 3)
         local minutes = math.floor(budget / costPerMinute)
         local quote = cocoaData.Quote(offer, 0, minutes)
-        if quote.reason or quote.seconds < 60 or quote.cost > budget or not enabled then return 15 end
+        if quote.reason or quote.seconds < 60 or quote.cost > budget then return 15 end
 
-        local success = plot:Invoke(cocoaData.VERB_BUY, offer.Key, quote.seconds // 60)
-        if success == true then
-            nextAxis = nextAxis == "Coins" and "IslandLuck" or "Coins"
-        end
+        -- Kiểm tra lại số dư và timer của boost được chọn trước khi mua.
+        local currentCoins = cocoa.Coins()
+        if not isActive() or type(currentCoins) ~= "number" or not (currentCoins > minimumCoins)
+            or quote.cost > math.floor(currentCoins / 3) or boosts.GetTimer(offer.Id) ~= 0 then return 5 end
+
+        -- Ưu tiên boost kia ở lượt sau nếu cả hai cùng hết.
+        nextAxis = offer.Axis == "Coins" and "IslandLuck" or "Coins"
+        plot:Invoke(cocoaData.VERB_BUY, offer.Key, quote.seconds // 60)
         return 15
     end
 
@@ -672,9 +686,9 @@ do
     features.EventAutoHotCoca = {
         duy = function(on)
             enabled = on
-            if not on or job then return end
+            if not isActive() or job then return end
             job = task.defer(function()
-                while enabled do
+                while isActive() do
                     local ok, delay = pcall(buyCocoa)
                     task.wait(ok and delay or 15)
                 end
