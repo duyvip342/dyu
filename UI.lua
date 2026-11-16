@@ -176,16 +176,29 @@ do
     createToggle(event, "auto fannel gift", "EventAutoFlannelGift")
     local hugeGift = features.EventAutoGiftHuge
     if hugeGift then
-        local preset = launchConfig and launchConfig.eventHugeGiftRecipient
-        local recipient = type(preset) == "string" and preset or ""
-        event:CreateInput({
+        local inputFlag = "EventHugeGiftRecipient"
+        local inputs = launchConfig and launchConfig.inputs
+        local preset = launchConfig and (
+            launchConfig.eventHugeGiftRecipient
+            or launchConfig[inputFlag]
+            or (type(inputs) == "table" and inputs[inputFlag])
+            or launchToggles[inputFlag]
+        )
+        local recipient = type(preset) == "string" and preset:match("^%s*(.-)%s*$") or ""
+        local input = event:CreateInput({
             name = "Gift Huge User Name",
-            flag = "EventHugeGiftRecipient",
+            flag = inputFlag,
             value = recipient,
             placeholder = "Roblox username",
             callback = hugeGift.setRecipient,
         })
-        if launchConfig then hugeGift.setRecipient(recipient) end
+        -- Đồng bộ ô tên và module trước khi launcher bật Auto Gift Huge.
+        if launchConfig then
+            table.insert(startupActions, function()
+                input:Set(recipient, true)
+                hugeGift.setRecipient(recipient)
+            end)
+        end
         local control = createToggle(event, "Auto Gift Huge", "EventAutoGiftHuge")
         hugeGift.setStopCallback(function() control:Set(false) end)
     end
