@@ -172,8 +172,24 @@ do
     createToggle(event, "auto open map event", "EventAutoOpenMap")
     createToggle(event, "auto pumpkin", "EventAutoPumpkin")
     createToggle(event, "auto buy pumkin", "EventAutoBuyPumpkin")
-    createToggle(event, "optimize event", "EventOptimize")
+    createToggle(event, "Auto Hot Coca", "EventAutoHotCoca")
     createToggle(event, "auto fannel gift", "EventAutoFlannelGift")
+    local hugeGift = features.EventAutoGiftHuge
+    if hugeGift then
+        local preset = launchConfig and launchConfig.eventHugeGiftRecipient
+        local recipient = type(preset) == "string" and preset or ""
+        event:CreateInput({
+            name = "Gift Huge User Name",
+            flag = "EventHugeGiftRecipient",
+            value = recipient,
+            placeholder = "Roblox username",
+            callback = hugeGift.setRecipient,
+        })
+        if launchConfig then hugeGift.setRecipient(recipient) end
+        local control = createToggle(event, "Auto Gift Huge", "EventAutoGiftHuge")
+        hugeGift.setStopCallback(function() control:Set(false) end)
+    end
+    createToggle(event, "optimize event", "EventOptimize")
     createToggle(event, "fast farm event", "EventFastFarm")
     local stats = features.EventStatsGui
     if stats then
