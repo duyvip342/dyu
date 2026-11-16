@@ -13,7 +13,6 @@ local items = require(library.Items)
 local petTypes = require(library.Items.PetItem).Types
 local normalPlace = require(library.Modules.PlaceFile).LocalPlaces.Trading
 local launcherUrl = "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/UI.lua"
-local saleIcon = "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRGqBzt8-gWyK4EjXzygBwxYJE9zJZGbTviQfXU6-Ui5A&s"
 local diamondIcon = "https://tr.rbxcdn.com/180DAY-9b4d094e1819c1b5ea67575b824a9101/150/150/Image/Png/noFilter"
 
 local environment = type(getgenv) == "function" and getgenv() or _G
@@ -156,13 +155,18 @@ local function reportPurchase(item, name, quantity, price, before)
     if quantity > 1 then priceText ..= " · Tổng " .. formatDiamonds(quantity * price) .. " 💎" end
     local boughtAt = timeInVietnam()
     emit(function()
-        return {
+        local embed = {
             title = "Sale!",
             description = ("**you just bought:**\n%s\nx%d\n**price:**\n%s\n**Trong kho:** %s\n\n**time: %s**"):format(
                 name, quantity, priceText, purchaseInventoryText(item, before, quantity), boughtAt),
             color = 15595273,
-            thumbnail = { url = saleIcon },
         }
+        -- Lấy icon của đúng món đã mua cho thumbnail Discord.
+        if type(delivery.thumbnail) == "function" then
+            local ok, image = pcall(function() return delivery.thumbnail(item:GetIcon()) end)
+            if ok and type(image) == "string" then embed.thumbnail = { url = image } end
+        end
+        return embed
     end)
 end
 
