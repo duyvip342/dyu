@@ -1,441 +1,210 @@
--- Trading / Quét giá booth, mua theo danh sách và báo Discord.
 local features = {}
-local library = game:GetService("ReplicatedStorage").Library
-local client = library.Client
-local player = game:GetService("Players").LocalPlayer
-local teleport = game:GetService("TeleportService")
-local http = game:GetService("HttpService")
-local network = require(client.Network)
-local currency = require(client.CurrencyCmds)
-local signal = require(library.Signal)
-local items = require(library.Items)
-local petTypes = require(library.Items.PetItem).Types
-local normalPlace = require(library.Modules.PlaceFile).LocalPlaces.Trading
-local launcherUrl = "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/UI.lua"
-local saleIcon = "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRGqBzt8-gWyK4EjXzygBwxYJE9zJZGbTviQfXU6-Ui5A&s"
-local diamondIcon = "https://tr.rbxcdn.com/180DAY-9b4d094e1819c1b5ea67575b824a9101/150/150/Image/Png/noFilter"
 
-local environment = type(getgenv) == "function" and getgenv() or _G
-local runToken = {}
-environment.RobloxHubTradingRun = runToken
-local rules, visited, pending = {}, {}, {}
-local sniperEnabled, webhookEnabled, hopEnabled = false, false, true
-local webhookUrl, minDiamond = "", 0
-local belowMinimum, delivery, job
-local nextTravelAt, searchIndex = 0, 0
-local nextSearchAt, pendingHop
-local idleBeforeSearch = 5
-local rejectedServers = {}
-local lastNotice
-local suffixes = { [""] = 1, k = 1e3, m = 1e6, b = 1e9, t = 1e12 }
-local variants = {
-    normal = { petTypes.Normal, false, "Normal" },
-    golden = { petTypes.Golden, false, "Golden" },
-    rainbow = { petTypes.Rainbow, false, "Rainbow" },
-    shiny = { petTypes.Normal, true, "Shiny" },
-    shinygolden = { petTypes.Golden, true, "Shiny Golden" },
-    shinyrainbow = { petTypes.Rainbow, true, "Shiny Rainbow" },
+local lib = game:GetService("ReplicatedStorage").Library
+local net = require(lib.Client.Network)
+local save = require(lib.Client.Save)
+local items = require(lib.Items)
+local constants = require(lib.Balancing.Constants)
+local mailbox = require(lib.Types.Mailbox)
+local flags = require(lib.Client.FFlags)
+local player = game:GetService("Players").LocalPlayer
+local mailJob
+
+-- Tự nhận toàn bộ thư; khi server báo cooldown thì đợi 30 giây.
+features.MailAutoClaim = {
+    duy = function(on)
+        if mailJob then
+            task.cancel(mailJob)
+            mailJob = nil
+        end
+        if not on then return end
+
+        mailJob = task.defer(function()
+            while true do
+                local ok, result, message = pcall(net.Invoke, "Mailbox: Claim All")
+                local responseText = string.lower(tostring(message or result or ""))
+                local cooldown = responseText:find("wait") and responseText:find("second")
+                task.wait(cooldown and 30 or 5)
+            end
+        end)
+    end,
 }
 
--- Chuẩn hóa chuỗi do launcher hoặc item cung cấp.
-local function clean(value)
-    return type(value) == "string" and value:match("^%s*(.-)%s*$") or ""
+-- Auto Gift / Mỗi dòng là một món, có thể gửi qua nhiều stack cùng tên.
+-- Sửa Class và ID nội bộ của món tại đây. Thứ tự ID trong mỗi nhóm là thứ tự dropdown.
+local giftCatalog = {
+    Currency = { "Diamonds" },
+    Pet = { "Stingray" },
+    Consumable = { "Patch Coin Boost II", "Pumpkin Damage Boost II", "Island Luck Boost II" },
+}
+
+-- Ghép tên boost cấp II với ID gốc và cấp trong inventory.
+local tierTwoBoostIds = {
+    ["Patch Coin Boost II"] = "Patch Coin Boost",
+    ["Pumpkin Damage Boost II"] = "Pumpkin Damage Boost",
+    ["Island Luck Boost II"] = "Island Luck Boost",
+}
+
+-- Giữ các dòng Auto Gift theo thứ tự Add Item.
+local rules = {}
+local recipient = ""
+local giftEnabled = false
+local giftJob
+local giftRevision = 0
+-- Quy đổi hậu tố k, m, b và t sang hệ số.
+local suffixes = { [""] = 1, k = 1e3, m = 1e6, b = 1e9, t = 1e12 }
+
+-- Đổi Amount hoặc Keep thành số nguyên hợp lệ.
+local function parseAmount(text)
+    local number, suffix = text:lower():gsub(",", ""):match("^%s*(%d+%.?%d*)%s*([kmbt]?)%s*$")
+    if not number then return nil end
+    local amount = tonumber(number) * suffixes[suffix]
+    if amount > 2^53 - 1 or amount % 1 ~= 0 then return nil end
+    return amount
 end
 
--- Đọc số kim cương nguyên hoặc giá có hậu tố k, m, b và t.
-local function parseDiamonds(value)
-    if type(value) == "string" then
-        local number, suffix = value:lower():gsub(",", ""):match("^%s*(%d+%.?%d*)%s*([kmbt]?)%s*$")
-        value = number and tonumber(number) * suffixes[suffix]
-    end
-    if type(value) == "number" and value >= 0 and value < 2^53 and value % 1 == 0 then return value end
-end
-
--- In cùng một lỗi một lần cho mỗi trạng thái liên tiếp.
-local function notice(reason)
-    if lastNotice == reason then return end
-    lastNotice = reason
-    warn("[Trading] " .. reason)
-end
-
--- Hiển thị số kim cương đầy đủ theo nhóm ba chữ số.
-local function formatDiamonds(value)
-    return (("%.0f"):format(value):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
-end
-
--- Định dạng thời điểm theo múi giờ Việt Nam.
-local function timeInVietnam()
-    return os.date("!%H:%M:%S %d/%m/%Y", os.time() + 7 * 3600) .. " (UTC+7)"
-end
-
--- Gửi một embed qua luồng HTTP của webhook hiện có.
-local function emit(embed)
-    if not webhookEnabled or webhookUrl == "" or not delivery then return end
-    local url = webhookUrl
-    task.defer(function()
-        local ok, reason = delivery.post(url, function()
-            return { embeds = { embed }, allowed_mentions = { parse = {} }, attachments = {} }
-        end)
-        if not ok then warn("[Webhook Trading] " .. reason) end
+-- Kiểm tra stack có đủ điều kiện gửi qua mail.
+local function canGiftItem(class, entry)
+    if entry._lk then return false end
+    local ok, tradable = pcall(function()
+        return items.From(class, table.clone(entry)):IsTradable()
     end)
+    return ok and tradable
 end
 
--- Chỉ ghi nhận giao dịch sau khi server báo mua thành công.
-local function reportPurchase(name, quantity, price)
-    local priceText = formatDiamonds(price) .. " 💎/món"
-    if quantity > 1 then priceText ..= " · Tổng " .. formatDiamonds(quantity * price) .. " 💎" end
-    emit({
-        title = "Sale!",
-        description = ("**you just bought:**\n%s\nx%d\n**price:**\n%s\n\n**time: %s**"):format(
-            name, quantity, priceText, timeInVietnam()),
-        color = 15595273,
-        thumbnail = { url = saleIcon },
-    })
+-- Lấy kho hiện tại từ Save của client.
+local function giftInventory()
+    local data = save.Get()
+    return data and data.Inventory or {}, data
 end
 
--- Chỉ báo hết tiền khi số dư đi từ trên ngưỡng xuống dưới ngưỡng.
-local function checkBalance(balance)
-    if not webhookEnabled or type(balance) ~= "number" then return end
-    local below = balance < minDiamond
-    if below and belowMinimum == false then
-        emit({
-            title = "out of diamond !",
-            description = ("hết tiền 🤣\n**time: %s**"):format(timeInVietnam()),
-            color = 393185,
-            thumbnail = { url = diamondIcon },
-        })
+-- Tính phí gửi thư theo dữ liệu mailbox của game.
+local function mailFee(data)
+    local multiplier = flags.Get(flags.Keys.DiamondSink_MailboxFee_Mult)
+    if type(multiplier) ~= "number" or multiplier <= 0 then multiplier = 1 end
+    local base = math.floor(constants.MailboxDiamondCost * multiplier)
+    if not data.MailboxResetTime or data.MailboxResetTime < workspace:GetServerTimeNow()
+        or (data.Gamepasses and data.Gamepasses.VIP) or player:GetAttribute("Partner") then
+        return base
     end
-    belowMinimum = below
+    return math.min(math.floor(base * mailbox.DiamondCostGrowthRate^(data.MailboxSendsSinceReset or 0)),
+        math.floor(mailbox.DiamondCostCap * multiplier))
 end
 
--- Giữ danh sách server vừa quét ở kích thước cố định.
-local function rememberServer(id)
-    if type(id) ~= "string" or id == "" or table.find(visited, id) then return end
-    table.insert(visited, id)
-    if #visited > 12 then table.remove(visited, 1) end
-end
-
--- Chuyển cấu hình Trading sang lần chạy tiếp theo qua executor.
-local function queueResume(targetJobId)
-    local queue = queue_on_teleport or queue_on_tp or queueonteleport
-    if type(queue) ~= "function" then
-        notice("Executor thiếu queue_on_teleport. Cần chạy launcher lại ở server mới.")
-        return false
+-- Đếm Diamonds có thể dùng để kiểm tra phí.
+local function countDiamonds(inventory)
+    local count = 0
+    for _, entry in pairs(inventory.Currency or {}) do
+        if entry.id == "Diamonds" then count += entry._am or 1 end
     end
-    local config = {
-        toggles = { TradingSniperBooth = sniperEnabled, TradingWebhook = webhookEnabled },
-        trading = { items = rules, webhookUrl = webhookUrl, minDiamond = minDiamond, hop = hopEnabled,
-            visited = visited, searchIndex = searchIndex },
-    }
-    local source = ([=[
-local env = type(getgenv) == "function" and getgenv() or _G
-if not game:IsLoaded() then game.Loaded:Wait() end
-local expectedJob = %q
-if game.PlaceId ~= %d or (expectedJob ~= "" and game.JobId ~= expectedJob) then return end
-if env.RobloxHubTradingResumedJob == game.JobId then return end
-env.RobloxHubTradingResumedJob = game.JobId
-env.RobloxHubConfig = game:GetService("HttpService"):JSONDecode(%q)
-assert(loadstring(game:HttpGet(%q)))()
-]=]):format(targetJobId or "", normalPlace, http:JSONEncode(config), launcherUrl)
-    local ok = pcall(queue, source)
-    if not ok then notice("Executor không thể nạp lại launcher sau teleport.") end
-    return ok
+    return count
 end
 
--- Dùng đúng đường vào Trading Plaza Normal của game.
-local function enterNormal()
-    if os.clock() < nextTravelAt then return end
-    nextTravelAt = os.clock() + 30
-    queueResume()
-    local ok, reason = network.Invoke("Travel to Trading Plaza", normalPlace)
-    if not ok then notice(tostring(reason or "Game từ chối vào Trading Plaza Normal.")) end
-end
-
--- Đọc bảng booth đã tải trong client thay vì quét giao diện.
-local function getBooths()
-    if not signal.Invoke("Booths_IsLoaded") then return nil end
-    local getCallback = getcallbackvalue or getcallbackmember
-    if type(getCallback) ~= "function" then
-        notice("Executor không hỗ trợ đọc dữ liệu booth.")
-        return nil
+-- Tìm số lượng và stack lớn nhất theo đúng Class và Item ID.
+local function findGiftStock(inventory, rule)
+    local stock, largestUid, largest = 0, nil, 0
+    for uid, entry in pairs(inventory[rule.class] or {}) do
+        if entry.id == rule.id and (not rule.tier or entry.tn == rule.tier) and canGiftItem(rule.class, entry) then
+            local amount = entry._am or 1
+            stock += amount
+            if amount > largest then largestUid, largest = uid, amount end
+        end
     end
-    local callback = getCallback(signal.Invoked("Booths_GetIdWithStackKey"), "OnInvoke")
-    if type(callback) ~= "function" then return nil end
-    local cache, value = debug.getupvalue(callback, 1)
-    if type(value) == "table" then cache = value end
-    if type(cache) == "table" then return cache end
-    notice("Chưa đọc được bảng listing của Trading Plaza.")
+    return stock, largestUid, largest
 end
 
--- Khớp tên nội bộ hoặc tên hiển thị và biến thể pet đã chọn.
-local function matches(rule, item)
-    if item.Class.Name ~= rule.class then return false end
-    local variant = rule.variant and variants[rule.variant]
-    if variant and (item:GetType() ~= variant[1] or item:IsShiny() ~= variant[2]) then return false end
-    local needle = rule.name:lower()
-    return item:GetId():lower() == needle or item:GetName():lower() == needle
+-- Gửi đúng Amount trong một thư khi stack và phần Keep đều đủ.
+local function sendRule(rule, revision)
+    local inventory, data = giftInventory()
+    if not data then return end
+    local stock, uid, stack = findGiftStock(inventory, rule)
+    local quantity = rule.amount
+    if not uid or stack < quantity then return end
+    local fee = mailFee(data)
+    if countDiamonds(inventory) < fee then return end
+    local isDiamonds = rule.class == "Currency" and rule.name == "Diamonds"
+    local available = stock - rule.keep - (isDiamonds and fee or 0)
+    if available < quantity or not giftEnabled or revision ~= giftRevision then return end
+
+    -- Chờ trước khi đọc lại kho nếu server báo gửi lỗi.
+    local ok, accepted = pcall(net.Invoke, "EF_Relay", recipient, "", rule.class, uid, quantity)
+    if not ok or not accepted then
+        task.wait(5)
+        return
+    end
+
+    -- Đợi kho xác nhận trừ stack trước khi gửi thư kế tiếp.
+    repeat
+        task.wait(0.25)
+        local live, liveData = giftInventory()
+        local entry = live[rule.class] and live[rule.class][uid]
+        if liveData and (not entry or (entry._am or 1) < stack) then break end
+    until not giftEnabled or revision ~= giftRevision
 end
 
--- Tính số lượng mua được theo giá từng món và ví hiện tại.
-local function quantityFor(row, rule, balance, now)
-    if not row or not row.Item or type(row.ReadyTimestamp) ~= "number" or row.ReadyTimestamp > now then return 0 end
-    local price = row.DiamondCost
-    if type(price) ~= "number" or price <= 0 or price > rule.minAmount then return 0 end
-    return math.min(row.Item:GetAmount(), math.floor(balance / price))
-end
-
--- Ưu tiên quy tắc đầu tiên có hàng và giá thấp nhất trong quy tắc đó.
-local function findListing(booths, balance)
-    local now = workspace:GetServerTimeNow()
-    local best
-    for owner, booth in pairs(booths) do
-        if owner == player or type(booth.Listings) ~= "table" then continue end
-        for id, row in pairs(booth.Listings) do
-            if not row.Item then continue end
-            local key = tostring(booth.PlayerID or owner.UserId) .. ":" .. tostring(id)
-            local held = pending[key]
-            local eligible = not held or (held.amount and row.Item:GetAmount() < held.amount) or held.untilAt <= now
-            for priority, rule in ipairs(rules) do
-                if not matches(rule, row.Item) then continue end
-                if not rule.stackKey then rule.stackKey = row.Item:StackKey() end
-                if eligible and quantityFor(row, rule, balance, now) > 0
-                    and (not best or priority < best.priority
-                        or (priority == best.priority and row.DiamondCost < best.price)) then
-                    best = { owner = owner, boothId = booth.BoothID, id = id, key = key,
-                        priority = priority, price = row.DiamondCost, rule = rule }
-                end
+-- Duyệt lần lượt các quy tắc gửi quà khi Auto Gift đang bật.
+local function autoGift()
+    while giftEnabled do
+        local revision = giftRevision
+        if recipient ~= "" and recipient:lower() ~= player.Name:lower() then
+            for _, rule in ipairs(rules) do
+                if not giftEnabled or revision ~= giftRevision then break end
+                sendRule(rule, revision)
             end
         end
+        task.wait(2)
     end
-    for key, held in pairs(pending) do
-        if held.untilAt <= now then pending[key] = nil end
-    end
-    return best
+    giftJob = nil
 end
 
--- Đứng cạnh booth theo cùng điểm đến mà Trading Terminal dùng.
-local function approachBooth(boothId)
-    local model = signal.Invoke("Booths_GetPlaceholderModelFromID", tostring(boothId))
-    local character = player.Character
-    local root = character and character.PrimaryPart
-    if not model or not root then return end
-    local pivot = model:GetPivot()
-    if (root.Position - pivot.Position).Magnitude <= 16 then return end
-    local target = pivot * CFrame.new(0, 0, -8)
-    character:PivotTo(target)
-    task.wait(0.3)
-end
-
--- Xác nhận lại listing và số dư ngay trước khi gửi lệnh mua.
-local function buyListing(booths, candidate)
-    local scanner = require(library.Modules.LuaScanner)
-    approachBooth(candidate.boothId)
-    if not sniperEnabled or environment.RobloxHubTradingRun ~= runToken then return end
-    local booth = booths[candidate.owner]
-    local row = booth and booth.Listings[candidate.id]
-    if not row or not row.Item or not matches(candidate.rule, row.Item) then return end
-    local balance = currency.Get("Diamonds")
-    if type(balance) ~= "number" then return end
-    local now = workspace:GetServerTimeNow()
-    local quantity = quantityFor(row, candidate.rule, balance, now)
-    if quantity < 1 then return end
-    local price, name, amount = row.DiamondCost, row.Item:GetName(), row.Item:GetAmount()
-    pending[candidate.key] = { untilAt = now + 4 }
-    local accepted, reason = network.Invoke("Booths_RequestPurchase", booth.PlayerID or candidate.owner.UserId,
-        { [candidate.id] = quantity }, scanner.Create(-1))
-    if accepted then
-        pending[candidate.key] = { amount = amount, untilAt = workspace:GetServerTimeNow() + 12 }
-        lastNotice = nil
-        reportPurchase(name, quantity, price)
-    else
-        notice(tostring(reason or "Game từ chối mua listing."))
-    end
-end
-
--- Dựng StackKey từ loại vật phẩm đã chọn khi booth hiện tại chưa có món đó.
-local function terminalKey(rule)
-    if rule.stackKey then return rule.stackKey end
-    local data = { id = rule.name }
-    local variant = rule.variant and variants[rule.variant]
-    if variant then
-        data.pt = variant[1] ~= petTypes.Normal and variant[1] or nil
-        data.sh = variant[2] or nil
-    end
-    local ok, key = pcall(function() return items.From(rule.class, data):StackKey() end)
-    if ok then rule.stackKey = key end
-    return rule.stackKey
-end
-
--- Gỡ listener ngay khi lần chuyển server kết thúc hoặc bị hủy.
-local function clearPendingHop()
-    if not pendingHop then return end
-    pendingHop.connection:Disconnect()
-    pendingHop = nil
-end
-
--- Chuyển sang món kế tiếp khi Roblox từ chối server đích.
-local function failHop(reason)
-    rejectedServers[pendingHop.jobId] = os.clock() + 30
-    clearPendingHop()
-    nextSearchAt = os.clock() + 1
-    notice("Chuyển server thất bại: " .. tostring(reason))
-end
-
--- Dùng Terminal sau khi đủ 5 giây không có listing phù hợp.
-local function searchNextServer()
-    if not hopEnabled or not nextSearchAt or os.clock() < nextSearchAt then return end
-    if type(queue_on_teleport or queue_on_tp or queueonteleport) ~= "function" then return end
-    local now = os.clock()
-    for id, expiresAt in pairs(rejectedServers) do
-        if expiresAt <= now then rejectedServers[id] = nil end
-    end
-    searchIndex = searchIndex % #rules + 1
-    local retryDelay = searchIndex == #rules and idleBeforeSearch or 1
-    nextSearchAt = now + retryDelay
-    local rule = rules[searchIndex]
-    local key = terminalKey(rule)
-    if not key then return end
-    local okVoice, voice = pcall(function()
-        return game:GetService("VoiceChatService"):IsVoiceEnabledForUserIdAsync(player.UserId)
-    end)
-    if not sniperEnabled or environment.RobloxHubTradingRun ~= runToken then return end
-    local ok, result, reason = pcall(network.Invoke, "TradingTerminal_Search", rule.class, key, nil, okVoice and voice == true)
-    if not sniperEnabled or environment.RobloxHubTradingRun ~= runToken then return end
-    nextSearchAt = os.clock() + retryDelay
-    if not ok or type(result) ~= "table" then
-        local message = tostring((ok and reason or result) or "không tìm thấy listing")
-        local cooldown = tonumber(message:lower():match("wait (%d+) seconds?"))
-        if cooldown then nextSearchAt = os.clock() + math.max(cooldown, retryDelay) end
-        if not ok then notice(("Terminal · %s · %s"):format(rule.name, message)) end
-        return
-    end
-    if result.place_id ~= normalPlace or type(result.job_id) ~= "string" or result.job_id == ""
-        or result.job_id == game.JobId or table.find(visited, result.job_id)
-        or (rejectedServers[result.job_id] or 0) > os.clock() then return end
-
-    -- Kiểm tra lại server hiện tại sau thời gian chờ phản hồi Terminal.
-    local balance = currency.Get("Diamonds")
-    local booths = getBooths()
-    if not booths or type(balance) ~= "number" or balance <= 0 or findListing(booths, balance) then
-        nextSearchAt = nil
-        return
-    end
-    rememberServer(game.JobId)
-    if not queueResume(result.job_id) then return end
-
-    -- Chờ lỗi teleport bất đồng bộ như server đầy trước khi thử món khác.
-    local attempt = { jobId = result.job_id, deadline = os.clock() + 25 }
-    attempt.connection = teleport.TeleportInitFailed:Connect(function(who, outcome, message, placeId, options)
-        if pendingHop ~= attempt or who ~= player or placeId ~= normalPlace then return end
-        local failedJob = options and options.ServerInstanceId
-        if failedJob and failedJob ~= "" and failedJob ~= result.job_id then return end
-        failHop(message ~= "" and message or outcome)
-    end)
-    pendingHop = attempt
-    -- Sniper tự đọc lại booth sau khi đến server tìm được.
-    local sent, failure = pcall(teleport.TeleportToPlaceInstance, teleport, normalPlace, result.job_id, player)
-    if not sent and pendingHop == attempt then failHop(failure) end
-end
-
--- Chỉ quét và mua ở Plaza Normal.
-local function tick()
-    local balance = currency.Get("Diamonds")
-    checkBalance(balance)
-    if not sniperEnabled then return end
-    if pendingHop then
-        if os.clock() >= pendingHop.deadline then failHop("hết thời gian chờ Roblox phản hồi") end
-        return
-    end
-    if game.PlaceId ~= normalPlace then
-        enterNormal()
-    elseif #rules > 0 and type(balance) == "number" and balance > 0 then
-        local booths = getBooths()
-        if not booths then
-            nextSearchAt = nil
-            return
-        end
-        local candidate = findListing(booths, balance)
-        if candidate then
-            nextSearchAt = nil
-            buyListing(booths, candidate)
-        else
-            nextSearchAt = nextSearchAt or os.clock() + idleBeforeSearch
-            searchNextServer()
-        end
-    else
-        nextSearchAt = nil
-    end
-end
-
--- Dùng chung một worker cho hai toggle trong Trading.
-local function start(shared)
-    delivery = shared and shared.WebhookDelivery or delivery
-    if job or not (sniperEnabled or webhookEnabled) then return end
-    job = task.defer(function()
-        while environment.RobloxHubTradingRun == runToken and (sniperEnabled or webhookEnabled) do
-            local ok, reason = pcall(tick)
-            if not ok then notice(tostring(reason)) end
-            task.wait(ok and 1 or 5)
-        end
-        clearPendingHop()
-        job = nil
-    end)
-end
-
--- Chuẩn hóa quy tắc săn từ cấu hình launcher.
-local function configure(config)
-    config = type(config) == "table" and config or {}
-    webhookUrl = clean(config.webhookUrl)
-    minDiamond = parseDiamonds(config.minDiamond) or 0
-    hopEnabled = config.hop ~= false
-    searchIndex = type(config.searchIndex) == "number" and math.max(0, math.floor(config.searchIndex)) or 0
-    for _, id in ipairs(type(config.visited) == "table" and config.visited or {}) do rememberServer(id) end
-    table.clear(rules)
-    local descriptions = {}
-    for index, entry in ipairs(type(config.items) == "table" and config.items or {}) do
-        if type(entry) ~= "table" then continue end
-        local class, name = clean(entry.class), clean(entry.name)
-        local price = parseDiamonds(entry.minAmount or entry.maxUnitPrice)
-        local variant = clean(entry.variant or entry.varities):lower():gsub("[^%a]", ""):gsub("gold$", "golden")
-        if variant == "goldenshiny" or variant == "goldshiny" then variant = "shinygolden" end
-        if variant == "rainbowshiny" then variant = "shinyrainbow" end
-        if class == "" or name == "" or not price or price < 1 or (class == "Pet" and not variants[variant]) then
-            descriptions[#descriptions + 1] = ("Dòng %d thiếu Class, tên, giá hoặc biến thể pet."):format(index)
-            continue
-        end
-        variant = class == "Pet" and variant or nil
-        rules[#rules + 1] = { class = class, name = name, minAmount = price, variant = variant }
-        descriptions[#descriptions + 1] = ("%s · %s%s · ≤ %s 💎/món"):format(class, name,
-            variant and (" · " .. variants[variant][3]) or "", formatDiamonds(price))
-    end
-    return #descriptions > 0 and table.concat(descriptions, "\n") or "Danh sách săn chưa có món."
-end
-
-features.TradingSniperBooth = {
-    configure = configure,
-    duy = function(on, shared)
-        if on and not sniperEnabled then
-            nextSearchAt = nil
-            nextTravelAt = 0
-        end
-        sniperEnabled = on
-        if not on then clearPendingHop() end
-        start(shared)
+-- Xuất chức năng cấu hình Auto Gift cho tab Mail.
+features.MailAutoGift = {
+    getFee = mailFee,
+    setRecipient = function(value)
+        local name = value:match("^%s*(.-)%s*$")
+        if recipient ~= name then recipient = name; giftRevision += 1 end
     end,
-}
-
-features.TradingWebhook = {
-    setUrl = function(value) webhookUrl = clean(value) end,
-    setMinimum = function(value)
-        local minimum = parseDiamonds(value)
-        if minimum == nil then return end
-        minDiamond = minimum
-        belowMinimum = nil
+    -- Liệt kê Class từ bảng giftCatalog.
+    getClasses = function()
+        local classes = {}
+        for class in pairs(giftCatalog) do classes[#classes + 1] = class end
+        table.sort(classes)
+        return classes
     end,
-    duy = function(on, shared)
-        if on and not webhookEnabled then belowMinimum = nil end
-        webhookEnabled = on
-        start(shared)
+    -- Lấy riêng các Item ID của Class đã chọn.
+    getNames = function(class)
+        return table.clone(giftCatalog[class] or {})
+    end,
+    add = function(class, name, amountText, keepText)
+        local ids = giftCatalog[class]
+        if not ids or not name or not table.find(ids, name) then
+            return false, "Chọn Item Class và Item ID trong cùng nhóm"
+        end
+        local amount, keep = parseAmount(amountText), parseAmount(keepText)
+        if not amount or amount <= 0 or keep == nil then
+            return false, "Amount phải lớn hơn 0 và Keep từ 0 trở lên"
+        end
+        local boostId = class == "Consumable" and tierTwoBoostIds[name]
+        rules[#rules + 1] = {
+            class = class,
+            name = name,
+            id = boostId or name,
+            tier = boostId and 2 or nil,
+            amount = amount,
+            keep = keep,
+        }
+        giftRevision += 1
+        return true
+    end,
+    -- Xóa quy tắc Auto Gift được thêm gần nhất.
+    removeLast = function()
+        if #rules > 0 then table.remove(rules); giftRevision += 1 end
+    end,
+    getList = function() return table.clone(rules) end,
+    duy = function(enabled)
+        if giftEnabled ~= enabled then giftRevision += 1 end
+        giftEnabled = enabled
+        if enabled and not giftJob then giftJob = task.defer(autoGift) end
     end,
 }
 
