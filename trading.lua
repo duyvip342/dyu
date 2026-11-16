@@ -22,6 +22,7 @@ local rules, visited, pending = {}, {}, {}
 local sniperEnabled, webhookEnabled, hopEnabled = false, false, true
 local webhookUrl, minDiamond = "", 0
 local belowMinimum, delivery, job
+local lastWebhookError
 local nextTravelAt, searchIndex = 0, 0
 local nextSearchAt, pendingHop
 local idleBeforeSearch = 5
@@ -93,15 +94,33 @@ local function timeInVietnam()
     return os.date("!%H:%M:%S %d/%m/%Y", os.time() + 7 * 3600) .. " (UTC+7)"
 end
 
+-- Báo cấu hình webhook bị thiếu ngay khi bật hoặc chuẩn bị gửi.
+local function webhookReady()
+    local reason
+    if webhookUrl == "" then
+        reason = "Hãy điền Trading Webhook URL."
+    elseif type(delivery) ~= "table" or type(delivery.post) ~= "function" then
+        reason = "Thiếu hàm gửi Discord. Hãy cập nhật webhook.lua cùng phiên bản với trading.lua."
+    end
+    if reason and lastWebhookError ~= reason then warn("[Webhook Trading] " .. reason) end
+    lastWebhookError = reason
+    return reason == nil
+end
+
 -- Gửi một embed qua luồng HTTP của webhook hiện có.
 local function emit(embed)
-    if not webhookEnabled or webhookUrl == "" or not delivery then return end
+    if not webhookEnabled or not webhookReady() then return end
     local url = webhookUrl
+    local post = delivery.post
     task.defer(function()
-        local ok, reason = delivery.post(url, function()
+        local ran, ok, reason = pcall(post, url, function()
             return { embeds = { embed }, allowed_mentions = { parse = {} }, attachments = {} }
         end)
-        if not ok then warn("[Webhook Trading] " .. reason) end
+        if not ran then
+            warn("[Webhook Trading] Không gọi được hàm gửi Discord.")
+        elseif not ok then
+            warn("[Webhook Trading] " .. tostring(reason or "Discord chưa nhận thông báo."))
+        end
     end)
 end
 
@@ -422,6 +441,7 @@ end
 -- Dùng chung một worker cho hai toggle trong Trading.
 local function start(shared)
     delivery = shared and shared.WebhookDelivery or delivery
+    if webhookEnabled then webhookReady() end
     if job or not (sniperEnabled or webhookEnabled) then return end
     job = task.defer(function()
         while environment.RobloxHubTradingRun == runToken and (sniperEnabled or webhookEnabled) do
@@ -489,7 +509,10 @@ features.TradingSniperBooth = {
 }
 
 features.TradingWebhook = {
-    setUrl = function(value) webhookUrl = clean(value) end,
+    setUrl = function(value)
+        webhookUrl = clean(value)
+        if webhookEnabled then webhookReady() end
+    end,
     setMinimum = function(value)
         local minimum = parseDiamonds(value)
         if minimum == nil then return end
