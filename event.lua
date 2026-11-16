@@ -621,6 +621,185 @@ do
     }
 end
 
+-- Auto Hot Coca / Đổi Patch Coins lấy thời gian boost tại Hot Cocoa Stand.
+do
+    local cocoaData = require(library.Util.PumpkinTycoonCocoa)
+    local boosts = require(client.BoostCmds)
+    local minimumCoins = 40000000000
+    local offers = {}
+    local nextAxis = "Coins"
+    local enabled = false
+    local job
+
+    -- Lấy đúng hai offer Coin và Island Luck từ cấu hình quầy.
+    for _, offer in ipairs(cocoaData.OFFERS) do
+        if offer.Axis == "Coins" or offer.Axis == "IslandLuck" then
+            offers[offer.Axis] = offer
+        end
+    end
+
+    -- Chỉ mua một boost khi cả hai timer đã về 0.
+    local function buyCocoa()
+        if not isInEvent() then return 5 end
+        local cocoa = tycoon.Feature("Cocoa")
+        if not cocoa.Enabled() or not cocoa.Unlocked() then return 5 end
+        local coins = currency.Get(tycoonTypes.COIN)
+        if type(coins) ~= "number" or coins <= minimumCoins then return 5 end
+        local coinOffer, luckOffer = offers.Coins, offers.IslandLuck
+        if not coinOffer or not luckOffer then return 5 end
+        if boosts.GetTimer(coinOffer.Id) ~= 0 or boosts.GetTimer(luckOffer.Id) ~= 0 then return 5 end
+
+        local plot = tycoon.Feature("Island").Plot()
+        if not plot then return 5 end
+        local offer = offers[nextAxis]
+        local costPerMinute = cocoaData.CostPerMinute(offer.Tier)
+        if type(costPerMinute) ~= "number" or costPerMinute <= 0 then return 15 end
+
+        -- Đổi tối đa một phần ba số dư theo phút nguyên và sức chứa của quầy.
+        local budget = math.floor(coins / 3)
+        local minutes = math.floor(budget / costPerMinute)
+        local quote = cocoaData.Quote(offer, 0, minutes)
+        if quote.reason or quote.seconds < 60 or quote.cost > budget or not enabled then return 15 end
+
+        local success = plot:Invoke(cocoaData.VERB_BUY, offer.Key, quote.seconds // 60)
+        if success == true then
+            nextAxis = nextAxis == "Coins" and "IslandLuck" or "Coins"
+        end
+        return 15
+    end
+
+    -- Giữ một lượt mua đang chờ phản hồi tại một thời điểm.
+    features.EventAutoHotCoca = {
+        duy = function(on)
+            enabled = on
+            if not on or job then return end
+            job = task.defer(function()
+                while enabled do
+                    local ok, delay = pcall(buyCocoa)
+                    task.wait(ok and delay or 15)
+                end
+                job = nil
+            end)
+        end,
+    }
+end
+
+-- Auto Gift Huge / Gửi pet Huge có thể giao dịch theo từng UID.
+do
+    local save = require(client.Save)
+    local items = require(library.Items)
+    local petDirectory = require(library.Directory.Pets)
+    local recipient = ""
+    local enabled = false
+    local job
+    local onStop
+    local status = {}
+
+    -- Dừng gửi và đồng bộ toggle khi thiếu kim cương trả phí.
+    local function stopForFee()
+        enabled = false
+        warn("[Auto Gift Huge] Dừng gửi vì không đủ kim cương trả phí mail.")
+        if onStop then onStop() end
+    end
+
+    -- Đọc lỗi mail để phân biệt thiếu phí và pet không thể giao dịch.
+    local function classifyFailure(message)
+        local reason = string.lower(tostring(message or ""))
+        if reason:find("diamond", 1, true) and (reason:find("not enough", 1, true)
+            or reason:find("n't have enough", 1, true) or reason:find("insufficient", 1, true)
+            or reason:find("need more", 1, true)) then
+            return "fee"
+        end
+        if reason:find("untradable", 1, true) or reason:find("untradeable", 1, true)
+            or reason:find("not tradable", 1, true) or reason:find("not tradeable", 1, true)
+            or reason:find("cannot be traded", 1, true) or reason:find("can't be traded", 1, true) then
+            return "pet"
+        end
+        return tonumber(reason:match("please wait (%d+) seconds?"))
+    end
+
+    -- Đọc xác nhận từ kho trước khi thử gửi thêm từ cùng stack.
+    local function refreshStatus(inventory)
+        for uid, state in pairs(status) do
+            local pet = inventory[uid]
+            if not pet or (state.sentAmount and (pet._am or 1) < state.sentAmount) then
+                status[uid] = nil
+            end
+        end
+    end
+
+    -- Chọn pet Huge theo dữ liệu thật của game và bỏ qua pet đang khóa.
+    local function findHuge(inventory)
+        local now = os.clock()
+        for uid, entry in pairs(inventory) do
+            local state = status[uid]
+            if state and (state.blocked or state.sentAmount or state.retryAt > now) then continue end
+            local definition = rawget(petDirectory, entry.id)
+            if definition and definition.huge == true and not definition.titanic and not definition.gargantuan
+                and not entry._lk and (entry._am or 1) > 0 then
+                local ok, tradable = pcall(function()
+                    return items.From("Pet", table.clone(entry)):IsTradable()
+                end)
+                if ok and tradable then return uid, entry._am or 1 end
+            end
+        end
+    end
+
+    -- Gửi một pet và giãn lần thử lại nếu server từ chối.
+    local function sendHuge(getFee)
+        local target = recipient
+        if target == "" or target:lower() == player.Name:lower() then return 5 end
+        local data = save.Get()
+        local inventory = data and data.Inventory and data.Inventory.Pet
+        if not inventory then return 5 end
+        refreshStatus(inventory)
+        local uid, amount = findHuge(inventory)
+        if not uid then return 5 end
+        local diamonds = currency.Get("Diamonds")
+        if type(diamonds) ~= "number" then return 5 end
+        if diamonds < getFee(data) then
+            stopForFee()
+            return 5
+        end
+        if not enabled or recipient ~= target then return 2 end
+
+        local ok, accepted, message = pcall(network.Invoke, "EF_Relay", target, "", "Pet", uid, 1)
+        if ok and accepted then
+            status[uid] = { sentAmount = amount }
+            return 2
+        end
+        local failure = classifyFailure(message or accepted)
+        if failure == "fee" then
+            if enabled then stopForFee() end
+        elseif failure == "pet" then
+            status[uid] = { blocked = true }
+        else
+            status[uid] = { retryAt = os.clock() + 5 }
+        end
+        return type(failure) == "number" and math.max(failure, 2) or 2
+    end
+
+    -- Nhận tên người nhận từ ô nhập hoặc launcher.
+    features.EventAutoGiftHuge = {
+        setRecipient = function(value)
+            recipient = type(value) == "string" and value:match("^%s*(.-)%s*$") or ""
+        end,
+        setStopCallback = function(callback) onStop = callback end,
+        duy = function(on, allFeatures)
+            enabled = on
+            local mailGift = allFeatures and allFeatures.MailAutoGift
+            if not on or job or not (mailGift and mailGift.getFee) then return end
+            job = task.defer(function()
+                while enabled do
+                    local ok, delay = pcall(sendHuge, mailGift.getFee)
+                    task.wait(ok and delay or 5)
+                end
+                job = nil
+            end)
+        end,
+    }
+end
+
 -- Auto Pumpkin Upgrade / Nâng cấp các mục đã chọn trong máy.
 do
     local definitions = require(library.Types.PumpkinTycoon.Upgrades)
