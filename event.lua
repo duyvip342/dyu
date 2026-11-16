@@ -35,6 +35,7 @@ local enabled = false
 local pumpkinEnabled = false
 local fastFarmEnabled = false
 local workerRunning = false
+local cocoaTick
 local generation = 0
 
 -- Vào map sự kiện.
@@ -454,7 +455,7 @@ local function startWorker()
             nextHatch = 0,
         }
         local nextEntryAt = 0
-        while enabled or pumpkinEnabled or fastFarmEnabled do
+        while enabled or pumpkinEnabled or fastFarmEnabled or cocoaTick do
             local character = player.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             local root = humanoid and humanoid.RootPart
@@ -462,6 +463,13 @@ local function startWorker()
             if not inEvent or not (enabled or fastFarmEnabled) then clearFarmTargets(state) end
             if root and humanoid.Health > 0 then
                 if inEvent then
+                    if cocoaTick then
+                        cocoaTick(character, humanoid, root)
+                        if player.Character ~= character or humanoid.Health <= 0 or not isInEvent() then
+                            task.wait(scanInterval)
+                            continue
+                        end
+                    end
                     local pumpkin = pumpkinEnabled and findPumpkin(root.Position)
                     if pumpkin then
                         clearFarmTargets(state)
@@ -632,7 +640,8 @@ do
     local offers = {}
     local nextAxis = "Coins"
     local enabled = false
-    local job
+    local nextCheckAt = 0
+    local lastError
 
     -- Chỉ phiên vừa nạp được phép chạy Auto Hot Coca.
     local function isActive()
@@ -646,13 +655,24 @@ do
         end
     end
 
+    -- Báo một lần cho mỗi lỗi liên tiếp để dễ kiểm tra trên mobile.
+    local function reportFailure(reason)
+        reason = tostring(reason or "Game từ chối lượt mua.")
+        if lastError == reason then return end
+        lastError = reason
+        warn("[Auto Hot Coca] " .. reason)
+    end
+
     -- Xét timer riêng cho Coin và Island Luck khi số dư trên 40B.
-    local function buyCocoa()
+    local function buyCocoa(character, humanoid, root)
         if not isActive() or not isInEvent() then return 5 end
         local cocoa = tycoon.Feature("Cocoa")
-        if not cocoa.Enabled() or not cocoa.Unlocked() then return 5 end
         local coins = cocoa.Coins()
         if type(coins) ~= "number" or not (coins > minimumCoins) then return 5 end
+        if not cocoa.Enabled() or not cocoa.Unlocked() then
+            reportFailure("Hot Cocoa Stand chưa mở hoặc chưa sẵn sàng.")
+            return 5
+        end
         local offer = offers[nextAxis]
         if not offer or boosts.GetTimer(offer.Id) ~= 0 then
             local otherAxis = nextAxis == "Coins" and "IslandLuck" or "Coins"
@@ -662,6 +682,12 @@ do
 
         local plot = tycoon.Feature("Island").Plot()
         if not plot then return 5 end
+        local model = plot:GetModel()
+        local pad = model and buttons.MachinePad(model, cocoaData.MACHINE)
+        if not pad then
+            reportFailure("Chưa tải được vị trí Hot Cocoa Stand trên đảo.")
+            return 5
+        end
         local costPerMinute = cocoaData.CostPerMinute(offer.Tier)
         if type(costPerMinute) ~= "number" or costPerMinute <= 0 then return 15 end
 
@@ -671,29 +697,64 @@ do
         local quote = cocoaData.Quote(offer, 0, minutes)
         if quote.reason or quote.seconds < 60 or quote.cost > budget then return 15 end
 
-        -- Kiểm tra lại số dư và timer của boost được chọn trước khi mua.
-        local currentCoins = cocoa.Coins()
-        if not isActive() or type(currentCoins) ~= "number" or not (currentCoins > minimumCoins)
-            or quote.cost > math.floor(currentCoins / 3) or boosts.GetTimer(offer.Id) ~= 0 then return 5 end
+        local original
+        local ok, accepted, reason = pcall(function()
+            -- Ghé quầy khi đứng ngoài phạm vi tương tác của game.
+            if (root.Position - pad.Position).Magnitude >= cocoaData.Range() then
+                original = character:GetPivot()
+                local rootOffset = root.CFrame:ToObjectSpace(original)
+                local height = root.Size.Y / 2 + humanoid.HipHeight + 0.5
+                local leg = humanoid.RigType == Enum.HumanoidRigType.R6 and character:FindFirstChild("Left Leg")
+                if leg then height += leg.Size.Y end
+                root.AssemblyLinearVelocity = Vector3.zero
+                character:PivotTo(CFrame.new(pad.Position + Vector3.new(0, height, 0)) * root.CFrame.Rotation * rootOffset)
+                task.wait(0.35)
+            end
 
-        -- Ưu tiên boost kia ở lượt sau nếu cả hai cùng hết.
-        nextAxis = offer.Axis == "Coins" and "IslandLuck" or "Coins"
-        plot:Invoke(cocoaData.VERB_BUY, offer.Key, quote.seconds // 60)
+            -- Đọc lại số dư và timer sau khi đứng cạnh quầy.
+            local currentCoins = cocoa.Coins()
+            if not isActive() or not isInEvent() or player.Character ~= character or humanoid.Health <= 0
+                or tycoon.Feature("Island").Plot() ~= plot or not pad.Parent
+                or type(currentCoins) ~= "number" or not (currentCoins > minimumCoins)
+                or quote.cost > math.floor(currentCoins / 3) or boosts.GetTimer(offer.Id) ~= 0 then return end
+            nextAxis = offer.Axis == "Coins" and "IslandLuck" or "Coins"
+            local bought, message = plot:Invoke(cocoaData.VERB_BUY, offer.Key, quote.seconds // 60)
+            return bought == true, message
+        end)
+        if original and player.Character == character and humanoid.Health > 0 and root.Parent == character and isInEvent() then
+            root.AssemblyLinearVelocity = Vector3.zero
+            character:PivotTo(original)
+        end
+        if not ok then reportFailure(accepted)
+        elseif accepted == false then reportFailure(reason)
+        elseif accepted then
+            lastError = nil
+            print(("[Auto Hot Coca] Đã mua %s trong %d phút."):format(offer.Axis, quote.seconds // 60))
+        end
         return 15
     end
 
-    -- Giữ một lượt mua đang chờ phản hồi tại một thời điểm.
+    -- Ghép lượt ghé quầy vào vòng Event để không tranh vị trí với farm.
     features.EventAutoHotCoca = {
         duy = function(on)
             enabled = on
-            if not isActive() or job then return end
-            job = task.defer(function()
-                while isActive() do
-                    local ok, delay = pcall(buyCocoa)
-                    task.wait(ok and delay or 15)
+            if not isActive() then
+                cocoaTick = nil
+                return
+            end
+            nextCheckAt = 0
+            lastError = nil
+            cocoaTick = function(character, humanoid, root)
+                if not isActive() then
+                    cocoaTick = nil
+                    return
                 end
-                job = nil
-            end)
+                if os.clock() < nextCheckAt then return end
+                local ok, delay = pcall(buyCocoa, character, humanoid, root)
+                if not ok then reportFailure(delay) end
+                nextCheckAt = os.clock() + (ok and delay or 15)
+            end
+            startWorker()
         end,
     }
 end
