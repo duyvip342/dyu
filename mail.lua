@@ -159,6 +159,7 @@ end
 
 -- Xuất chức năng cấu hình Auto Gift cho tab Mail.
 features.MailAutoGift = {
+    getFee = mailFee,
     setRecipient = function(value)
         local name = value:match("^%s*(.-)%s*$")
         if recipient ~= name then recipient = name; giftRevision += 1 end
