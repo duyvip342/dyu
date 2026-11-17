@@ -404,6 +404,7 @@ do
         local config = launchConfig and launchConfig.trading
         trading:CreateText({ text = sniper.configure(config) })
         createToggle(trading, "Sniper Booth", "TradingSniperBooth")
+         createToggle(trading, "Săn cụm Huge", "TradingSniperHuge")
         local report = features.TradingWebhook
         if report then
             config = type(config) == "table" and config or {}
