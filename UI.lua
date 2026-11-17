@@ -403,6 +403,18 @@ do
     if sniper then
         local config = launchConfig and launchConfig.trading
         trading:CreateText({ text = sniper.configure(config) })
+        if sniper.setStatusCallback then
+            local status = trading:CreateText({ text = "Đang khởi tạo Trading..." })
+            sniper.setStatusCallback(function(message) status:Set(message) end)
+        end
+        if sniper.setHop then
+            trading:CreateToggle({
+                name = "Hop qua Trading Terminal",
+                flag = "TradingTerminalHop",
+                value = type(config) ~= "table" or config.hop ~= false,
+                callback = sniper.setHop,
+            })
+        end
         createToggle(trading, "Sniper Booth", "TradingSniperBooth")
         local report = features.TradingWebhook
         if report then
