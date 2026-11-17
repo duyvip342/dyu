@@ -1,566 +1,663 @@
--- Trading / Quét giá booth, mua theo danh sách và báo Discord.
-local features = {}
-local library = game:GetService("ReplicatedStorage").Library
-local client = library.Client
-local player = game:GetService("Players").LocalPlayer
-local teleport = game:GetService("TeleportService")
-local http = game:GetService("HttpService")
-local network = require(client.Network)
-local currency = require(client.CurrencyCmds)
-local inventory = require(client.InventoryCmds)
-local signal = require(library.Signal)
-local items = require(library.Items)
-local petTypes = require(library.Items.PetItem).Types
-local normalPlace = require(library.Modules.PlaceFile).LocalPlaces.Trading
-local launcherUrl = "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/UI.lua"
-local diamondIcon = "https://tr.rbxcdn.com/180DAY-9b4d094e1819c1b5ea67575b824a9101/150/150/Image/Png/noFilter"
+-- 1. Cấu hình khởi chạy
+-- Ghi thời điểm khởi động trước khi tải các module.
+local scriptStartedAt = os.clock()
 
+-- Launcher có thể truyền cấu hình riêng cho lần chạy này.
 local environment = type(getgenv) == "function" and getgenv() or _G
-local runToken = {}
-environment.RobloxHubTradingRun = runToken
-local rules, visited, pending = {}, {}, {}
-local sniperEnabled, webhookEnabled, hopEnabled = false, false, true
-local webhookUrl, minDiamond = "", 0
-local belowMinimum, delivery, job
-local lastWebhookError
-local nextTravelAt, searchIndex = 0, 0
-local nextSearchAt, pendingHop
-local idleBeforeSearch = 5
-local rejectedServers = {}
-local lastNotice
-local suffixes = { [""] = 1, k = 1e3, m = 1e6, b = 1e9, t = 1e12 }
-local variants = {
-    normal = { petTypes.Normal, false, "Normal" },
-    golden = { petTypes.Golden, false, "Golden" },
-    rainbow = { petTypes.Rainbow, false, "Rainbow" },
-    shiny = { petTypes.Normal, true, "Shiny" },
-    shinygolden = { petTypes.Golden, true, "Shiny Golden" },
-    shinyrainbow = { petTypes.Rainbow, true, "Shiny Rainbow" },
-}
-local romanParts = {
-    { "M", 1000 }, { "CM", 900 }, { "D", 500 }, { "CD", 400 },
-    { "C", 100 }, { "XC", 90 }, { "L", 50 }, { "XL", 40 },
-    { "X", 10 }, { "IX", 9 }, { "V", 5 }, { "IV", 4 }, { "I", 1 },
-}
+local launchConfig = environment.RobloxHubConfig
+environment.RobloxHubConfig = nil
+if type(launchConfig) ~= "table" then launchConfig = nil end
+local launchToggles = launchConfig and type(launchConfig.toggles) == "table" and launchConfig.toggles or {}
+local startupActions = {}
 
--- Chuẩn hóa chuỗi do launcher hoặc item cung cấp.
-local function clean(value)
-    return type(value) == "string" and value:match("^%s*(.-)%s*$") or ""
-end
-
--- Đọc hậu tố La Mã hợp lệ trong tên vật phẩm.
-local function romanTier(roman)
-    if not roman then return nil end
-    local value, position = 0, 1
-    for _, part in ipairs(romanParts) do
-        local symbol, amount = part[1], part[2]
-        while roman:sub(position, position + #symbol - 1) == symbol do
-            position += #symbol
-            value += amount
-        end
+-- Anti-AFK / Gửi phím Space mỗi phút.
+do
+    -- Dừng vòng nhảy từ bản cũ.
+    if environment.RobloxHubAntiAfkJob then
+        pcall(task.cancel, environment.RobloxHubAntiAfkJob)
+        environment.RobloxHubAntiAfkJob = nil
     end
-    if position <= #roman or value < 1 or value > 3999 then return nil end
-    local canonical, remaining = {}, value
-    for _, part in ipairs(romanParts) do
-        canonical[#canonical + 1] = part[1]:rep(remaining // part[2])
-        remaining %= part[2]
+
+    -- Gỡ kết nối anti-AFK của lần chạy trước.
+    if environment.RobloxHubAntiAfkConnection then
+        environment.RobloxHubAntiAfkConnection:Disconnect()
+        environment.RobloxHubAntiAfkConnection = nil
     end
-    if table.concat(canonical) == roman then return value end
-end
 
--- Đọc số kim cương nguyên hoặc giá có hậu tố k, m, b và t.
-local function parseDiamonds(value)
-    if type(value) == "string" then
-        local number, suffix = value:lower():gsub(",", ""):match("^%s*(%d+%.?%d*)%s*([kmbt]?)%s*$")
-        value = number and tonumber(number) * suffixes[suffix]
+    -- Gỡ kết nối theo dõi idle của lần chạy trước.
+    if environment.RobloxHubAntiAfkIdleConnection then
+        environment.RobloxHubAntiAfkIdleConnection:Disconnect()
+        environment.RobloxHubAntiAfkIdleConnection = nil
     end
-    if type(value) == "number" and value >= 0 and value < 2^53 and value % 1 == 0 then return value end
-end
 
--- In cùng một lỗi một lần cho mỗi trạng thái liên tiếp.
-local function notice(reason)
-    if lastNotice == reason then return end
-    lastNotice = reason
-    warn("[Trading] " .. reason)
-end
-
--- Hiển thị số kim cương đầy đủ theo nhóm ba chữ số.
-local function formatDiamonds(value)
-    return (("%.0f"):format(value):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
-end
-
--- Định dạng thời điểm theo múi giờ Việt Nam.
-local function timeInVietnam()
-    return os.date("!%H:%M:%S %d/%m/%Y", os.time() + 7 * 3600) .. " (UTC+7)"
-end
-
--- Báo cấu hình webhook bị thiếu ngay khi bật hoặc chuẩn bị gửi.
-local function webhookReady()
-    local reason
-    if webhookUrl == "" then
-        reason = "Hãy điền Trading Webhook URL."
-    elseif type(delivery) ~= "table" or type(delivery.post) ~= "function" then
-        reason = "Thiếu hàm gửi Discord. Hãy cập nhật webhook.lua cùng phiên bản với trading.lua."
+    -- Dừng đoạn exec thử nếu nó vẫn đang gửi phím.
+    if type(environment.StopAfkTest) == "function" then
+        environment.StopAfkTest()
+        environment.StopAfkTest = nil
     end
-    if reason and lastWebhookError ~= reason then warn("[Webhook Trading] " .. reason) end
-    lastWebhookError = reason
-    return reason == nil
-end
 
--- Gửi một embed qua luồng HTTP của webhook hiện có.
-local function emit(buildEmbed)
-    if not webhookEnabled or not webhookReady() then return end
-    local url = webhookUrl
-    local post = delivery.post
-    task.defer(function()
-        local ran, ok, reason = pcall(post, url, function()
-            return { embeds = { buildEmbed() }, allowed_mentions = { parse = {} }, attachments = {} }
-        end)
-        if not ran then
-            warn("[Webhook Trading] Không gọi được hàm gửi Discord.")
-        elseif not ok then
-            warn("[Webhook Trading] " .. tostring(reason or "Discord chưa nhận thông báo."))
-        end
-    end)
-end
-
--- Đếm theo nhóm stack của game để giữ đúng cấp và biến thể.
-local function inventoryAmount(item)
-    local ok, amount = pcall(function()
-        if inventory.Container() then return item:CountAny() end
-    end)
-    if ok and type(amount) == "number" then return amount end
-end
-
--- Chờ kho đồng bộ lượt mua trên luồng gửi webhook.
-local function purchaseInventoryText(item, before, quantity)
-    local deadline = os.clock() + 2
-    local latest
-    repeat
-        local amount = inventoryAmount(item)
-        if amount ~= nil then
-            latest = amount
-            if before ~= nil and amount >= before + quantity then return formatDiamonds(amount) end
-        end
-        task.wait(0.15)
-    until os.clock() >= deadline
-    if latest == nil then return "Chưa đọc được kho" end
-    if before == nil then return formatDiamonds(latest) end
-    return formatDiamonds(latest) .. " (đang đồng bộ)"
-end
-
--- Chỉ ghi nhận giao dịch sau khi server báo mua thành công.
-local function reportPurchase(item, name, quantity, price, before)
-    local priceText = formatDiamonds(price) .. " 💎/món"
-    if quantity > 1 then priceText ..= " · Tổng " .. formatDiamonds(quantity * price) .. " 💎" end
-    local boughtAt = timeInVietnam()
-    emit(function()
-        local embed = {
-            title = "Sale!",
-            description = ("**you just bought:**\n%s\nx%d\n**price:**\n%s\n**Trong kho:** %s\n\n**time: %s**"):format(
-                name, quantity, priceText, purchaseInventoryText(item, before, quantity), boughtAt),
-            color = 15595273,
-        }
-        -- Lấy icon của đúng món đã mua cho thumbnail Discord.
-        if type(delivery.thumbnail) == "function" then
-            local ok, image = pcall(function() return delivery.thumbnail(item:GetIcon()) end)
-            if ok and type(image) == "string" then embed.thumbnail = { url = image } end
-        end
-        return embed
-    end)
-end
-
--- Chỉ báo hết tiền khi số dư đi từ trên ngưỡng xuống dưới ngưỡng.
-local function checkBalance(balance)
-    if not webhookEnabled or type(balance) ~= "number" then return end
-    local below = balance < minDiamond
-    if below and belowMinimum == false then
-        emit(function()
-            return {
-                title = "out of diamond !",
-                description = ("hết tiền 🤣\n**time: %s**"):format(timeInVietnam()),
-                color = 393185,
-                thumbnail = { url = diamondIcon },
-            }
-        end)
-    end
-    belowMinimum = below
-end
-
--- Giữ danh sách server vừa quét ở kích thước cố định.
-local function rememberServer(id)
-    if type(id) ~= "string" or id == "" or table.find(visited, id) then return end
-    table.insert(visited, id)
-    if #visited > 12 then table.remove(visited, 1) end
-end
-
--- Chuyển cấu hình Trading sang lần chạy tiếp theo qua executor.
-local function queueResume(targetJobId)
-    local queue = queue_on_teleport or queue_on_tp or queueonteleport
-    if type(queue) ~= "function" then
-        notice("Executor thiếu queue_on_teleport. Cần chạy launcher lại ở server mới.")
-        return false
-    end
-    local config = {
-        toggles = { TradingSniperBooth = sniperEnabled, TradingWebhook = webhookEnabled },
-        trading = { items = rules, webhookUrl = webhookUrl, minDiamond = minDiamond, hop = hopEnabled,
-            visited = visited, searchIndex = searchIndex },
-    }
-    local source = ([=[
-local env = type(getgenv) == "function" and getgenv() or _G
-if not game:IsLoaded() then game.Loaded:Wait() end
-local expectedJob = %q
-if game.PlaceId ~= %d or (expectedJob ~= "" and game.JobId ~= expectedJob) then return end
-if env.RobloxHubTradingResumedJob == game.JobId then return end
-env.RobloxHubTradingResumedJob = game.JobId
-env.RobloxHubConfig = game:GetService("HttpService"):JSONDecode(%q)
-assert(loadstring(game:HttpGet(%q)))()
-]=]):format(targetJobId or "", normalPlace, http:JSONEncode(config), launcherUrl)
-    local ok = pcall(queue, source)
-    if not ok then notice("Executor không thể nạp lại launcher sau teleport.") end
-    return ok
-end
-
--- Dùng đúng đường vào Trading Plaza Normal của game.
-local function enterNormal()
-    if os.clock() < nextTravelAt then return end
-    nextTravelAt = os.clock() + 30
-    queueResume()
-    local ok, reason = network.Invoke("Travel to Trading Plaza", normalPlace)
-    if not ok then notice(tostring(reason or "Game từ chối vào Trading Plaza Normal.")) end
-end
-
--- Đọc bảng booth đã tải trong client thay vì quét giao diện.
-local function getBooths()
-    if not signal.Invoke("Booths_IsLoaded") then return nil end
-    local getCallback = getcallbackvalue or getcallbackmember
-    if type(getCallback) ~= "function" then
-        notice("Executor không hỗ trợ đọc dữ liệu booth.")
-        return nil
-    end
-    local callback = getCallback(signal.Invoked("Booths_GetIdWithStackKey"), "OnInvoke")
-    if type(callback) ~= "function" then return nil end
-    local cache, value = debug.getupvalue(callback, 1)
-    if type(value) == "table" then cache = value end
-    if type(cache) == "table" then return cache end
-    notice("Chưa đọc được bảng listing của Trading Plaza.")
-end
-
--- Khớp tên nội bộ hoặc tên hiển thị và biến thể pet đã chọn.
-local function matches(rule, item)
-    if item.Class.Name ~= rule.class then return false end
-    if rule.tier then
-        local tier = type(item.GetTier) == "function" and item:GetTier() or item:GetData().tn
-        local id = item:GetId():lower()
-        if not rule.roman then return id == rule.itemId:lower() and tier == rule.tier end
-        local needle = rule.name:lower()
-        local display = item:GetName():lower()
-        local exact = id == needle or display == needle
-        if type(tier) ~= "number" then return exact end
-        local base = rule.itemId:lower()
-        return tier == rule.tier and (exact or id == base or display == base)
-    end
-    local variant = rule.variant and variants[rule.variant]
-    if variant and (item:GetType() ~= variant[1] or item:IsShiny() ~= variant[2]) then return false end
-    local needle = rule.name:lower()
-    return item:GetId():lower() == needle or item:GetName():lower() == needle
-end
-
--- Tính số lượng mua được theo giá từng món và ví hiện tại.
-local function quantityFor(row, rule, balance, now)
-    if not row or not row.Item or type(row.ReadyTimestamp) ~= "number" or row.ReadyTimestamp > now then return 0 end
-    local price = row.DiamondCost
-    if type(price) ~= "number" or price <= 0 or price > rule.minAmount then return 0 end
-    return math.min(row.Item:GetAmount(), math.floor(balance / price))
-end
-
--- Ưu tiên quy tắc đầu tiên có hàng và giá thấp nhất trong quy tắc đó.
-local function findListing(booths, balance)
-    local now = workspace:GetServerTimeNow()
-    local best
-    for owner, booth in pairs(booths) do
-        if owner == player or type(booth.Listings) ~= "table" then continue end
-        for id, row in pairs(booth.Listings) do
-            if not row.Item then continue end
-            local key = tostring(booth.PlayerID or owner.UserId) .. ":" .. tostring(id)
-            local held = pending[key]
-            local eligible = not held or (held.amount and row.Item:GetAmount() < held.amount) or held.untilAt <= now
-            for priority, rule in ipairs(rules) do
-                if not matches(rule, row.Item) then continue end
-                if not rule.stackKey then rule.stackKey = row.Item:StackKey() end
-                if eligible and quantityFor(row, rule, balance, now) > 0
-                    and (not best or priority < best.priority
-                        or (priority == best.priority and row.DiamondCost < best.price)) then
-                    best = { owner = owner, boothId = booth.BoothID, id = id, key = key,
-                        priority = priority, price = row.DiamondCost, rule = rule }
-                end
-            end
-        end
-    end
-    for key, held in pairs(pending) do
-        if held.untilAt <= now then pending[key] = nil end
-    end
-    return best
-end
-
--- Đứng cạnh booth theo cùng điểm đến mà Trading Terminal dùng.
-local function approachBooth(boothId)
-    local model = signal.Invoke("Booths_GetPlaceholderModelFromID", tostring(boothId))
-    local character = player.Character
-    local root = character and character.PrimaryPart
-    if not model or not root then return end
-    local pivot = model:GetPivot()
-    if (root.Position - pivot.Position).Magnitude <= 16 then return end
-    local target = pivot * CFrame.new(0, 0, -8)
-    character:PivotTo(target)
-    task.wait(0.3)
-end
-
--- Xác nhận lại listing và số dư ngay trước khi gửi lệnh mua.
-local function buyListing(booths, candidate)
-    local scanner = require(library.Modules.LuaScanner)
-    approachBooth(candidate.boothId)
-    if not sniperEnabled or environment.RobloxHubTradingRun ~= runToken then return end
-    local booth = booths[candidate.owner]
-    local row = booth and booth.Listings[candidate.id]
-    if not row or not row.Item or not matches(candidate.rule, row.Item) then return end
-    local balance = currency.Get("Diamonds")
-    if type(balance) ~= "number" then return end
-    local now = workspace:GetServerTimeNow()
-    local quantity = quantityFor(row, candidate.rule, balance, now)
-    if quantity < 1 then return end
-    local item = row.Item
-    local price, name, amount = row.DiamondCost, item:GetName(), item:GetAmount()
-    local before = webhookEnabled and inventoryAmount(item) or nil
-    pending[candidate.key] = { untilAt = now + 4 }
-    local accepted, reason = network.Invoke("Booths_RequestPurchase", booth.PlayerID or candidate.owner.UserId,
-        { [candidate.id] = quantity }, scanner.Create(-1))
-    if accepted then
-        pending[candidate.key] = { amount = amount, untilAt = workspace:GetServerTimeNow() + 12 }
-        lastNotice = nil
-        if webhookEnabled then reportPurchase(item, name, quantity, price, before) end
-    else
-        notice(tostring(reason or "Game từ chối mua listing."))
-    end
-end
-
--- Dựng StackKey từ loại vật phẩm đã chọn khi booth hiện tại chưa có món đó.
-local function terminalKey(rule)
-    if rule.stackKey then return rule.stackKey end
-    if rule.stackLookupDone then return nil end
-    local data = { id = rule.itemId or rule.name, tn = rule.tier }
-    local variant = rule.variant and variants[rule.variant]
-    if variant then
-        data.pt = variant[1] ~= petTypes.Normal and variant[1] or nil
-        data.sh = variant[2] or nil
-    end
-    local ok, key = pcall(function()
-        local item = items.From(rule.class, data)
-        if matches(rule, item) then return item:StackKey() end
-    end)
-    if ok and key then
-        rule.stackKey = key
-    elseif rule.roman then
-        -- Tra tên hiển thị đầy đủ như Coins Potion II trong danh mục Terminal.
-        local catalog = require(library.Util.TradingTerminalUtil).ByClasses({ rule.class })
-        for _, item in pairs(catalog) do
-            if matches(rule, item) then
-                rule.stackKey = item:StackKey()
-                break
-            end
-        end
-    end
-    rule.stackLookupDone = true
-    return rule.stackKey
-end
-
--- Gỡ listener ngay khi lần chuyển server kết thúc hoặc bị hủy.
-local function clearPendingHop()
-    if not pendingHop then return end
-    pendingHop.connection:Disconnect()
-    pendingHop = nil
-end
-
--- Chuyển sang món kế tiếp khi Roblox từ chối server đích.
-local function failHop(reason)
-    rejectedServers[pendingHop.jobId] = os.clock() + 30
-    clearPendingHop()
-    nextSearchAt = os.clock() + 1
-    notice("Chuyển server thất bại: " .. tostring(reason))
-end
-
--- Dùng Terminal sau khi đủ 5 giây không có listing phù hợp.
-local function searchNextServer()
-    if not hopEnabled or not nextSearchAt or os.clock() < nextSearchAt then return end
-    if type(queue_on_teleport or queue_on_tp or queueonteleport) ~= "function" then return end
-    local now = os.clock()
-    for id, expiresAt in pairs(rejectedServers) do
-        if expiresAt <= now then rejectedServers[id] = nil end
-    end
-    searchIndex = searchIndex % #rules + 1
-    local retryDelay = searchIndex == #rules and idleBeforeSearch or 1
-    nextSearchAt = now + retryDelay
-    local rule = rules[searchIndex]
-    local key = terminalKey(rule)
-    if not key then return end
-    local okVoice, voice = pcall(function()
-        return game:GetService("VoiceChatService"):IsVoiceEnabledForUserIdAsync(player.UserId)
-    end)
-    if not sniperEnabled or environment.RobloxHubTradingRun ~= runToken then return end
-    local ok, result, reason = pcall(network.Invoke, "TradingTerminal_Search", rule.class, key, nil, okVoice and voice == true)
-    if not sniperEnabled or environment.RobloxHubTradingRun ~= runToken then return end
-    nextSearchAt = os.clock() + retryDelay
-    if not ok or type(result) ~= "table" then
-        local message = tostring((ok and reason or result) or "không tìm thấy listing")
-        local cooldown = tonumber(message:lower():match("wait (%d+) seconds?"))
-        if cooldown then nextSearchAt = os.clock() + math.max(cooldown, retryDelay) end
-        if not ok then notice(("Terminal · %s · %s"):format(rule.name, message)) end
-        return
-    end
-    if result.place_id ~= normalPlace or type(result.job_id) ~= "string" or result.job_id == ""
-        or result.job_id == game.JobId or table.find(visited, result.job_id)
-        or (rejectedServers[result.job_id] or 0) > os.clock() then return end
-
-    -- Kiểm tra lại server hiện tại sau thời gian chờ phản hồi Terminal.
-    local balance = currency.Get("Diamonds")
-    local booths = getBooths()
-    if not booths or type(balance) ~= "number" or balance <= 0 or findListing(booths, balance) then
-        nextSearchAt = nil
-        return
-    end
-    rememberServer(game.JobId)
-    if not queueResume(result.job_id) then return end
-
-    -- Chờ lỗi teleport bất đồng bộ như server đầy trước khi thử món khác.
-    local attempt = { jobId = result.job_id, deadline = os.clock() + 25 }
-    attempt.connection = teleport.TeleportInitFailed:Connect(function(who, outcome, message, placeId, options)
-        if pendingHop ~= attempt or who ~= player or placeId ~= normalPlace then return end
-        local failedJob = options and options.ServerInstanceId
-        if failedJob and failedJob ~= "" and failedJob ~= result.job_id then return end
-        failHop(message ~= "" and message or outcome)
-    end)
-    pendingHop = attempt
-    -- Sniper tự đọc lại booth sau khi đến server tìm được.
-    local sent, failure = pcall(teleport.TeleportToPlaceInstance, teleport, normalPlace, result.job_id, player)
-    if not sent and pendingHop == attempt then failHop(failure) end
-end
-
--- Chỉ quét và mua ở Plaza Normal.
-local function tick()
-    local balance = currency.Get("Diamonds")
-    checkBalance(balance)
-    if not sniperEnabled then return end
-    if pendingHop then
-        if os.clock() >= pendingHop.deadline then failHop("hết thời gian chờ Roblox phản hồi") end
-        return
-    end
-    if game.PlaceId ~= normalPlace then
-        enterNormal()
-    elseif #rules > 0 and type(balance) == "number" and balance > 0 then
-        local booths = getBooths()
-        if not booths then
-            nextSearchAt = nil
-            return
-        end
-        local candidate = findListing(booths, balance)
-        if candidate then
-            nextSearchAt = nil
-            buyListing(booths, candidate)
-        else
-            nextSearchAt = nextSearchAt or os.clock() + idleBeforeSearch
-            searchNextServer()
+    local input = game:GetService("UserInputService")
+    local useNativeInput = type(keypress) == "function" and type(keyrelease) == "function"
+    local setSpace
+    if useNativeInput then
+        setSpace = function(down)
+            if down then keypress(0x20) else keyrelease(0x20) end
         end
     else
-        nextSearchAt = nil
-    end
-end
-
--- Dùng chung một worker cho hai toggle trong Trading.
-local function start(shared)
-    delivery = shared and shared.WebhookDelivery or delivery
-    if webhookEnabled then webhookReady() end
-    if job or not (sniperEnabled or webhookEnabled) then return end
-    job = task.defer(function()
-        while environment.RobloxHubTradingRun == runToken and (sniperEnabled or webhookEnabled) do
-            local ok, reason = pcall(tick)
-            if not ok then notice(tostring(reason)) end
-            task.wait(ok and 1 or 5)
-        end
-        clearPendingHop()
-        job = nil
-    end)
-end
-
--- Chuẩn hóa quy tắc săn từ cấu hình launcher.
-local function configure(config)
-    config = type(config) == "table" and config or {}
-    webhookUrl = clean(config.webhookUrl)
-    minDiamond = parseDiamonds(config.minDiamond) or 0
-    hopEnabled = config.hop ~= false
-    searchIndex = type(config.searchIndex) == "number" and math.max(0, math.floor(config.searchIndex)) or 0
-    for _, id in ipairs(type(config.visited) == "table" and config.visited or {}) do rememberServer(id) end
-    table.clear(rules)
-    local descriptions = {}
-    for index, entry in ipairs(type(config.items) == "table" and config.items or {}) do
-        if type(entry) ~= "table" then continue end
-        local class, name = clean(entry.class), clean(entry.name)
-        local price = parseDiamonds(entry.minAmount or entry.maxUnitPrice)
-        local variant = clean(entry.variant or entry.varities):lower():gsub("[^%a]", ""):gsub("gold$", "golden")
-        if variant == "goldenshiny" or variant == "goldshiny" then variant = "shinygolden" end
-        if variant == "rainbowshiny" then variant = "shinyrainbow" end
-        if class == "" or name == "" or not price or price < 1 or (class == "Pet" and not variants[variant]) then
-            descriptions[#descriptions + 1] = ("Dòng %d thiếu Class, tên, giá hoặc biến thể pet."):format(index)
-            continue
-        end
-        variant = class == "Pet" and variant or nil
-        -- Tách cấp viết bằng số La Mã hoặc cú pháp [Cấp N].
-        local itemId, tier, roman
-        if class ~= "Pet" then
-            itemId, tier = name:match("^(.-)%s+%[Cấp (%d+)%]$")
-            tier = tonumber(tier)
-            if not tier then
-                local base, suffix = name:match("^(.-)%s+([IVXLCDM]+)$")
-                tier = romanTier(suffix)
-                if tier then itemId, roman = base, true end
+        local ok, virtualInput = pcall(function() return input:CreateVirtualInput() end)
+        if ok and virtualInput then
+            setSpace = function(down)
+                virtualInput:SendKey(down, Enum.KeyCode.Space, false)
             end
         end
-        rules[#rules + 1] = { class = class, name = name, minAmount = price, variant = variant,
-            itemId = itemId, tier = tier, roman = roman }
-        descriptions[#descriptions + 1] = ("%s · %s%s · ≤ %s 💎/món"):format(class, name,
-            variant and (" · " .. variants[variant][3]) or "", formatDiamonds(price))
     end
-    return #descriptions > 0 and table.concat(descriptions, "\n") or "Danh sách săn chưa có món."
+
+    if setSpace then
+        local player = game:GetService("Players").LocalPlayer
+        -- Báo số giây Roblox vẫn tính là idle.
+        environment.RobloxHubAntiAfkIdleConnection = player.Idled:Connect(function(seconds)
+            warn(("[Anti-AFK] Roblox ghi nhận idle %ds."):format(math.floor(seconds)))
+        end)
+
+        local nextInputAt = os.clock() + 60
+        local runService = game:GetService("RunService")
+        -- Bỏ qua lượt gửi khi input đang được dùng ở nơi khác.
+        environment.RobloxHubAntiAfkConnection = runService.Heartbeat:Connect(function()
+            local now = os.clock()
+            if now < nextInputAt then return end
+            nextInputAt = now + 60
+
+            if input:GetFocusedTextBox() or (useNativeInput and type(isrbxactive) == "function" and not isrbxactive()) then
+                return
+            end
+
+            local ok, err = pcall(function()
+                setSpace(true)
+                task.wait(0.08)
+                setSpace(false)
+            end)
+            if not ok then warn("[Anti-AFK] Gửi Space lỗi: " .. tostring(err)) end
+        end)
+    else
+        warn("[Anti-AFK] Executor không có API gửi phím dùng được.")
+    end
 end
 
-features.TradingSniperBooth = {
-    configure = configure,
-    duy = function(on, shared)
-        if on and not sniperEnabled then
-            nextSearchAt = nil
-            nextTravelAt = 0
+-- 2. Tải các module tính năng
+-- Thêm một URL Raw vào danh sách cho mỗi file xử lý mới.
+local urls = {
+    "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/farm.lua",
+    "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/rank.lua",
+    "https://raw.githubusercontent.com/duyvip453/dyu/main/automatic.lua",
+    "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/optimize.lua",
+    "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/mail.lua",
+    "https://raw.githubusercontent.com/duyvip453/dyu/main/webhook.lua",
+    "https://raw.githubusercontent.com/duyvip453/dyu/main/event.lua",
+    "https://raw.githubusercontent.com/duyvip453/dyu/main/trading.lua",
+}
+
+-- Gộp tính năng từ các module theo tên flag.
+local features = {}
+for _, url in ipairs(urls) do
+    local filename = url:match("[^/]+$")
+    local source = game:HttpGet(url)
+    -- Một số client còn nhận bản webhook giữ chỗ rỗng từ cache.
+    if filename == "webhook.lua" and not source:find("%S") then continue end
+    local loadTab = assert(loadstring(source, "@" .. filename))
+    local moduleFeatures
+    if filename == "rank.lua" or filename == "event.lua" then
+        moduleFeatures = loadTab(scriptStartedAt)
+    else
+        moduleFeatures = loadTab()
+    end
+    assert(type(moduleFeatures) == "table", filename .. " phải trả về bảng features")
+    for flag, feature in pairs(moduleFeatures) do
+        features[flag] = feature
+    end
+end
+
+-- 3. Tạo cửa sổ và các tab
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+
+local window = Rayfield:CreateWindow({
+    name = "Menu Roblox",
+    sidebarLayout = true,
+    configuration = {
+        autoSave = launchConfig == nil,
+        autoLoad = launchConfig == nil,
+        fileName = "RobloxHubUI",
+    },
+})
+
+-- Khai báo các tab theo thứ tự xuất hiện trên menu.
+window:CreateTab({ name = "Stats" })
+local farm = window:CreateTab({ name = "farm" })
+local optimize = window:CreateTab({ name = "optimize" })
+local event = window:CreateTab({ name = "Event" })
+local mail = window:CreateTab({ name = "mail" })
+local trading = window:CreateTab({ name = "trading" })
+local rank = window:CreateTab({ name = "rank" })
+local automatic = window:CreateTab({ name = "automatic" })
+local webhook = window:CreateTab({ name = "webhook" })
+window:CreateTab({ name = "setting" })
+
+-- 4. Hàm tạo toggle dùng chung
+-- Launcher bật toggle qua RobloxHubConfig.toggles[flag] = true.
+-- Nối toggle Rayfield với tính năng cùng flag.
+local function createToggle(tab, name, flag)
+    local initial = launchToggles[flag] == true
+    local applied = false
+    -- Áp dụng trạng thái bật tắt từ giao diện hoặc launcher.
+    local function apply(enabled)
+        local feature = features[flag]
+        if feature and (not launchConfig or applied ~= enabled) then
+            applied = enabled
+            feature.duy(enabled, features)
         end
-        sniperEnabled = on
-        if not on then clearPendingHop() end
-        start(shared)
-    end,
-}
+    end
 
-features.TradingWebhook = {
-    setUrl = function(value)
-        webhookUrl = clean(value)
-        if webhookEnabled then webhookReady() end
-    end,
-    setMinimum = function(value)
-        local minimum = parseDiamonds(value)
-        if minimum == nil then return end
-        minDiamond = minimum
-        belowMinimum = nil
-    end,
-    duy = function(on, shared)
-        if on and not webhookEnabled then belowMinimum = nil end
-        webhookEnabled = on
-        start(shared)
-    end,
-}
+    local control = tab:CreateToggle({
+        name = name,
+        flag = flag,
+        value = initial,
+        callback = apply,
+    })
+    if initial then table.insert(startupActions, function() apply(true) end) end
+    return control
+end
 
-return features
+-- 5. Cấu hình các tab
+
+-- Tạo toggle mở map event.
+do
+    createToggle(event, "auto open map event", "EventAutoOpenMap")
+    createToggle(event, "auto pumpkin", "EventAutoPumpkin")
+    createToggle(event, "auto buy pumkin", "EventAutoBuyPumpkin")
+    createToggle(event, "Auto Hot Coca", "EventAutoHotCoca")
+    createToggle(event, "auto fannel gift", "EventAutoFlannelGift")
+    local hugeGift = features.EventAutoGiftHuge
+    if hugeGift then
+        local inputFlag = "EventHugeGiftRecipient"
+        local inputs = launchConfig and launchConfig.inputs
+        local preset = launchConfig and (
+            launchConfig.eventHugeGiftRecipient
+            or launchConfig[inputFlag]
+            or (type(inputs) == "table" and inputs[inputFlag])
+            or launchToggles[inputFlag]
+        )
+        local recipient = type(preset) == "string" and preset:match("^%s*(.-)%s*$") or ""
+        local input = event:CreateInput({
+            name = "Gift Huge User Name",
+            flag = inputFlag,
+            value = recipient,
+            placeholder = "Roblox username",
+            callback = hugeGift.setRecipient,
+        })
+        -- Đồng bộ ô tên và module trước khi launcher bật Auto Gift Huge.
+        if launchConfig then
+            table.insert(startupActions, function()
+                input:Set(recipient, true)
+                hugeGift.setRecipient(recipient)
+            end)
+        end
+        local control = createToggle(event, "Auto Gift Huge", "EventAutoGiftHuge")
+        hugeGift.setStopCallback(function() control:Set(false) end)
+    end
+    createToggle(event, "optimize event", "EventOptimize")
+    createToggle(event, "fast farm event", "EventFastFarm")
+    local stats = features.EventStatsGui
+    if stats then
+        local control = createToggle(event, "stats event", "EventStatsGui")
+        stats.setQuickClose(function() control:Set(false) end)
+    end
+
+    -- Chọn các mục nâng cấp Pumpkin Tycoon.
+    local upgrade = features.EventAutoPumpkinUpgrade
+    if upgrade then
+        local options = upgrade.getOptions()
+        local initial = {}
+        local preset = launchConfig and launchConfig.pumpkinUpgrades
+        if type(preset) == "table" then
+            for _, name in ipairs(options) do
+                if table.find(preset, name) then table.insert(initial, name) end
+            end
+        end
+        event:CreateDropdown({
+            name = "Pumpkin Upgrades",
+            flag = "EventPumpkinUpgradeSelection",
+            options = options,
+            multiSelect = true,
+            value = initial,
+            callback = upgrade.setSelection,
+        })
+        if launchConfig then upgrade.setSelection(initial) end
+        createToggle(event, "auto pumpkin upgrade", "EventAutoPumpkinUpgrade")
+    end
+
+    -- Chọn boost dùng tự động trong Pumpkin Tycoon.
+    local boost = features.EventAutoEquipBoost
+    if boost then
+        local options, initial = boost.getOptions(), {}
+        local preset = launchConfig and launchConfig.boosts
+        if boost.resolveSelection then
+            initial = boost.resolveSelection(preset)
+        elseif type(preset) == "table" then
+            for _, name in ipairs(options) do
+                if table.find(preset, name) then table.insert(initial, name) end
+            end
+        end
+        event:CreateDropdown({
+            name = "Boosts",
+            flag = "EventBoostSelection",
+            options = options,
+            multiSelect = true,
+            value = initial,
+            callback = boost.setSelection,
+        })
+        if launchConfig then boost.setSelection(initial) end
+        createToggle(event, "auto equip boost", "EventAutoEquipBoost")
+    end
+end
+
+-- Tạo giao diện cho các tính năng farm.
+do
+    -- Farm và di chuyển
+    createToggle(farm, "inf pet speed", "FarmInfinityPetSpeed")
+    createToggle(farm, "fast farm", "FarmFastFarm")
+    createToggle(farm, "auto tap", "FarmAutoTap")
+    createToggle(farm, "Tự nhặt orb", "FarmAutoCollectOrb")
+    createToggle(farm, "tele to best area", "FarmTeleToBestArea")
+    createToggle(farm, "tele to best world", "FarmTeleToBestWorld")
+    createToggle(farm, "auto buy next area", "FarmAutoBuyNextArea")
+
+    farm:CreateSection({ name = "Nâng cấp slot" })
+    createToggle(farm, "auto upd pet slot", "FarmAutoPetSlot")
+    createToggle(farm, "auto upd egg slot", "FarmAutoEggSlot")
+end
+
+-- Tạo các toggle tối ưu hiển thị.
+do
+    optimize:CreateSection({ name = "Loot boxes" })
+    createToggle(optimize, "disable loot boxes", "OptimizeDisableLootBoxes")
+    optimize:CreateSection({ name = "Dropped objects" })
+    createToggle(optimize, "disable objects", "OptimizeDisableObjects")
+    optimize:CreateSection({ name = "Combined" })
+    createToggle(optimize, "super optimize", "OptimizeSuper")
+
+    -- Cấu hình giới hạn FPS của client.
+    local fpsLimit = features.OptimizeFpsLimit
+    local initialFps = "30"
+    if fpsLimit and launchConfig and launchConfig.fpsTarget ~= nil then
+        if fpsLimit.setTarget(launchConfig.fpsTarget) then
+            initialFps = tostring(tonumber(launchConfig.fpsTarget))
+        end
+    end
+    optimize:CreateSection({ name = "FPS" })
+    optimize:CreateInput({
+        name = "Target FPS",
+        flag = "OptimizeFpsTarget",
+        numeric = true,
+        value = initialFps,
+        placeholder = "Nhập FPS mong muốn",
+        callback = function(value)
+            if fpsLimit then fpsLimit.setTarget(value) end
+        end,
+    })
+    createToggle(optimize, "Limit FPS", "OptimizeFpsLimit")
+end
+
+-- Tạo giao diện nhận thư và cấu hình gửi quà.
+do
+    createToggle(mail, "Tự nhận thư", "MailAutoClaim")
+    local gift = features.MailAutoGift
+    if not gift then return end
+    local preset = launchConfig and launchConfig.mailGift
+    local recipient = type(preset) == "table" and type(preset.recipient) == "string" and preset.recipient or ""
+    mail:CreateInput({
+        name = "User Name",
+        flag = "MailUserName",
+        value = recipient,
+        placeholder = "...",
+        callback = gift.setRecipient,
+    })
+
+    local selectedClass, itemDropdown
+    -- Đổi danh sách Item ID theo Class đang chọn.
+    local function selectClass(class)
+        local changed = selectedClass ~= nil and selectedClass ~= class
+        selectedClass = class
+        if itemDropdown then
+            if changed then itemDropdown:Set("", true) end
+            itemDropdown:Refresh(gift.getNames(class))
+        end
+    end
+    mail:CreateDropdown({
+        name = "Item Class",
+        flag = "MailGiftClass",
+        options = gift.getClasses(),
+        multiSelect = false,
+        callback = selectClass,
+    })
+    itemDropdown = mail:CreateDropdown({
+        name = "Item ID",
+        flag = "MailGiftItem",
+        options = {},
+        multiSelect = false,
+    })
+    if selectedClass then selectClass(selectedClass) end
+
+    local amount = mail:CreateInput({
+        name = "Amount",
+        flag = "MailGiftAmount",
+        value = "",
+        placeholder = "Ví dụ: 100k",
+    })
+    local keep = mail:CreateInput({
+        name = "Keep",
+        flag = "MailGiftKeep",
+        value = "",
+        placeholder = "Ví dụ: 10k hoặc 0",
+    })
+    local giftText = mail:CreateText({ text = "Danh sách gift: (trống)" })
+    -- Hiện mỗi quy tắc gửi quà trên một dòng.
+    local function updateGiftText()
+        local lines = {}
+        for _, rule in ipairs(gift.getList()) do
+            lines[#lines + 1] = ("%s, %s, %s, %s"):format(rule.class, rule.name, rule.amount, rule.keep)
+        end
+        giftText:Set(#lines > 0 and table.concat(lines, "\n") or "Danh sách gift: (trống)")
+    end
+    mail:CreateButton({
+        name = "Add Item",
+        callback = function()
+            local added, reason = gift.add(selectedClass, itemDropdown.value[1], amount.value, keep.value)
+            if added then updateGiftText() else warn("[Auto Gift] " .. reason) end
+        end,
+    })
+    mail:CreateButton({
+        name = "Clear 1 Item",
+        callback = function()
+            gift.removeLast()
+            updateGiftText()
+        end,
+    })
+    -- Nạp người nhận và danh sách trước khi launcher bật Auto Gift.
+    if type(preset) == "table" then
+        gift.setRecipient(recipient)
+        for _, rule in ipairs(type(preset.items) == "table" and preset.items or {}) do
+            if type(rule) == "table" then
+                local added, reason = gift.add(rule.class, rule.name, tostring(rule.amount), tostring(rule.keep))
+                if not added then warn("[Auto Gift] " .. reason) end
+            end
+        end
+        updateGiftText()
+    end
+    createToggle(mail, "auto gift", "MailAutoGift")
+end
+
+-- Tạo các nhóm giao diện giao dịch.
+do
+    local boothSnipe = trading:CreateGroup({ direction = "column" })
+    boothSnipe:CreateSection({ name = "Săn món ở gian hàng" })
+    local sniper = features.TradingSniperBooth
+    if sniper then
+        local config = launchConfig and launchConfig.trading
+        trading:CreateText({ text = sniper.configure(config) })
+        createToggle(trading, "Sniper Booth", "TradingSniperBooth")
+        createToggle(trading, "Săn cụm Huge", "TradingSniperHuge")
+        local report = features.TradingWebhook
+        if report then
+            config = type(config) == "table" and config or {}
+            -- Nhập URL và số dư cảnh báo cho webhook giao dịch.
+            trading:CreateInput({
+                name = "Trading Webhook URL",
+                flag = "TradingWebhookUrl",
+                value = type(config.webhookUrl) == "string" and config.webhookUrl or "",
+                callback = report.setUrl,
+            })
+            trading:CreateInput({
+                name = "Min Diamonds",
+                flag = "TradingMinDiamond",
+                value = tostring(config.minDiamond or 0),
+                callback = report.setMinimum,
+            })
+            createToggle(trading, "Webhook Trading", "TradingWebhook")
+        end
+    end
+
+    local boothSeller = trading:CreateGroup({ direction = "column" })
+    boothSeller:CreateSection({ name = "Bán ở gian hàng" })
+end
+
+-- Tạo giao diện cho các tính năng rank.
+do
+    createToggle(rank, "auto claim rank reward", "RankAutoClaimReward")
+    rank:CreateSection({ name = "auto quest" })
+    createToggle(rank, "auto rank quest", "RankAutoQuest")
+    createToggle(rank, "stats gui", "RankStatsGui")
+end
+
+-- Tạo giao diện cấu hình webhook.
+do
+    -- Webhook chung: URL, loại thông báo và nút điều khiển.
+    local petWebhook = features.WebhookEnabled
+    local petPreset = launchConfig and type(launchConfig.petWebhook) == "table" and launchConfig.petWebhook or {}
+    local initialPetUrl = type(petPreset.url) == "string" and petPreset.url or ""
+    local petOptions = petWebhook and petWebhook.getOptions() or {}
+    local initialPetEvents = {}
+    if type(petPreset.events) == "table" then
+        for _, category in ipairs(petOptions) do
+            if table.find(petPreset.events, category) then table.insert(initialPetEvents, category) end
+        end
+    end
+    webhook:CreateSection({ name = "webhook" })
+    webhook:CreateInput({
+        name = "Webhook URL",
+        flag = "WebhookUrl",
+        value = initialPetUrl,
+        placeholder = "Dán link webhook",
+        callback = function(value)
+            if petWebhook then petWebhook.setUrl(value) end
+        end,
+    })
+    webhook:CreateDropdown({
+        name = "Webhook Events",
+        flag = "WebhookEvents",
+        options = petOptions,
+        multiSelect = true,
+        value = initialPetEvents,
+        placeholder = "Chọn loại pet muốn báo",
+        callback = function(values)
+            if petWebhook then petWebhook.setSelection(values) end
+        end,
+    })
+    -- Nạp URL và loại pet trước khi launcher bật webhook.
+    if petWebhook and launchConfig then
+        petWebhook.setUrl(initialPetUrl)
+        petWebhook.setSelection(initialPetEvents)
+    end
+    createToggle(webhook, "Start Webhook", "WebhookEnabled")
+    webhook:CreateButton({
+        name = "Test Webhook",
+        callback = function()
+            if petWebhook then petWebhook.test() end
+        end,
+    })
+
+    -- Webhook Rank dùng URL và cấu hình riêng.
+    local rankWebhook = features.RankWebhookEnabled
+    local rankPreset = launchConfig and type(launchConfig.rankWebhook) == "table" and launchConfig.rankWebhook or {}
+    local initialRankUrl = type(rankPreset.url) == "string" and rankPreset.url or ""
+    local initialRankTarget = rankPreset.target ~= nil and tostring(rankPreset.target) or ""
+    webhook:CreateSection({ name = "webhook rank" })
+    webhook:CreateInput({
+        name = "Rank Webhook URL",
+        flag = "RankWebhookUrl",
+        value = initialRankUrl,
+        placeholder = "Dán link webhook rank",
+        callback = function(value)
+            if rankWebhook then rankWebhook.setUrl(value) end
+        end,
+    })
+    webhook:CreateInput({
+        name = "Target Rank",
+        flag = "RankWebhookTarget",
+        numeric = true,
+        value = initialRankTarget,
+        placeholder = "Nhập rank để kích hoạt",
+        callback = function(value)
+            if rankWebhook then rankWebhook.setTarget(value) end
+        end,
+    })
+    if rankWebhook and launchConfig then
+        rankWebhook.setUrl(initialRankUrl)
+        rankWebhook.setTarget(initialRankTarget)
+    end
+    createToggle(webhook, "Start Rank Webhook", "RankWebhookEnabled")
+    webhook:CreateButton({
+        name = "Test Rank Webhook",
+        callback = function()
+            if rankWebhook then rankWebhook.test() end
+        end,
+    })
+end
+
+-- Tạo giao diện cho các tính năng tự động.
+do
+    -- Danh sách Add Enchant không phải control có flag, nên lưu riêng theo tài khoản.
+    local enchantConfigPath = "RobloxHubEnchantList_" .. game:GetService("Players").LocalPlayer.UserId .. ".json"
+    local httpService = game:GetService("HttpService")
+
+    -- Đọc danh sách enchant đã lưu của tài khoản.
+    local function loadEnchantList()
+        if launchConfig then
+            return type(launchConfig.enchants) == "table" and launchConfig.enchants or {}
+        end
+        if type(readfile) ~= "function" then return {} end
+        if type(isfile) == "function" and not isfile(enchantConfigPath) then return {} end
+        local ok, list = pcall(function()
+            return httpService:JSONDecode(readfile(enchantConfigPath))
+        end)
+        return ok and type(list) == "table" and list or {}
+    end
+
+    -- Lưu thứ tự Add Enchant vào JSON cục bộ.
+    local function saveEnchantList(list)
+        if launchConfig then return end
+        local ok = pcall(function()
+            writefile(enchantConfigPath, httpService:JSONEncode(list))
+        end)
+        if not ok then warn("[Enchant UI] Không lưu được danh sách enchant vào config") end
+    end
+
+    -- Đọc kho ở luồng riêng để giữ quyền tạo UI của Rayfield.
+    local function runInventoryAction(action, ...)
+        local result
+        task.spawn(function(...)
+            result = table.pack(pcall(action, ...))
+        end, ...)
+        while not result do task.wait() end
+        return table.unpack(result, 1, result.n)
+    end
+
+    -- Nhận quà online
+    createToggle(automatic, "auto claim free gift", "AutoClaimFreeGift")
+
+    -- Trang bị enchant
+    automatic:CreateSection({ name = "Enchant" })
+    local enchantFeature = features.AutoEquipEnchant
+    local selectedEnchant
+
+    local hasEnchantNames, enchantNames = runInventoryAction(enchantFeature.getNames)
+    if not hasEnchantNames then
+        warn("[Enchant UI] " .. tostring(enchantNames))
+        enchantNames = {}
+    end
+    local enchantDropdown = automatic:CreateDropdown({
+        name = "Enchant",
+        flag = "AutoEnchantSelection",
+        multiSelect = false,
+        options = enchantNames,
+        callback = function(value) selectedEnchant = value end,
+    })
+    local enchantText = automatic:CreateText({ text = "enchant : (trống)" })
+    -- Hiện sách theo đúng thứ tự trong danh sách Add Enchant.
+    local function updateEnchantText()
+        local list = enchantFeature.getList()
+        enchantText:Set("enchant : " .. (#list > 0 and table.concat(list, ", ") or "(trống)"))
+    end
+
+    -- Khôi phục danh sách trước khi Rayfield có thể bật lại Auto Equip từ config.
+    local savedEnchants = loadEnchantList()
+    if #savedEnchants > 0 then
+        local ok, err = runInventoryAction(function()
+            for _, name in ipairs(savedEnchants) do
+                if type(name) == "string" then enchantFeature.add(name) end
+            end
+        end)
+        if not ok then warn("[Enchant UI] " .. tostring(err)) end
+        updateEnchantText()
+    end
+    automatic:CreateButton({
+        name = "add enchant",
+        callback = function()
+            local name = selectedEnchant or enchantDropdown.value[1]
+            if name then
+                local ok, err = runInventoryAction(enchantFeature.add, name)
+                if not ok then warn("[Enchant UI] " .. tostring(err)) end
+                if ok and err then saveEnchantList(enchantFeature.getList()) end
+            end
+            updateEnchantText()
+        end,
+    })
+    automatic:CreateButton({
+        name = "clear enchant",
+        callback = function()
+            enchantFeature.clear()
+            saveEnchantList(enchantFeature.getList())
+            updateEnchantText()
+        end,
+    })
+    createToggle(automatic, "auto equip enchant", "AutoEquipEnchant")
+
+    -- Dọn vòng làm mới inventory còn chạy từ bản UI cũ.
+    if environment.RobloxHubEnchantUiJob then
+        pcall(task.cancel, environment.RobloxHubEnchantUiJob)
+        environment.RobloxHubEnchantUiJob = nil
+    end
+
+    -- Chọn loại và tự mở quà
+    local giftFeature = features.AutoOpenGifts
+    local giftOptions = giftFeature and giftFeature.getOptions and giftFeature.getOptions()
+        or { "Gift Bag", "Large Gift Bag", "Mini Chest" }
+    local initialGifts = {}
+    if launchConfig then
+        local giftPreset = launchConfig.gifts
+        for _, id in ipairs(giftOptions) do
+            if type(id) == "string" and id:find("%S")
+                and (giftPreset == "all" or (type(giftPreset) == "table" and table.find(giftPreset, id))) then
+                table.insert(initialGifts, id)
+            end
+        end
+    end
+    -- Chuyển các loại quà đã chọn sang module Automatic.
+    local function setGiftSelection(values)
+        local feature = features.AutoOpenGifts
+        if feature then feature.setSelection(values) end
+    end
+
+    automatic:CreateDropdown({
+        name = "Gifts",
+        flag = "AutoOpenGiftTypes",
+        options = giftOptions,
+        multiSelect = true,
+        value = initialGifts,
+        callback = setGiftSelection,
+    })
+    if launchConfig then setGiftSelection(initialGifts) end
+    createToggle(automatic, "auto open gifts", "AutoOpenGifts")
+end
+
+-- 6. Áp dụng cấu hình khởi chạy
+-- Áp dụng các toggle được launcher đặt sẵn.
+for _, start in ipairs(startupActions) do start() end
