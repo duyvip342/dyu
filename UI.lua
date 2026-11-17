@@ -404,7 +404,7 @@ do
         local config = launchConfig and launchConfig.trading
         trading:CreateText({ text = sniper.configure(config) })
         createToggle(trading, "Sniper Booth", "TradingSniperBooth")
-         createToggle(trading, "Săn cụm Huge", "TradingSniperHuge")
+        createToggle(trading, "Săn cụm Huge", "TradingSniperHuge")
         local report = features.TradingWebhook
         if report then
             config = type(config) == "table" and config or {}
@@ -427,6 +427,7 @@ do
 
     local boothSeller = trading:CreateGroup({ direction = "column" })
     boothSeller:CreateSection({ name = "Bán ở gian hàng" })
+    if features.TradingAutoSell then createToggle(trading, "Auto Sell", "TradingAutoSell") end
 end
 
 -- Tạo giao diện cho các tính năng rank.
