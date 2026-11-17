@@ -37,6 +37,11 @@ local nextSearchAt, pendingHop
 local idleBeforeSearch = 5
 local rejectedServers = {}
 local lastNotice
+local tradingStatus, statusCallback = "Chưa bật Sniper Booth.", nil
+local function setStatus(message)
+    tradingStatus = message
+    if statusCallback then pcall(statusCallback, message) end
+end
 local suffixes = { [""] = 1, k = 1e3, m = 1e6, b = 1e9, t = 1e12 }
 local variants = {
     normal = { petTypes.Normal, false, "Normal" },
@@ -97,6 +102,7 @@ end
 
 -- In cùng một lỗi một lần cho mỗi trạng thái liên tiếp.
 local function notice(reason)
+    setStatus(reason)
     if lastNotice == reason then return end
     lastNotice = reason
     warn("[Trading] " .. reason)
@@ -213,8 +219,28 @@ local function rememberServer(id)
 end
 
 -- Chuyển cấu hình Trading sang lần chạy tiếp theo qua executor.
+local function teleportQueue()
+    -- Không dùng chuỗi `or`: một alias không phải hàm có thể che alias hợp lệ.
+    for _, scope in ipairs({ environment, _G }) do
+        for _, name in ipairs({ "queue_on_teleport", "queue_on_tp", "queueonteleport", "queueontp" }) do
+            if type(scope[name]) == "function" then return scope[name] end
+        end
+        for _, name in ipairs({ "syn", "fluxus" }) do
+            local api = scope[name]
+            if type(api) == "table" and type(api.queue_on_teleport) == "function" then
+                return api.queue_on_teleport
+            end
+        end
+    end
+    -- Một số executor tách globals của script khỏi getgenv().
+    if type(queue_on_teleport) == "function" then return queue_on_teleport end
+    if type(queue_on_tp) == "function" then return queue_on_tp end
+    if type(queueonteleport) == "function" then return queueonteleport end
+    if type(queueontp) == "function" then return queueontp end
+end
+
 local function queueResume(targetJobId)
-    local queue = queue_on_teleport or queue_on_tp or queueonteleport
+    local queue = teleportQueue()
     if type(queue) ~= "function" then
         notice("Executor thiếu queue_on_teleport. Cần chạy launcher lại ở server mới.")
         return false
@@ -243,9 +269,9 @@ env.RobloxHubTradingResumedJob = game.JobId
 env.RobloxHubConfig = game:GetService("HttpService"):JSONDecode(%q)
 assert(loadstring(game:HttpGet(%q)))()
 ]=]):format(targetJobId or "", normalPlace, http:JSONEncode(config), launcherUrl)
-    local ok = pcall(queue, source)
-    if not ok then notice("Executor không thể nạp lại launcher sau teleport.") end
-    return ok
+    local ok, result = pcall(queue, source)
+    if not ok or result == false then notice("Executor không thể nạp lại launcher sau teleport.") end
+    return ok and result ~= false
 end
 
 -- Dùng đúng đường vào Trading Plaza Normal của game.
@@ -259,14 +285,20 @@ end
 
 -- Đọc bảng booth đã tải trong client thay vì quét giao diện.
 local function getBooths()
-    if not signal.Invoke("Booths_IsLoaded") then return nil end
+    if not signal.Invoke("Booths_IsLoaded") then
+        setStatus("Đang chờ game tải dữ liệu booth...")
+        return nil
+    end
     local getCallback = getcallbackvalue or getcallbackmember
     if type(getCallback) ~= "function" then
         notice("Executor không hỗ trợ đọc dữ liệu booth.")
         return nil
     end
     local callback = getCallback(signal.Invoked("Booths_GetIdWithStackKey"), "OnInvoke")
-    if type(callback) ~= "function" then return nil end
+    if type(callback) ~= "function" then
+        notice("Executor chưa đọc được callback booth; không thể quét hoặc hop.")
+        return nil
+    end
     local cache, value = debug.getupvalue(callback, 1)
     if type(value) == "table" then cache = value end
     if type(cache) == "table" then return cache end
@@ -585,8 +617,14 @@ local function nextSearchRule()
     local rule = rules[searchIndex]
     local class = rule.class
     if not class then return end
-    if not searchCatalogs[class] then
-        searchCatalogs[class] = require(library.Util.TradingTerminalUtil).ByClasses({ class })
+    if not searchCatalogs[class] or not next(searchCatalogs[class]) then
+        local catalog = require(library.Util.TradingTerminalUtil).ByClasses({ class })
+        -- ByClasses có thể trả {} khi game chưa khởi tạo xong. Không giữ cache rỗng.
+        if type(catalog) ~= "table" or not next(catalog) then
+            setStatus("Danh mục Terminal chưa sẵn sàng; sẽ tải lại.")
+            return
+        end
+        searchCatalogs[class] = catalog
     end
     local pool = rule.searchPool
     if not pool then
@@ -595,12 +633,17 @@ local function nextSearchRule()
             if matches(rule, item) then pool[#pool + 1] = item end
         end
         table.sort(pool, function(a, b) return a:StackKey() < b:StackKey() end)
-        rule.searchPool = pool
+        if #pool > 0 then rule.searchPool = pool end
     end
-    if #pool == 0 then return end
+    if #pool == 0 then
+        searchCatalogs[class] = nil
+        setStatus("Terminal chưa có mục khớp " .. rule.name .. "; sẽ tải lại danh mục.")
+        return
+    end
     local offset = (searchOffsets[searchIndex] or 0) % #pool + 1
     searchOffsets[searchIndex] = offset
     local target = pool[offset]
+    setStatus(("Terminal: %s (%d/%d loại khớp %s)"):format(target:GetName(), offset, #pool, rule.name))
     return { class = class, name = target:GetName(), stackKey = target:StackKey() }, 1
 end
 
@@ -610,8 +653,15 @@ end
 
 -- Dùng Terminal sau khi đủ 5 giây không có listing phù hợp.
 local function searchNextServer()
-    if not hopEnabled or not nextSearchAt or os.clock() < nextSearchAt then return end
-    if type(queue_on_teleport or queue_on_tp or queueonteleport) ~= "function" then return end
+    if not hopEnabled then
+        setStatus("Hop đang tắt; chỉ quét server hiện tại.")
+        return
+    end
+    if not nextSearchAt or os.clock() < nextSearchAt then return end
+    if not teleportQueue() then
+        notice("Không hop được: executor thiếu hàm queue teleport để tiếp tục sniper ở server mới.")
+        return
+    end
     local now = os.clock()
     for id, expiresAt in pairs(rejectedServers) do
         if expiresAt <= now then rejectedServers[id] = nil end
@@ -635,12 +685,15 @@ local function searchNextServer()
         local message = tostring((ok and reason or result) or "không tìm thấy listing")
         local cooldown = tonumber(message:lower():match("wait (%d+) seconds?"))
         if cooldown then nextSearchAt = os.clock() + math.max(cooldown, retryDelay) end
-        if not ok then notice(("Terminal · %s · %s"):format(rule.name, message)) end
+        setStatus(("Terminal · %s · %s"):format(rule.name, message))
         return
     end
     if result.place_id ~= normalPlace or type(result.job_id) ~= "string" or result.job_id == ""
         or result.job_id == game.JobId or table.find(visited, result.job_id)
-        or (rejectedServers[result.job_id] or 0) > os.clock() then return end
+        or (rejectedServers[result.job_id] or 0) > os.clock() then
+        setStatus("Terminal trả server hiện tại/đã ghé/không phù hợp; đang thử loại tiếp theo.")
+        return
+    end
 
     -- Kiểm tra lại server hiện tại sau thời gian chờ phản hồi Terminal.
     local balance = currency.Get("Diamonds")
@@ -661,6 +714,7 @@ local function searchNextServer()
         failHop(message ~= "" and message or outcome)
     end)
     pendingHop = attempt
+    setStatus("Đang chuyển tới server có " .. rule.name)
     -- Sniper tự đọc lại booth sau khi đến server tìm được.
     local sent, failure = pcall(teleport.TeleportToPlaceInstance, teleport, normalPlace, result.job_id, player)
     if not sent and pendingHop == attempt then failHop(failure) end
@@ -780,12 +834,23 @@ end
 
 features.TradingSniperBooth = {
     configure = configure,
+    setStatusCallback = function(callback)
+        statusCallback = callback
+        if callback then pcall(callback, tradingStatus) end
+    end,
+    setHop = function(on)
+        hopEnabled = on == true
+        nextSearchAt = nil
+        setStatus(hopEnabled and "Đã bật tìm server qua Terminal." or "Hop đang tắt; chỉ quét server hiện tại.")
+    end,
     duy = function(on, shared)
         if on and not sniperEnabled then
             nextSearchAt = nil
             nextTravelAt = 0
         end
         sniperEnabled = on
+        if on then setStatus("Đang quét booth; nếu không có món đạt giá sẽ tìm qua Terminal.")
+        else setStatus("Đã tắt Sniper Booth.") end
         if not on and pendingHop then clearPendingHop() end
         start(shared)
     end,
