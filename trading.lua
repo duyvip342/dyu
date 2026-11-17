@@ -8,10 +8,13 @@ local http = game:GetService("HttpService")
 local network = require(client.Network)
 local currency = require(client.CurrencyCmds)
 local inventory = require(client.InventoryCmds)
+local save = require(client.Save)
+local flags = require(client.FFlags)
 local signal = require(library.Signal)
 local items = require(library.Items)
 local petTypes = require(library.Items.PetItem).Types
-local normalPlace = require(library.Modules.PlaceFile).LocalPlaces.Trading
+local plazaPlaces = require(library.Modules.PlaceFile).LocalPlaces
+local normalPlace = plazaPlaces.Trading
 local launcherUrl = "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/UI.lua"
 local diamondIcon = "https://tr.rbxcdn.com/180DAY-9b4d094e1819c1b5ea67575b824a9101/150/150/Image/Png/noFilter"
 
@@ -22,6 +25,9 @@ local rules, visited, pending = {}, {}, {}
 local sniperEnabled, webhookEnabled, hopEnabled = false, false, true
 local hugeEnabled = false
 local hugeRule = { maxPrice = 50_000_000 }
+local sellEnabled = false
+local sellRules, pendingSales = {}, {}
+local nextSellAt = 0
 local webhookUrl, minDiamond = "", 0
 local belowMinimum, delivery, job
 local lastWebhookError
@@ -68,6 +74,15 @@ local function romanTier(roman)
         remaining %= part[2]
     end
     if table.concat(canonical) == roman then return value end
+end
+
+-- Tách cấp viết bằng số La Mã hoặc cú pháp [Cấp N].
+local function itemTier(name)
+    local itemId, tier = name:match("^(.-)%s+%[Cấp (%d+)%]$")
+    if tier then return itemId, tonumber(tier) end
+    local base, suffix = name:match("^(.-)%s+([IVXLCDM]+)$")
+    tier = romanTier(suffix)
+    if tier then return base, tier, true end
 end
 
 -- Đọc số kim cương nguyên hoặc giá có hậu tố k, m, b và t.
@@ -204,9 +219,10 @@ local function queueResume(targetJobId)
         return false
     end
     local config = {
-        toggles = { TradingSniperBooth = sniperEnabled, TradingSniperHuge = hugeEnabled, TradingWebhook = webhookEnabled },
+        toggles = { TradingSniperBooth = sniperEnabled, TradingSniperHuge = hugeEnabled,
+            TradingWebhook = webhookEnabled, TradingAutoSell = sellEnabled },
         trading = { items = rules, webhookUrl = webhookUrl, minDiamond = minDiamond, hop = hopEnabled,
-            visited = visited, searchIndex = searchIndex },
+            visited = visited, searchIndex = searchIndex, sell = sellRules },
     }
     local source = ([=[
 local env = type(getgenv) == "function" and getgenv() or _G
@@ -250,7 +266,7 @@ end
 
 -- Khớp tên nội bộ hoặc tên hiển thị và biến thể pet đã chọn.
 local function matches(rule, item)
-    if item.Class.Name ~= rule.class then return false end
+    if rule.class and item.Class.Name ~= rule.class then return false end
     if rule.tier then
         local tier = type(item.GetTier) == "function" and item:GetTier() or item:GetData().tn
         local id = item:GetId():lower()
@@ -266,6 +282,70 @@ local function matches(rule, item)
     if variant and (item:GetType() ~= variant[1] or item:IsShiny() ~= variant[2]) then return false end
     local needle = rule.name:lower()
     return item:GetId():lower() == needle or item:GetName():lower() == needle
+end
+
+-- Lấy số slot đã dùng và số lượng đang rao theo UID trên booth của mình.
+local function saleSpace(booth, now)
+    local data = save.Get()
+    if not booth or not data or type(data.BoothSlots) ~= "number" then return nil end
+    local configured = flags.Get(flags.Keys.BoothMaxSlots)
+    local limit = type(configured) == "number" and configured == configured
+        and math.clamp(math.floor(configured), 4, 100) or 25
+    local listed, used = {}, 0
+    for _, row in pairs(booth.Listings) do
+        local uid = row.Item:GetUID()
+        listed[uid] = (listed[uid] or 0) + row.Item:GetAmount()
+        used += 1
+    end
+    for uid, previous in pairs(pendingSales) do
+        if previous.expires <= now or (previous.expected and (listed[uid] or 0) >= previous.expected) then
+            pendingSales[uid] = nil
+        elseif previous.expected then
+            used += 1
+        end
+    end
+    if used < math.min(data.BoothSlots, limit) then return listed end
+end
+
+-- Khớp tên chính xác hoặc mọi biến thể thuộc nhóm Huge.
+local function matchesSale(rule, item)
+    if rule.class and item.Class.Name ~= rule.class then return false end
+    if rule.huge then return item:IsHuge() end
+    if rule.tier and item.Class.Name ~= "Pet" then return matches(rule, item) end
+    return item:GetName():lower() == rule.name:lower()
+end
+
+-- Tính giá mỗi món và giới hạn lượng đăng theo số còn rảnh trong kho.
+local function saleDetails(rule, item, listed)
+    if not item or item:IsLocked() or not item:IsTradable() then return nil end
+    local amount = math.min(item:GetAmount() - listed, 50_000)
+    if amount < 1 then return nil end
+    local rap = item:GetRAP()
+    if type(rap) ~= "number" or not (rap > 0 and rap < 2^53) then return nil end
+    local price = math.ceil(rap + rap * rule.rap / 100)
+    if price < 2^53 then return price, amount end
+end
+
+-- Tìm một stack phù hợp còn hàng và có RAP.
+local function findSale(container, listed)
+    for _, rule in ipairs(sellRules) do
+        local function findInClass(class)
+            for uid, item in pairs(container:All(class)) do
+                if not pendingSales[uid] and matchesSale(rule, item) and saleDetails(rule, item, listed[uid] or 0) then
+                    return uid
+                end
+            end
+        end
+        if rule.class then
+            local uid = findInClass(items.Types[rule.class])
+            if uid then return uid, rule end
+        else
+            for _, class in pairs(items.Types) do
+                local uid = findInClass(class)
+                if uid then return uid, rule end
+            end
+        end
+    end
 end
 
 -- Tính số lượng mua được theo giá từng món và ví hiện tại.
@@ -333,6 +413,41 @@ local function approachBooth(boothId)
     local target = pivot * CFrame.new(0, 0, -8)
     character:PivotTo(target)
     task.wait(0.3)
+end
+
+-- Đăng một listing trên booth của mình rồi chờ game cập nhật số đã rao.
+local function sellOne(booths)
+    local now = os.clock()
+    if now < nextSellAt then return end
+    nextSellAt = now + 3
+    if not flags.Get(flags.Keys.Booth) then return end
+    local booth = booths[player]
+    local listed = saleSpace(booth, now)
+    local container = inventory.Container()
+    if not listed or not container then return end
+    local uid, rule = findSale(container, listed)
+    if not uid then return end
+
+    local boothId = booth.BoothID
+    approachBooth(boothId)
+    if not sellEnabled or environment.RobloxHubTradingRun ~= runToken then return end
+    booth = booths[player]
+    if not booth or booth.BoothID ~= boothId then return end
+    listed = saleSpace(booth, os.clock())
+    local item = container:Get(uid)
+    if not listed or not item or not matchesSale(rule, item) then return end
+    local alreadyListed = listed[uid] or 0
+    local price, amount = saleDetails(rule, item, alreadyListed)
+    if not price then return end
+
+    pendingSales[uid] = { expires = os.clock() + 10 }
+    local accepted, reason = network.Invoke("Booths_CreateListing", uid, price, amount)
+    if accepted then
+        pendingSales[uid] = { expires = os.clock() + 12, expected = alreadyListed + amount }
+        nextSellAt = os.clock() + 1
+    else
+        notice("Auto Sell · " .. tostring(reason or "Game từ chối đăng món."))
+    end
 end
 
 -- Xác nhận lại listing và số dư ngay trước khi gửi lệnh mua.
@@ -470,39 +585,48 @@ end
 local function tick()
     local balance = currency.Get("Diamonds")
     checkBalance(balance)
-    if not (sniperEnabled or hugeEnabled) then return end
+    local buying = sniperEnabled or hugeEnabled
+    if not (buying or sellEnabled) then return end
     if pendingHop then
         if os.clock() >= pendingHop.deadline then failHop("hết thời gian chờ Roblox phản hồi") end
         return
     end
-    if game.PlaceId ~= normalPlace then
+    local placeId = game.PlaceId
+    local selling = sellEnabled and #sellRules > 0 and (placeId == normalPlace or placeId == plazaPlaces.ProTrading)
+    if buying and placeId ~= normalPlace then
         enterNormal()
-    elseif (hugeEnabled or (sniperEnabled and #rules > 0)) and type(balance) == "number" and balance > 0 then
+        return
+    end
+    buying = (hugeEnabled or (sniperEnabled and #rules > 0)) and type(balance) == "number" and balance > 0
+    if buying or selling then
         local booths = getBooths()
         if not booths then
             nextSearchAt = nil
             return
         end
-        local candidate = findListing(booths, balance)
+        local candidate = buying and findListing(booths, balance)
         if candidate then
             nextSearchAt = nil
             buyListing(booths, candidate)
-        elseif sniperEnabled and #rules > 0 then
-            nextSearchAt = nextSearchAt or os.clock() + idleBeforeSearch
-            searchNextServer()
+        else
+            if selling then sellOne(booths) end
+            if buying and sniperEnabled and #rules > 0 then
+                nextSearchAt = nextSearchAt or os.clock() + idleBeforeSearch
+                searchNextServer()
+            end
         end
     else
         nextSearchAt = nil
     end
 end
 
--- Dùng chung một worker cho hai toggle trong Trading.
+-- Dùng chung một worker cho các toggle trong Trading.
 local function start(shared)
     delivery = shared and shared.WebhookDelivery or delivery
     if webhookEnabled then webhookReady() end
-    if job or not (sniperEnabled or hugeEnabled or webhookEnabled) then return end
+    if job or not (sniperEnabled or hugeEnabled or sellEnabled or webhookEnabled) then return end
     job = task.defer(function()
-        while environment.RobloxHubTradingRun == runToken and (sniperEnabled or hugeEnabled or webhookEnabled) do
+        while environment.RobloxHubTradingRun == runToken and (sniperEnabled or hugeEnabled or sellEnabled or webhookEnabled) do
             local ok, reason = pcall(tick)
             if not ok then notice(tostring(reason)) end
             task.wait(ok and 1 or 5)
@@ -520,6 +644,22 @@ local function configure(config)
     hopEnabled = config.hop ~= false
     searchIndex = type(config.searchIndex) == "number" and math.max(0, math.floor(config.searchIndex)) or 0
     for _, id in ipairs(type(config.visited) == "table" and config.visited or {}) do rememberServer(id) end
+    table.clear(sellRules)
+    for index, entry in ipairs(type(config.sell) == "table" and config.sell or {}) do
+        if type(entry) ~= "table" then continue end
+        local name, class = clean(entry.name), clean(entry.class)
+        local rap = type(entry.rap) == "number" and entry.rap
+            or tonumber(clean(entry.rap):match("^([%d]+%.?%d*)%s*%%?$"))
+        local huge = name:lower() == "huge"
+        if name == "" or not (rap and rap >= 0 and rap < 2^53)
+            or (class ~= "" and not items.Types[class]) or (huge and class ~= "" and class ~= "Pet") then
+            warn(("[Auto Sell] Dòng %d thiếu tên, class hoặc %% RAP hợp lệ."):format(index))
+            continue
+        end
+        local itemId, tier, roman = itemTier(name)
+        sellRules[#sellRules + 1] = { name = name, class = huge and "Pet" or (class ~= "" and class or nil),
+            rap = rap, huge = huge, itemId = itemId, tier = tier, roman = roman }
+    end
     table.clear(rules)
     local descriptions = {}
     for index, entry in ipairs(type(config.items) == "table" and config.items or {}) do
@@ -534,17 +674,8 @@ local function configure(config)
             continue
         end
         variant = class == "Pet" and variant or nil
-        -- Tách cấp viết bằng số La Mã hoặc cú pháp [Cấp N].
         local itemId, tier, roman
-        if class ~= "Pet" then
-            itemId, tier = name:match("^(.-)%s+%[Cấp (%d+)%]$")
-            tier = tonumber(tier)
-            if not tier then
-                local base, suffix = name:match("^(.-)%s+([IVXLCDM]+)$")
-                tier = romanTier(suffix)
-                if tier then itemId, roman = base, true end
-            end
-        end
+        if class ~= "Pet" then itemId, tier, roman = itemTier(name) end
         rules[#rules + 1] = { class = class, name = name, minAmount = price, variant = variant,
             itemId = itemId, tier = tier, roman = roman }
         descriptions[#descriptions + 1] = ("%s · %s%s · ≤ %s 💎/món"):format(class, name,
@@ -571,6 +702,15 @@ features.TradingSniperHuge = {
     duy = function(on, shared)
         if on and not hugeEnabled and not sniperEnabled then nextTravelAt = 0 end
         hugeEnabled = on
+        start(shared)
+    end,
+}
+
+-- Bật đăng bán theo danh sách từ launcher.
+features.TradingAutoSell = {
+    duy = function(on, shared)
+        sellEnabled = on
+        if on then nextSellAt = 0 end
         start(shared)
     end,
 }
