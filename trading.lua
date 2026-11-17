@@ -23,11 +23,12 @@ local runToken = {}
 environment.RobloxHubTradingRun = runToken
 local rules, visited, pending = {}, {}, {}
 local sniperEnabled, webhookEnabled, hopEnabled = false, false, true
-local hugeEnabled = false
-local hugeRule = { maxPrice = 50_000_000 }
+local searchCatalogs, searchOffsets = {}, {}
 local sellEnabled = false
 local sellRules, pendingSales = {}, {}
 local nextSellAt = 0
+local nextClaimAt, sellerBoothId = 0, nil
+local restorePending = false
 local webhookUrl, minDiamond = "", 0
 local belowMinimum, delivery, job
 local lastWebhookError
@@ -218,11 +219,19 @@ local function queueResume(targetJobId)
         notice("Executor thiếu queue_on_teleport. Cần chạy launcher lại ở server mới.")
         return false
     end
+    local function exportRules(source)
+        local output = {}
+        for _, rule in ipairs(source) do
+            output[#output + 1] = { class = rule.class, name = rule.name, price = rule.price,
+                variant = rule.variant, minPrice = rule.minPrice }
+        end
+        return output
+    end
     local config = {
-        toggles = { TradingSniperBooth = sniperEnabled, TradingSniperHuge = hugeEnabled,
+        toggles = { TradingSniperBooth = sniperEnabled,
             TradingWebhook = webhookEnabled, TradingAutoSell = sellEnabled },
-        trading = { items = rules, webhookUrl = webhookUrl, minDiamond = minDiamond, hop = hopEnabled,
-            visited = visited, searchIndex = searchIndex, sell = sellRules },
+        trading = { items = exportRules(rules), webhookUrl = webhookUrl, minDiamond = minDiamond, hop = hopEnabled,
+            visited = visited, searchIndex = searchIndex, sell = exportRules(sellRules) },
     }
     local source = ([=[
 local env = type(getgenv) == "function" and getgenv() or _G
@@ -264,24 +273,35 @@ local function getBooths()
     notice("Chưa đọc được bảng listing của Trading Plaza.")
 end
 
--- Khớp tên nội bộ hoặc tên hiển thị và biến thể pet đã chọn.
+-- Dùng cùng quy tắc tên, cấp và thuộc tính cho mua/bán.
 local function matches(rule, item)
     if rule.class and item.Class.Name ~= rule.class then return false end
-    if rule.tier then
-        local tier = type(item.GetTier) == "function" and item:GetTier() or item:GetData().tn
-        local id = item:GetId():lower()
-        if not rule.roman then return id == rule.itemId:lower() and tier == rule.tier end
-        local needle = rule.name:lower()
-        local display = item:GetName():lower()
-        local exact = id == needle or display == needle
-        if type(tier) ~= "number" then return exact end
-        local base = rule.itemId:lower()
-        return tier == rule.tier and (exact or id == base or display == base)
+    if rule.variant then
+        if item.Class.Name ~= "Pet" then return false end
+        local variant = variants[rule.variant]
+        if item:GetType() ~= variant[1] or item:IsShiny() ~= variant[2] then return false end
     end
-    local variant = rule.variant and variants[rule.variant]
-    if variant and (item:GetType() ~= variant[1] or item:IsShiny() ~= variant[2]) then return false end
-    local needle = rule.name:lower()
-    return item:GetId():lower() == needle or item:GetName():lower() == needle
+    if rule.huge then return item.Class.Name == "Pet" and item:IsHuge() end
+    local id, display = item:GetId(), item:GetName()
+    local baseId, idTier = itemTier(id)
+    local baseDisplay, displayTier = itemTier(display)
+    local needle = (rule.itemId or rule.name):lower()
+    local nameMatches = id:lower() == rule.name:lower() or display:lower() == rule.name:lower()
+        or (baseId or id):lower() == needle or (baseDisplay or display):lower() == needle
+    if not nameMatches then return false end
+    if not rule.tier then return true end
+    local tier = type(item.GetTier) == "function" and item:GetTier() or item:GetData().tn
+    return (tier or displayTier or idTier) == rule.tier
+end
+
+-- Price không có % là kim cương; có % là mức giảm/tăng so với RAP.
+local function rulePrice(rule, item, selling)
+    if not rule.percent then return parseDiamonds(rule.price) end
+    local rap = item:GetRAP()
+    if type(rap) ~= "number" or not (rap > 0 and rap < 2^53) then return nil end
+    local value = rap * (1 + (selling and 1 or -1) * rule.percent / 100)
+    value = selling and math.ceil(value) or math.floor(value)
+    if value >= 1 and value < 2^53 then return value end
 end
 
 -- Lấy số slot đã dùng và số lượng đang rao theo UID trên booth của mình.
@@ -307,23 +327,15 @@ local function saleSpace(booth, now)
     if used < math.min(data.BoothSlots, limit) then return listed end
 end
 
--- Khớp tên chính xác hoặc mọi biến thể thuộc nhóm Huge.
-local function matchesSale(rule, item)
-    if rule.class and item.Class.Name ~= rule.class then return false end
-    if rule.huge then return item:IsHuge() end
-    if rule.tier and item.Class.Name ~= "Pet" then return matches(rule, item) end
-    return item:GetName():lower() == rule.name:lower()
-end
+local matchesSale = matches
 
 -- Tính giá mỗi món và giới hạn lượng đăng theo số còn rảnh trong kho.
 local function saleDetails(rule, item, listed)
     if not item or item:IsLocked() or not item:IsTradable() then return nil end
     local amount = math.min(item:GetAmount() - listed, 50_000)
     if amount < 1 then return nil end
-    local rap = item:GetRAP()
-    if type(rap) ~= "number" or not (rap > 0 and rap < 2^53) then return nil end
-    local price = math.ceil(rap + rap * rule.rap / 100)
-    if price < 2^53 then return price, amount end
+    local price = rulePrice(rule, item, true)
+    if price then return price, amount end
 end
 
 -- Tìm một stack phù hợp còn hàng và có RAP.
@@ -348,28 +360,21 @@ local function findSale(container, listed)
     end
 end
 
--- Tính số lượng mua được theo giá từng món và ví hiện tại.
+-- Giá trần Huge là giới hạn nghiêm ngặt trên giá rao từng món.
 local function quantityFor(row, rule, balance, now)
     if not row or not row.Item or type(row.ReadyTimestamp) ~= "number" or row.ReadyTimestamp > now then return 0 end
     local price = row.DiamondCost
-    if type(price) ~= "number" or price <= 0 then return 0 end
-    if rule == hugeRule then
-        -- Lọc riêng pet Huge có giá dưới 50M và bằng đúng 80% RAP.
-        local item = row.Item
-        if price >= hugeRule.maxPrice or item.Class.Name ~= "Pet" or not item:IsHuge()
-            or not item:GetName():lower():find("huge", 1, true) then return 0 end
-        local rap = item:GetRAP()
-        if type(rap) ~= "number" or price * 5 ~= rap * 4 then return 0 end
-    elseif price > rule.minAmount then
-        return 0
-    end
+    if type(price) ~= "number" or not (price > 0 and price < 2^53) then return 0 end
+    local limit = rulePrice(rule, row.Item, false)
+    if not limit or price > limit then return 0 end
+    if rule.huge and rule.minPrice and price >= rule.minPrice then return 0 end
     return math.min(row.Item:GetAmount(), math.floor(balance / price))
 end
 
 -- Ưu tiên quy tắc đầu tiên có hàng và giá thấp nhất trong quy tắc đó.
 local function findListing(booths, balance)
     local now = workspace:GetServerTimeNow()
-    local best, bestHuge
+    local best
     for owner, booth in pairs(booths) do
         if owner == player or type(booth.Listings) ~= "table" then continue end
         for id, row in pairs(booth.Listings) do
@@ -389,17 +394,13 @@ local function findListing(booths, balance)
                     end
                 end
             end
-            if hugeEnabled and eligible and quantityFor(row, hugeRule, balance, now) > 0
-                and (not bestHuge or row.DiamondCost < bestHuge.price) then
-                bestHuge = { owner = owner, boothId = booth.BoothID, id = id, key = key,
-                    price = row.DiamondCost, rule = hugeRule }
-            end
+
         end
     end
     for key, held in pairs(pending) do
         if held.untilAt <= now then pending[key] = nil end
     end
-    return best or bestHuge
+    return best
 end
 
 -- Đứng cạnh booth theo cùng điểm đến mà Trading Terminal dùng.
@@ -416,6 +417,59 @@ local function approachBooth(boothId)
 end
 
 -- Đăng một listing trên booth của mình rồi chờ game cập nhật số đã rao.
+local function ensureSellerBooth(booths)
+    local booth = booths[player]
+    if not booth then
+        sellerBoothId = nil
+        if os.clock() < nextClaimAt then return false end
+        nextClaimAt = os.clock() + 3
+        local plaza = workspace:FindFirstChild("TradingPlaza")
+        local spawns = plaza and plaza:FindFirstChild("BoothSpawns")
+        if not spawns or not flags.Get(flags.Keys.Booth) then return false end
+        local occupied = {}
+        for _, other in pairs(booths) do occupied[tostring(other.BoothID)] = true end
+        for _, model in ipairs(spawns:GetChildren()) do
+            local id = model:GetAttribute("ID")
+            if id and not occupied[tostring(id)] then
+                approachBooth(id)
+                if not sellEnabled or environment.RobloxHubTradingRun ~= runToken then return false end
+                if booths[player] then return false end
+                local accepted, reason = network.Invoke("Booths_ClaimBooth", id)
+                if accepted then restorePending = true
+                else notice("Nhận booth · " .. tostring(reason or "Booth không còn trống.")) end
+                return false
+            end
+        end
+        notice("Chưa có booth trống, sẽ tự thử lại.")
+        return false
+    end
+    if sellerBoothId ~= booth.BoothID then
+        approachBooth(booth.BoothID)
+        if not sellEnabled or environment.RobloxHubTradingRun ~= runToken then return false end
+        sellerBoothId = booth.BoothID
+        restorePending = true
+        require(client.TabController).OpenTab("BoothPrompt")
+    end
+    if restorePending then
+        if os.clock() < nextClaimAt then return false end
+        local data = save.Get()
+        if not data then return false end
+        if flags.Get(flags.Keys.BoothRestoring) and data.BoothRecovery and next(data.BoothRecovery) then
+            nextClaimAt = os.clock() + 3
+            -- Đây là nhánh Yes của promptRestore trong BoothCmds.
+            if not network.Invoke("Booths_Restore") then
+                notice("Chưa khôi phục được listing cũ, sẽ thử lại.")
+                return false
+            end
+            restorePending = false
+            nextSellAt = os.clock() + 2
+            return false
+        end
+        restorePending = false
+    end
+    return true
+end
+
 local function sellOne(booths)
     local now = os.clock()
     if now < nextSellAt then return end
@@ -455,11 +509,10 @@ local function buyListing(booths, candidate)
     local scanner = require(library.Modules.LuaScanner)
     approachBooth(candidate.boothId)
     if environment.RobloxHubTradingRun ~= runToken
-        or (candidate.rule == hugeRule and not hugeEnabled)
-        or (candidate.rule ~= hugeRule and not sniperEnabled) then return end
+        or not sniperEnabled then return end
     local booth = booths[candidate.owner]
     local row = booth and booth.Listings[candidate.id]
-    if not row or not row.Item or (candidate.rule ~= hugeRule and not matches(candidate.rule, row.Item)) then return end
+    if not row or not row.Item or not matches(candidate.rule, row.Item) then return end
     local balance = currency.Get("Diamonds")
     if type(balance) ~= "number" then return end
     local now = workspace:GetServerTimeNow()
@@ -525,6 +578,36 @@ local function failHop(reason)
     notice("Chuyển server thất bại: " .. tostring(reason))
 end
 
+-- Luân phiên mọi cấp/thuộc tính phù hợp thay vì khóa vào stack đầu tiên gặp.
+local function nextSearchRule()
+    if not hopEnabled or not sniperEnabled or #rules == 0 then return end
+    searchIndex = searchIndex % #rules + 1
+    local rule = rules[searchIndex]
+    local class = rule.class
+    if not class then return end
+    if not searchCatalogs[class] then
+        searchCatalogs[class] = require(library.Util.TradingTerminalUtil).ByClasses({ class })
+    end
+    local pool = rule.searchPool
+    if not pool then
+        pool = {}
+        for _, item in pairs(searchCatalogs[class]) do
+            if matches(rule, item) then pool[#pool + 1] = item end
+        end
+        table.sort(pool, function(a, b) return a:StackKey() < b:StackKey() end)
+        rule.searchPool = pool
+    end
+    if #pool == 0 then return end
+    local offset = (searchOffsets[searchIndex] or 0) % #pool + 1
+    searchOffsets[searchIndex] = offset
+    local target = pool[offset]
+    return { class = class, name = target:GetName(), stackKey = target:StackKey() }, 1
+end
+
+local function searchStillEnabled(rule)
+    return sniperEnabled and hopEnabled and environment.RobloxHubTradingRun == runToken
+end
+
 -- Dùng Terminal sau khi đủ 5 giây không có listing phù hợp.
 local function searchNextServer()
     if not hopEnabled or not nextSearchAt or os.clock() < nextSearchAt then return end
@@ -533,18 +616,20 @@ local function searchNextServer()
     for id, expiresAt in pairs(rejectedServers) do
         if expiresAt <= now then rejectedServers[id] = nil end
     end
-    searchIndex = searchIndex % #rules + 1
-    local retryDelay = searchIndex == #rules and idleBeforeSearch or 1
-    nextSearchAt = now + retryDelay
-    local rule = rules[searchIndex]
+    local rule, retryDelay = nextSearchRule()
+    if not rule then
+        nextSearchAt = os.clock() + 1
+        return
+    end
+    nextSearchAt = os.clock() + retryDelay
     local key = terminalKey(rule)
     if not key then return end
     local okVoice, voice = pcall(function()
         return game:GetService("VoiceChatService"):IsVoiceEnabledForUserIdAsync(player.UserId)
     end)
-    if not sniperEnabled or environment.RobloxHubTradingRun ~= runToken then return end
+    if not searchStillEnabled(rule) then return end
     local ok, result, reason = pcall(network.Invoke, "TradingTerminal_Search", rule.class, key, nil, okVoice and voice == true)
-    if not sniperEnabled or environment.RobloxHubTradingRun ~= runToken then return end
+    if not searchStillEnabled(rule) then return end
     nextSearchAt = os.clock() + retryDelay
     if not ok or type(result) ~= "table" then
         local message = tostring((ok and reason or result) or "không tìm thấy listing")
@@ -585,32 +670,33 @@ end
 local function tick()
     local balance = currency.Get("Diamonds")
     checkBalance(balance)
-    local buying = sniperEnabled or hugeEnabled
+    local buying = sniperEnabled
     if not (buying or sellEnabled) then return end
     if pendingHop then
         if os.clock() >= pendingHop.deadline then failHop("hết thời gian chờ Roblox phản hồi") end
         return
     end
     local placeId = game.PlaceId
-    local selling = sellEnabled and #sellRules > 0 and (placeId == normalPlace or placeId == plazaPlaces.ProTrading)
-    if buying and placeId ~= normalPlace then
+    local selling = sellEnabled and (placeId == normalPlace or placeId == plazaPlaces.ProTrading)
+    if (buying and placeId ~= normalPlace) or (sellEnabled and not selling) then
         enterNormal()
         return
     end
-    buying = (hugeEnabled or (sniperEnabled and #rules > 0)) and type(balance) == "number" and balance > 0
+    buying = (sniperEnabled and #rules > 0) and type(balance) == "number" and balance > 0
     if buying or selling then
         local booths = getBooths()
         if not booths then
             nextSearchAt = nil
             return
         end
+        if selling and not ensureSellerBooth(booths) then return end
+        if selling then sellOne(booths) end
         local candidate = buying and findListing(booths, balance)
         if candidate then
             nextSearchAt = nil
             buyListing(booths, candidate)
         else
-            if selling then sellOne(booths) end
-            if buying and sniperEnabled and #rules > 0 then
+            if buying then
                 nextSearchAt = nextSearchAt or os.clock() + idleBeforeSearch
                 searchNextServer()
             end
@@ -624,9 +710,9 @@ end
 local function start(shared)
     delivery = shared and shared.WebhookDelivery or delivery
     if webhookEnabled then webhookReady() end
-    if job or not (sniperEnabled or hugeEnabled or sellEnabled or webhookEnabled) then return end
+    if job or not (sniperEnabled or sellEnabled or webhookEnabled) then return end
     job = task.defer(function()
-        while environment.RobloxHubTradingRun == runToken and (sniperEnabled or hugeEnabled or sellEnabled or webhookEnabled) do
+        while environment.RobloxHubTradingRun == runToken and (sniperEnabled or sellEnabled or webhookEnabled) do
             local ok, reason = pcall(tick)
             if not ok then notice(tostring(reason)) end
             task.wait(ok and 1 or 5)
@@ -645,44 +731,52 @@ local function configure(config)
     searchIndex = type(config.searchIndex) == "number" and math.max(0, math.floor(config.searchIndex)) or 0
     for _, id in ipairs(type(config.visited) == "table" and config.visited or {}) do rememberServer(id) end
     table.clear(sellRules)
-    for index, entry in ipairs(type(config.sell) == "table" and config.sell or {}) do
-        if type(entry) ~= "table" then continue end
-        local name, class = clean(entry.name), clean(entry.class)
-        local rap = type(entry.rap) == "number" and entry.rap
-            or tonumber(clean(entry.rap):match("^([%d]+%.?%d*)%s*%%?$"))
-        local huge = name:lower() == "huge"
-        if name == "" or not (rap and rap >= 0 and rap < 2^53)
-            or (class ~= "" and not items.Types[class]) or (huge and class ~= "" and class ~= "Pet") then
-            warn(("[Auto Sell] Dòng %d thiếu tên, class hoặc %% RAP hợp lệ."):format(index))
-            continue
-        end
-        local itemId, tier, roman = itemTier(name)
-        sellRules[#sellRules + 1] = { name = name, class = huge and "Pet" or (class ~= "" and class or nil),
-            rap = rap, huge = huge, itemId = itemId, tier = tier, roman = roman }
-    end
     table.clear(rules)
+    table.clear(searchOffsets)
     local descriptions = {}
-    for index, entry in ipairs(type(config.items) == "table" and config.items or {}) do
-        if type(entry) ~= "table" then continue end
-        local class, name = clean(entry.class), clean(entry.name)
-        local price = parseDiamonds(entry.minAmount or entry.maxUnitPrice)
-        local variant = clean(entry.variant or entry.varities):lower():gsub("[^%a]", ""):gsub("gold$", "golden")
+    local function addRule(entry, selling, index)
+        if type(entry) ~= "table" then return end
+        local name, class = clean(entry.name or entry.item), clean(entry.class)
+        local huge = name:lower() == "huge"
+        if huge and class == "" then class = "Pet" end
+        local price = entry.price
+        -- Tương thích launcher cũ; cấu hình mới chỉ lưu price.
+        if price == nil then
+            if selling and entry.rap ~= nil then price = tostring(entry.rap):gsub("%%$", "") .. "%"
+            else price = entry.minAmount or entry.maxUnitPrice end
+        end
+        local percent = type(price) == "string" and tonumber(clean(price):match("^(%d+%.?%d*)%s*%%$")) or nil
+        local diamonds = not percent and parseDiamonds(price) or nil
+        local variant = clean(entry.rarities or entry.variant or entry.varities):lower():gsub("[^%a]", ""):gsub("gold$", "golden")
         if variant == "goldenshiny" or variant == "goldshiny" then variant = "shinygolden" end
         if variant == "rainbowshiny" then variant = "shinyrainbow" end
-        if class == "" or name == "" or not price or price < 1 or (class == "Pet" and not variants[variant]) then
-            descriptions[#descriptions + 1] = ("Dòng %d thiếu Class, tên, giá hoặc biến thể pet."):format(index)
-            continue
+        local rawCap = entry.minPrice or entry["min price"]
+        local cap = rawCap ~= nil and clean(tostring(rawCap)) ~= "" and parseDiamonds(rawCap) or nil
+        local validPrice = percent and percent >= 0 and percent < (selling and 2^53 or 100)
+            or diamonds and diamonds >= 1
+        if name == "" or not validPrice or (class ~= "" and not items.Types[class])
+            or (not selling and class == "") or (huge and class ~= "Pet")
+            or (variant ~= "" and (not variants[variant] or (class ~= "" and class ~= "Pet")))
+            or (rawCap ~= nil and clean(tostring(rawCap)) ~= "" and (not cap or cap < 1)) then
+            descriptions[#descriptions + 1] = ("%s dòng %d: tên, Class, Price hoặc bộ lọc không hợp lệ."):format(selling and "Sell" or "Sniper", index)
+            return
         end
-        variant = class == "Pet" and variant or nil
         local itemId, tier, roman
         if class ~= "Pet" then itemId, tier, roman = itemTier(name) end
-        rules[#rules + 1] = { class = class, name = name, minAmount = price, variant = variant,
+        local rule = { name = name, class = class ~= "" and class or nil, huge = huge,
+            price = percent and (tostring(percent) .. "%") or diamonds, percent = percent,
+            variant = variant ~= "" and variant or nil, minPrice = cap,
             itemId = itemId, tier = tier, roman = roman }
-        descriptions[#descriptions + 1] = ("%s · %s%s · ≤ %s 💎/món"):format(class, name,
-            variant and (" · " .. variants[variant][3]) or "", formatDiamonds(price))
+        table.insert(selling and sellRules or rules, rule)
+        descriptions[#descriptions + 1] = ("%s · %s · Price %s%s"):format(selling and "Sell" or "Sniper", name,
+            tostring(rule.price), cap and (" · giá < " .. formatDiamonds(cap)) or "")
     end
-    return #descriptions > 0 and table.concat(descriptions, "\n") or "Danh sách săn chưa có món."
+    for index, entry in ipairs(type(config.sell) == "table" and config.sell or {}) do addRule(entry, true, index) end
+    for index, entry in ipairs(type(config.items) == "table" and config.items or {}) do addRule(entry, false, index) end
+    return #descriptions > 0 and table.concat(descriptions, "\n") or "Danh sách giao dịch chưa có món."
 end
+
+
 
 features.TradingSniperBooth = {
     configure = configure,
@@ -692,25 +786,18 @@ features.TradingSniperBooth = {
             nextTravelAt = 0
         end
         sniperEnabled = on
-        if not on then clearPendingHop() end
+        if not on and pendingHop then clearPendingHop() end
         start(shared)
     end,
 }
 
--- Bật săn Huge độc lập với danh sách vật phẩm của Sniper Booth.
-features.TradingSniperHuge = {
-    duy = function(on, shared)
-        if on and not hugeEnabled and not sniperEnabled then nextTravelAt = 0 end
-        hugeEnabled = on
-        start(shared)
-    end,
-}
+
 
 -- Bật đăng bán theo danh sách từ launcher.
 features.TradingAutoSell = {
     duy = function(on, shared)
         sellEnabled = on
-        if on then nextSellAt = 0 end
+        if on then nextSellAt, nextClaimAt, sellerBoothId = 0, 0, nil end
         start(shared)
     end,
 }
