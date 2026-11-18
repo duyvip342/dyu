@@ -29,6 +29,34 @@ local sellRules, pendingSales = {}, {}
 local nextSellAt = 0
 local nextClaimAt, sellerBoothId = 0, nil
 local restorePending = false
+local sellerPhase, restoreWaitUntil = "waiting", 0
+local restoreRequestedAt
+local resetListingId
+local originalMessageNew, autoRestoreMessage
+local message = require(client.Message)
+
+-- Tự chọn Yes cho câu hỏi khôi phục booth khi Auto Sell đang bật.
+local function enableRestorePrompt()
+    if autoRestoreMessage then return end
+    local previous = message.New
+    local function answer(text, ...)
+        if text == "Would you like to restore your booth listings?"
+            and sellEnabled and environment.RobloxHubTradingRun == runToken then
+            sellerPhase = "restore"
+            restoreRequestedAt = os.clock()
+            return true
+        end
+        return previous(text, ...)
+    end
+    originalMessageNew, autoRestoreMessage = previous, answer
+    message.New = answer
+end
+
+-- Gỡ bộ trả lời của Auto Sell khi tắt toggle.
+local function disableRestorePrompt()
+    if autoRestoreMessage and message.New == autoRestoreMessage then message.New = originalMessageNew end
+    originalMessageNew, autoRestoreMessage = nil, nil
+end
 local webhookUrl, minDiamond = "", 0
 local belowMinimum, delivery, job
 local lastWebhookError
@@ -467,7 +495,10 @@ local function ensureSellerBooth(booths)
                 if not sellEnabled or environment.RobloxHubTradingRun ~= runToken then return false end
                 if booths[player] then return false end
                 local accepted, reason = network.Invoke("Booths_ClaimBooth", id)
-                if accepted then restorePending = true
+                if accepted then
+                    restorePending = true
+                    if sellerPhase ~= "reset" then sellerPhase = "waiting" end
+                    restoreWaitUntil = os.clock() + 5
                 else notice("Nhận booth · " .. tostring(reason or "Booth không còn trống.")) end
                 return false
             end
@@ -480,24 +511,61 @@ local function ensureSellerBooth(booths)
         if not sellEnabled or environment.RobloxHubTradingRun ~= runToken then return false end
         sellerBoothId = booth.BoothID
         restorePending = true
+        restoreWaitUntil = os.clock() + 5
         require(client.TabController).OpenTab("BoothPrompt")
     end
-    if restorePending then
-        if os.clock() < nextClaimAt then return false end
+    if sellerPhase ~= "ready" then
         local data = save.Get()
         if not data then return false end
-        if flags.Get(flags.Keys.BoothRestoring) and data.BoothRecovery and next(data.BoothRecovery) then
-            nextClaimAt = os.clock() + 3
-            -- Đây là nhánh Yes của promptRestore trong BoothCmds.
-            if not network.Invoke("Booths_Restore") then
-                notice("Chưa khôi phục được listing cũ, sẽ thử lại.")
+        local recovery = flags.Get(flags.Keys.BoothRestoring)
+            and type(data.BoothRecovery) == "table" and next(data.BoothRecovery) ~= nil
+        if (sellerPhase == "waiting" or sellerPhase == "restore") and recovery then
+            if os.clock() < (restoreRequestedAt or -10) + 5 then return false end
+            sellerPhase = "restore"
+            restoreRequestedAt = os.clock()
+            local accepted, reason = network.Invoke("Booths_Restore")
+            if not accepted then
+                notice("Khôi phục booth · " .. tostring(reason or "Game chưa chấp nhận."))
                 return false
             end
-            restorePending = false
+            sellerPhase = "restored"
+            restoreWaitUntil = os.clock() + 2
+            return false
+        end
+        if sellerPhase == "restore" and not recovery then
+            sellerPhase = "restored"
+            restoreWaitUntil = os.clock() + 2
+        end
+        if sellerPhase == "restored" then
+            if os.clock() < restoreWaitUntil then return false end
+            sellerPhase, restorePending = "ready", false
+            table.clear(pendingSales)
             nextSellAt = os.clock() + 2
             return false
         end
-        restorePending = false
+        if sellerPhase == "waiting" then
+            if os.clock() < restoreWaitUntil then return false end
+            sellerPhase = "reset"
+        end
+        if sellerPhase == "reset" then
+            if os.clock() < nextClaimAt then return false end
+            if resetListingId and booth.Listings[resetListingId] then
+                if os.clock() < nextClaimAt + 4 then return false end
+            end
+            local id = next(booth.Listings)
+            if id then
+                nextClaimAt = os.clock() + 1
+                local accepted, reason = network.Invoke("Booths_RemoveListing", id)
+                if accepted then resetListingId = id
+                else
+                    nextClaimAt = os.clock() + 5
+                    notice("Gỡ listing · " .. tostring(reason or "Game chưa chấp nhận."))
+                end
+                return false
+            end
+            table.clear(pendingSales)
+            sellerPhase, restorePending, resetListingId = "ready", false, nil
+        end
     end
     return true
 end
@@ -812,8 +880,19 @@ features.TradingSniperBooth = {
 -- Bật đăng bán theo danh sách từ launcher.
 features.TradingAutoSell = {
     duy = function(on, shared)
+        local wasEnabled = sellEnabled
         sellEnabled = on
-        if on then nextSellAt, nextClaimAt, sellerBoothId = 0, 0, nil end
+        if on and not wasEnabled then
+            local firstInServer = environment.RobloxHubSellerJob ~= game.JobId
+            environment.RobloxHubSellerJob = game.JobId
+            sellerPhase = firstInServer and "waiting" or "reset"
+            restoreWaitUntil = os.clock() + 5
+            restoreRequestedAt, resetListingId = nil, nil
+            nextSellAt, nextClaimAt, sellerBoothId = 0, 0, nil
+            enableRestorePrompt()
+        elseif not on then
+            disableRestorePrompt()
+        end
         start(shared)
     end,
 }
