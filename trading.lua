@@ -333,7 +333,7 @@ local function getBooths()
     notice("Chưa đọc được bảng listing của Trading Plaza.")
 end
 
--- Dùng cùng quy tắc tên, cấp và thuộc tính cho mua/bán.
+-- Dùng chung ID nội bộ, cấp và thuộc tính cho mua, bán và tìm Terminal.
 local function matches(rule, item)
     if rule.class and item.Class.Name ~= rule.class then return false end
     if rule.variant then
@@ -571,6 +571,10 @@ local function ensureSellerBooth(booths)
 end
 
 local function sellOne(booths)
+    if #sellRules == 0 then
+        notice("Auto Sell chưa có danh sách bán. Đặt món trong RobloxHubConfig.trading.sell trước khi tải UI.lua.")
+        return
+    end
     local now = os.clock()
     if now < nextSellAt then return end
     nextSellAt = now + 3
@@ -692,6 +696,7 @@ local function searchNextServer()
     end
     local item = nextSearchRule()
     if not item then return end
+    -- Terminal nhận StackKey chứa ID nội bộ dù giao diện hiện tên khác.
     local class, key, name = item.Class.Name, item:StackKey(), item:GetName()
     setStatus("Terminal đang tìm: " .. name)
     local voiceOk, voice = pcall(function()
@@ -762,8 +767,12 @@ local function tick()
             nextSearchAt = nil
             return
         end
-        if selling and not ensureSellerBooth(booths) then return end
-        if selling then sellOne(booths) end
+        if selling and #sellRules == 0 then
+            notice("Auto Sell chưa có danh sách bán. Đặt món trong RobloxHubConfig.trading.sell trước khi tải UI.lua.")
+        elseif selling then
+            if not ensureSellerBooth(booths) then return end
+            sellOne(booths)
+        end
         local candidate = buying and findListing(booths, balance)
         if candidate then
             nextSearchAt = nil
@@ -880,6 +889,9 @@ features.TradingSniperBooth = {
 -- Bật đăng bán theo danh sách từ launcher.
 features.TradingAutoSell = {
     duy = function(on, shared)
+        if on and #sellRules == 0 then
+            notice("Auto Sell chưa có danh sách bán. Đặt món trong RobloxHubConfig.trading.sell trước khi tải UI.lua.")
+        end
         local wasEnabled = sellEnabled
         sellEnabled = on
         if on and not wasEnabled then
