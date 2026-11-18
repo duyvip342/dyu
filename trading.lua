@@ -581,72 +581,71 @@ local function failHop(reason)
     notice("Chuyển server thất bại: " .. tostring(reason))
 end
 
--- Chọn server đông nhất còn chỗ và chưa ghé gần đây.
-local function crowdedServer(rows, now)
-    local best
-    for _, row in ipairs(rows) do
-        if type(row.id) == "string" and row.id ~= game.JobId and not table.find(visited, row.id)
-            and (rejectedServers[row.id] or 0) <= now
-            and type(row.playing) == "number" and type(row.maxPlayers) == "number"
-            and row.playing > 0 and row.playing < row.maxPlayers
-            and (not best or row.playing > best.playing) then
-            best = row
+-- Luân phiên các vật phẩm khớp danh sách trong danh mục Terminal.
+local function nextSearchRule()
+    if not sniperEnabled or not hopEnabled or #rules == 0 then return end
+    searchIndex = searchIndex % #rules + 1
+    local rule = rules[searchIndex]
+    local catalog = searchCatalogs[rule.class]
+    if not catalog or not next(catalog) then
+        catalog = require(library.Util.TradingTerminalUtil).ByClasses({ rule.class })
+        if type(catalog) ~= "table" or not next(catalog) then
+            setStatus("Danh mục Terminal chưa sẵn sàng; sẽ tải lại.")
+            return
         end
+        searchCatalogs[rule.class] = catalog
     end
-    return best
+    local pool = rule.searchPool
+    if not pool then
+        pool = {}
+        for _, item in pairs(catalog) do
+            if matches(rule, item) then pool[#pool + 1] = item end
+        end
+        table.sort(pool, function(a, b) return a:StackKey() < b:StackKey() end)
+        if #pool > 0 then rule.searchPool = pool end
+    end
+    if #pool == 0 then
+        searchCatalogs[rule.class] = nil
+        setStatus("Terminal chưa có mục khớp " .. rule.name .. "; sẽ thử món tiếp theo.")
+        return
+    end
+    local index = (searchOffsets[searchIndex] or 0) % #pool + 1
+    searchOffsets[searchIndex] = index
+    return pool[index]
 end
 
--- Đọc danh sách server công khai của đúng Plaza Normal.
-local function publicServerPage(cursor)
-    local url = "https://games.roblox.com/v1/games/" .. tostring(normalPlace)
-        .. "/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true"
-    if cursor then url = url .. "&cursor=" .. http:UrlEncode(cursor) end
-    local ok, body = pcall(game.HttpGet, game, url)
-    if not ok then
-        local send = request or http_request
-        if type(send) ~= "function" then error("Không đọc được danh sách server Roblox.") end
-        local response = send({ Url = url, Method = "GET" })
-        if type(response) ~= "table" or tonumber(response.StatusCode) ~= 200 then
-            error("Danh sách server trả HTTP " .. tostring(type(response) == "table" and response.StatusCode))
-        end
-        body = response.Body
-    end
-    local page = http:JSONDecode(body)
-    assert(type(page) == "table" and type(page.data) == "table", "Danh sách server không hợp lệ.")
-    return page
-end
-
--- Sau 5 giây hết món đạt giá, chuyển tới Plaza Normal đông người còn chỗ.
+-- Sau 5 giây hết món đạt giá, tìm một món trong list bằng Trading Terminal.
 local function searchNextServer()
-    if not hopEnabled or not sniperEnabled then return end
-    if not nextSearchAt or os.clock() < nextSearchAt then return end
-    nextSearchAt = os.clock() + 10
+    if not sniperEnabled or not hopEnabled or not nextSearchAt or os.clock() < nextSearchAt then return end
+    nextSearchAt = os.clock() + 1
     local now = os.clock()
     for id, expiresAt in pairs(rejectedServers) do
         if expiresAt <= now then rejectedServers[id] = nil end
     end
-    setStatus("Đang tìm server Plaza Normal đông người còn chỗ trống.")
-    local cursor, result
-    for _ = 1, 3 do
-        local ok, page = pcall(publicServerPage, cursor)
-        if not ok then
-            nextSearchAt = os.clock() + 15
-            notice(tostring(page))
-            setStatus("Không đọc được danh sách server; sẽ thử lại sau 15 giây.")
-            return
-        end
-        if not sniperEnabled or environment.RobloxHubTradingRun ~= runToken then return end
-        result = crowdedServer(page.data, os.clock())
-        if result then break end
-        cursor = page.nextPageCursor
-        if type(cursor) ~= "string" or cursor == "" then break end
-    end
-    if not result then
-        setStatus("Chưa có server khác còn chỗ; sẽ kiểm tra lại.")
+    local item = nextSearchRule()
+    if not item then return end
+    local class, key, name = item.Class.Name, item:StackKey(), item:GetName()
+    setStatus("Terminal đang tìm: " .. name)
+    local voiceOk, voice = pcall(function()
+        return game:GetService("VoiceChatService"):IsVoiceEnabledForUserIdAsync(player.UserId)
+    end)
+    if not sniperEnabled or environment.RobloxHubTradingRun ~= runToken then return end
+    local ok, result, reason = pcall(network.Invoke, "TradingTerminal_Search", class, key, nil, voiceOk and voice == true)
+    if not sniperEnabled or environment.RobloxHubTradingRun ~= runToken then return end
+    nextSearchAt = os.clock() + 1
+    if not ok or type(result) ~= "table" then
+        local message = tostring((ok and reason or result) or "Không tìm thấy listing.")
+        local cooldown = tonumber(message:lower():match("wait (%d+) seconds?"))
+        if cooldown then nextSearchAt = os.clock() + math.max(cooldown, 1) end
+        setStatus("Terminal · " .. name .. " · " .. message)
         return
     end
-
-    -- Ưu tiên mua món mới xuất hiện trong thời gian đọc danh sách server.
+    if result.place_id ~= normalPlace or type(result.job_id) ~= "string" or result.job_id == ""
+        or result.job_id == game.JobId or table.find(visited, result.job_id)
+        or (rejectedServers[result.job_id] or 0) > os.clock() then
+        setStatus("Terminal trả server hiện tại/đã ghé/không phù hợp; đang thử món tiếp theo.")
+        return
+    end
     local balance = currency.Get("Diamonds")
     local booths = getBooths()
     if not booths or type(balance) ~= "number" or balance <= 0 or findListing(booths, balance) then
@@ -654,19 +653,20 @@ local function searchNextServer()
         return
     end
     rememberServer(game.JobId)
-    local resumed = queueResume(result.id)
-    local attempt = { jobId = result.id, deadline = os.clock() + 25 }
+    local resumed = queueResume(result.job_id)
+    local attempt = { jobId = result.job_id, deadline = os.clock() + 25 }
     attempt.connection = teleport.TeleportInitFailed:Connect(function(who, outcome, message, placeId, options)
         if pendingHop ~= attempt or who ~= player or placeId ~= normalPlace then return end
         local failedJob = options and options.ServerInstanceId
-        if failedJob and failedJob ~= "" and failedJob ~= result.id then return end
+        if failedJob and failedJob ~= "" and failedJob ~= result.job_id then return end
         failHop(message ~= "" and message or outcome)
     end)
     pendingHop = attempt
-    setStatus(("Đang vào Plaza Normal %d/%d người%s"):format(result.playing, result.maxPlayers,
-        resumed and "" or " · cần exec lại khi đến."))
+    setStatus("Đang chuyển tới server có " .. name .. (resumed and "" or " · cần exec lại khi đến."))
     local sent, failure = pcall(function()
-        teleport:TeleportToPlaceInstance(normalPlace, result.id, player)
+        teleport:TeleportToPlaceInstance(normalPlace, result.job_id, player, nil, {
+            TradingSniperTarget = { class = class, stackKey = key, boothId = result.booth },
+        })
     end)
     if not sent and pendingHop == attempt then failHop(failure) end
 end
