@@ -11,6 +11,8 @@ if type(previous) == "table" and type(previous.stop) == "function" then previous
 local controller = { enabled = false }
 environment.RobloxHubTimedHop = controller
 local minutes, dueAt = 30, 0
+local seeking = false
+local retrySeconds = 5
 local job, pending, failureConnection
 local getResumeConfig
 local visited = {}
@@ -28,6 +30,7 @@ end
 -- Dọn listener và worker khi tắt hoặc exec lại launcher.
 controller.stop = function()
     controller.enabled = false
+    seeking = false
     pending = nil
     if failureConnection then failureConnection:Disconnect(); failureConnection = nil end
 end
@@ -68,10 +71,10 @@ local function serverPage(cursor)
 end
 
 -- Chọn server đông nhất còn ít nhất một chỗ và chưa ghé gần đây.
-local function pickServer(rows)
+local function pickServer(rows, allowVisited)
     local best
     for _, row in ipairs(rows) do
-        if type(row.id) == "string" and row.id ~= game.JobId and not table.find(visited, row.id)
+        if type(row.id) == "string" and row.id ~= game.JobId and (allowVisited or not table.find(visited, row.id))
             and (rejected[row.id] or 0) <= os.clock()
             and type(row.playing) == "number" and type(row.maxPlayers) == "number"
             and row.playing > 0 and row.playing < row.maxPlayers
@@ -103,11 +106,11 @@ assert(loadstring(game:HttpGet("https://raw.githubusercontent.com/duyvip453/dyu/
     if not ok or result == false then report("Executor không thể nạp lại launcher sau teleport.") end
 end
 
--- Ghi server đã lỗi và thử server khác sau 15 giây.
+-- Ghi server đã lỗi và tiếp tục đợt hop sau 5 giây.
 local function fail(reason)
     if pending then rejected[pending.id] = os.clock() + 60 end
     pending = nil
-    dueAt = os.clock() + 15
+    dueAt = os.clock() + retrySeconds
     report(reason)
 end
 
@@ -118,17 +121,25 @@ local function tick()
         return
     end
     if os.clock() < dueAt or trading.GetState() then return end
+    seeking = true
     for id, expires in pairs(rejected) do if expires <= os.clock() then rejected[id] = nil end end
-    local cursor, selected
+    local cursor, selected, revisitable
     for _ = 1, 3 do
         local page = serverPage(cursor)
         if not controller.enabled then return end
         selected = pickServer(page.data)
         if selected then break end
+        local candidate = pickServer(page.data, true)
+        if candidate and (not revisitable or candidate.playing > revisitable.playing) then revisitable = candidate end
         cursor = page.nextPageCursor
         if type(cursor) ~= "string" or cursor == "" then break end
     end
-    if not selected then dueAt = os.clock() + 15; return end
+    selected = selected or revisitable
+    if not selected then
+        dueAt = os.clock() + retrySeconds
+        report("Chưa có server còn chỗ; tiếp tục tìm sau 5 giây.")
+        return
+    end
     if not controller.enabled or trading.GetState() then return end
     table.insert(visited, game.JobId)
     if #visited > 12 then table.remove(visited, 1) end
@@ -145,7 +156,7 @@ features.SettingsTimedHop = {
         local number = tonumber(value)
         if not number or not (number > 0 and number <= 10080) then return false end
         minutes = number
-        if controller.enabled then dueAt = os.clock() + minutes * 60 end
+        if controller.enabled and not seeking then dueAt = os.clock() + minutes * 60 end
         return true
     end,
     getMinutes = function() return minutes end,
@@ -161,6 +172,7 @@ features.SettingsTimedHop = {
         if not on then controller.stop(); return end
         if controller.enabled then return end
         controller.enabled = true
+        seeking = false
         dueAt = os.clock() + minutes * 60
         failureConnection = teleport.TeleportInitFailed:Connect(function(who, result, reason, placeId, options)
             if not pending or who ~= player or placeId ~= game.PlaceId then return end
@@ -172,7 +184,7 @@ features.SettingsTimedHop = {
         job = task.defer(function()
             while controller.enabled and environment.RobloxHubTimedHop == controller do
                 local ok, reason = pcall(tick)
-                if not ok then dueAt = os.clock() + 15; report(reason) end
+                if not ok then dueAt = os.clock() + retrySeconds; report(reason) end
                 task.wait(1)
             end
             job = nil
