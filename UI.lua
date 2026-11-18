@@ -98,12 +98,38 @@ local urls = {
 
 -- Gộp tính năng từ các module theo tên flag.
 local features = {}
+
+-- Tải lại module nếu CDN trả trang lỗi thay vì mã Lua.
+local function loadRemoteModule(url, filename)
+    local lastError
+    for attempt = 1, 3 do
+        local target = url
+        if attempt > 1 then
+            target = url:gsub("/refs/heads/main/", "/main/")
+            target ..= "?reload=" .. tostring(os.time()) .. "-" .. tostring(attempt)
+        end
+        local ok, source = pcall(game.HttpGet, game, target)
+        if ok and type(source) == "string" then
+            if filename == "webhook.lua" and not source:find("%S") then return nil end
+            if source:match("^%s*<") then
+                lastError = "Máy chủ tải file trả HTML/XML thay vì Lua."
+            else
+                local chunk, problem = loadstring(source, "@" .. filename)
+                if chunk then return chunk end
+                lastError = problem
+            end
+        else
+            lastError = "Không tải được file từ GitHub."
+        end
+        if attempt < 3 then task.wait(1) end
+    end
+    error(filename .. ": " .. tostring(lastError), 0)
+end
+
 for _, url in ipairs(urls) do
     local filename = url:match("[^/]+$")
-    local source = game:HttpGet(url)
-    -- Một số client còn nhận bản webhook giữ chỗ rỗng từ cache.
-    if filename == "webhook.lua" and not source:find("%S") then continue end
-    local loadTab = assert(loadstring(source, "@" .. filename))
+    local loadTab = loadRemoteModule(url, filename)
+    if not loadTab then continue end
     local moduleFeatures
     if filename == "rank.lua" or filename == "event.lua" then
         moduleFeatures = loadTab(scriptStartedAt)
