@@ -12,6 +12,7 @@ local save = require(client.Save)
 local flags = require(client.FFlags)
 local signal = require(library.Signal)
 local items = require(library.Items)
+local itemTypes = require(library.Items.Types)
 local petTypes = require(library.Items.PetItem).Types
 local plazaPlaces = require(library.Modules.PlaceFile).LocalPlaces
 local normalPlace = plazaPlaces.Trading
@@ -60,6 +61,7 @@ end
 local webhookUrl, minDiamond = "", 0
 local belowMinimum, delivery, job
 local lastWebhookError
+local saleConnection
 local nextTravelAt, searchIndex = 0, 0
 local nextSearchAt, pendingHop
 local idleBeforeSearch = 5
@@ -165,14 +167,33 @@ local function emit(buildEmbed)
     local url = webhookUrl
     local post = delivery.post
     task.defer(function()
-        local ran, ok, reason = pcall(post, url, function()
-            return { embeds = { buildEmbed() }, allowed_mentions = { parse = {} }, attachments = {} }
-        end)
-        if not ran then
-            warn("[Webhook Trading] Không gọi được hàm gửi Discord.")
-        elseif not ok then
-            warn("[Webhook Trading] " .. tostring(reason or "Discord chưa nhận thông báo."))
+        local built, result = pcall(buildEmbed)
+        if not built then
+            warn("[Webhook Trading] Không dựng được nội dung thông báo.")
+            return
         end
+        local embeds = result.title and { result } or result
+        local batch, characters = {}, 0
+        local function sendBatch()
+            local payload = { embeds = batch, allowed_mentions = { parse = {} }, attachments = {} }
+            local ran, ok, reason = pcall(post, url, function() return payload end)
+            if not ran then
+                warn("[Webhook Trading] Không gọi được hàm gửi Discord.")
+            elseif not ok then
+                warn("[Webhook Trading] " .. tostring(reason or "Discord chưa nhận thông báo."))
+            end
+            return ran and ok
+        end
+        for _, embed in ipairs(embeds) do
+            local size = #(embed.title or "") + #(embed.description or "")
+            if #batch >= 10 or characters + size > 5500 then
+                if not sendBatch() then return end
+                batch, characters = {}, 0
+            end
+            batch[#batch + 1] = embed
+            characters += size
+        end
+        if #batch > 0 then sendBatch() end
     end)
 end
 
@@ -388,6 +409,159 @@ local function saleSpace(booth, now)
 end
 
 local matchesSale = matches
+
+-- Chỉ nhận thông báo bán của các món có trong danh sách sell.
+local function isSellItem(item)
+    for _, rule in ipairs(sellRules) do
+        if matchesSale(rule, item) then return true end
+    end
+    return false
+end
+
+-- Gắn ảnh thật của item vào embed nếu Roblox trả được thumbnail.
+local function itemThumbnail(embed, item)
+    if delivery and type(delivery.thumbnail) == "function" then
+        local ok, image = pcall(function() return delivery.thumbnail(item:GetIcon()) end)
+        if ok and type(image) == "string" then embed.thumbnail = { url = image } end
+    end
+end
+
+-- Gộp số còn lại trong kho và số đang rao theo từng loại/biến thể.
+local function sellInventoryEmbeds()
+    local container = inventory.Container()
+    if not container then
+        return { { title = "Hàng còn lại trong list sell", description = "Kho chưa tải xong.", color = 15595273 } }
+    end
+    local groups, matchedRules, listed = {}, {}, {}
+    local callbackReader = getcallbackvalue or getcallbackmember
+    if type(callbackReader) == "function" then
+        local ok, booths = pcall(function()
+            local callback = callbackReader(signal.Invoked("Booths_GetIdWithStackKey"), "OnInvoke")
+            local first, second = debug.getupvalue(callback, 1)
+            return type(second) == "table" and second or first
+        end)
+        local own = ok and type(booths) == "table" and booths[player]
+        for _, row in pairs(own and own.Listings or {}) do
+            local key = row.Item.Class.Name .. ":" .. row.Item:StackKey()
+            listed[key] = (listed[key] or 0) + row.Item:GetAmount()
+        end
+    end
+    local count = 0
+    for _, class in pairs(items.Types) do
+        for _, item in pairs(container:All(class)) do
+            local selected = false
+            for index, rule in ipairs(sellRules) do
+                if matchesSale(rule, item) then
+                    matchedRules[index] = true
+                    selected = true
+                end
+            end
+            if selected then
+                local key = item.Class.Name .. ":" .. item:StackKey()
+                local group = groups[key] or { item = item, amount = 0, listed = listed[key] or 0 }
+                group.amount += item:GetAmount()
+                groups[key] = group
+            end
+            count += 1
+            if count % 64 == 0 then task.wait() end
+        end
+    end
+    local rows = {}
+    for _, group in pairs(groups) do rows[#rows + 1] = group end
+    table.sort(rows, function(a, b) return a.item:GetName() < b.item:GetName() end)
+    local embeds = {}
+    for _, group in ipairs(rows) do
+        local embed = {
+            title = group.item:GetName(),
+            description = ("**Trong kho:** %s\n**Đang rao:** %s"):format(
+                formatDiamonds(group.amount), formatDiamonds(group.listed)),
+            color = 15595273,
+        }
+        itemThumbnail(embed, group.item)
+        embeds[#embeds + 1] = embed
+    end
+    local empty = {}
+    for index, rule in ipairs(sellRules) do
+        if not matchedRules[index] then empty[#empty + 1] = rule.name .. " ×0" end
+    end
+    if #empty > 0 then
+        -- Chia danh sách đã hết thành các embed nhỏ theo giới hạn Discord.
+        local lines = ""
+        for _, line in ipairs(empty) do
+            if #lines + #line > 3500 then
+                embeds[#embeds + 1] = { title = "Đã hết trong kho", description = lines, color = 15595273 }
+                lines = ""
+            end
+            lines ..= line .. "\n"
+        end
+        if lines ~= "" then embeds[#embeds + 1] = { title = "Đã hết trong kho", description = lines, color = 15595273 } end
+    end
+    return embeds
+end
+
+-- Đọc số kim cương thực nhận từ phía Received của lịch sử giao dịch.
+local function saleRecord(record)
+    if type(record) ~= "table" or type(record.Given) ~= "table" or type(record.Received) ~= "table" then return end
+    local given = itemTypes.DecodeUnpacked(record.Given)
+    local received = itemTypes.DecodeUnpacked(record.Received)
+    local sold, amount, net = {}, 0, 0
+    for _, item in ipairs(given) do
+        if item.Class.Name == "Currency" then return end
+        if isSellItem(item) then
+            sold[#sold + 1] = item
+            amount += item:GetAmount()
+        end
+    end
+    for _, item in ipairs(received) do
+        if item.Class.Name ~= "Currency" then return end
+        if item:GetId() == "Diamonds" then net += item:GetAmount() end
+    end
+    if #sold > 0 and net > 0 then return sold, amount, net end
+end
+
+-- Báo một giao dịch đã bán kèm số dư và hàng còn lại trong list.
+local function reportSale(record)
+    local sold, amount, net = saleRecord(record)
+    if not sold then return end
+    local soldAt = timeInVietnam()
+    emit(function()
+        task.wait(0.5)
+        local balance = currency.Get("Diamonds")
+        local names = {}
+        for _, item in ipairs(sold) do
+            names[#names + 1] = ("%s ×%s"):format(item:GetName(), formatDiamonds(item:GetAmount()))
+        end
+        local embed = {
+            title = "Sold!",
+            description = ("**you just sold:**\n%s\n**Số lượng đã bán:** %s\n**Kim cương thực nhận:** +%s 💎\n"
+                .. "**Kim cương hiện tại:** %s 💎\n\n**time: %s**"):format(
+                    table.concat(names, "\n"), formatDiamonds(amount), formatDiamonds(net),
+                    type(balance) == "number" and formatDiamonds(balance) or "Đang đồng bộ", soldAt),
+            color = 15595273,
+        }
+        itemThumbnail(embed, sold[1])
+        local embeds = { embed }
+        local remaining = sellInventoryEmbeds()
+        for _, row in ipairs(remaining) do embeds[#embeds + 1] = row end
+        return embeds
+    end)
+end
+
+-- Theo dõi giao dịch mới từ server và gỡ listener của lần exec cũ.
+local function watchSales()
+    if environment.RobloxHubTradingSaleConnection then
+        environment.RobloxHubTradingSaleConnection:Disconnect()
+        environment.RobloxHubTradingSaleConnection = nil
+    end
+    if saleConnection then saleConnection:Disconnect(); saleConnection = nil end
+    if not webhookEnabled then return end
+    saleConnection = network.Fired("Booths: Add History"):Connect(function(record)
+        if not webhookEnabled or environment.RobloxHubTradingRun ~= runToken then return end
+        local ok, reason = pcall(reportSale, record)
+        if not ok then warn("[Webhook Trading] Không đọc được lịch sử bán: " .. tostring(reason)) end
+    end)
+    environment.RobloxHubTradingSaleConnection = saleConnection
+end
 
 -- Tính giá mỗi món và giới hạn lượng đăng theo số còn rảnh trong kho.
 local function saleDetails(rule, item, listed)
@@ -923,6 +1097,7 @@ features.TradingWebhook = {
     duy = function(on, shared)
         if on and not webhookEnabled then belowMinimum = nil end
         webhookEnabled = on
+        watchSales()
         start(shared)
     end,
 }
