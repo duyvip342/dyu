@@ -565,35 +565,6 @@ local function buyListing(booths, candidate)
     end
 end
 
--- Dựng StackKey từ loại vật phẩm đã chọn khi booth hiện tại chưa có món đó.
-local function terminalKey(rule)
-    if rule.stackKey then return rule.stackKey end
-    if rule.stackLookupDone then return nil end
-    local data = { id = rule.itemId or rule.name, tn = rule.tier }
-    local variant = rule.variant and variants[rule.variant]
-    if variant then
-        data.pt = variant[1] ~= petTypes.Normal and variant[1] or nil
-        data.sh = variant[2] or nil
-    end
-    local ok, key = pcall(function()
-        local item = items.From(rule.class, data)
-        if matches(rule, item) then return item:StackKey() end
-    end)
-    if ok and key then
-        rule.stackKey = key
-    elseif rule.roman then
-        -- Tra tên hiển thị đầy đủ như Coins Potion II trong danh mục Terminal.
-        local catalog = require(library.Util.TradingTerminalUtil).ByClasses({ rule.class })
-        for _, item in pairs(catalog) do
-            if matches(rule, item) then
-                rule.stackKey = item:StackKey()
-                break
-            end
-        end
-    end
-    rule.stackLookupDone = true
-    return rule.stackKey
-end
 
 -- Gỡ listener ngay khi lần chuyển server kết thúc hoặc bị hủy.
 local function clearPendingHop()
@@ -610,117 +581,72 @@ local function failHop(reason)
     notice("Chuyển server thất bại: " .. tostring(reason))
 end
 
--- Luân phiên mọi cấp/thuộc tính phù hợp thay vì khóa vào stack đầu tiên gặp.
-local function nextSearchRule()
-    if not hopEnabled or not sniperEnabled or #rules == 0 then return end
-    searchIndex = searchIndex % #rules + 1
-    local rule = rules[searchIndex]
-    local class = rule.class
-    if not class then return end
-    if not searchCatalogs[class] or not next(searchCatalogs[class]) then
-        local catalog = require(library.Util.TradingTerminalUtil).ByClasses({ class })
-        -- ByClasses có thể trả {} khi game chưa khởi tạo xong. Không giữ cache rỗng.
-        if type(catalog) ~= "table" or not next(catalog) then
-            setStatus("Danh mục Terminal chưa sẵn sàng; sẽ tải lại.")
-            return
+-- Chọn server đông nhất còn chỗ và chưa ghé gần đây.
+local function crowdedServer(rows, now)
+    local best
+    for _, row in ipairs(rows) do
+        if type(row.id) == "string" and row.id ~= game.JobId and not table.find(visited, row.id)
+            and (rejectedServers[row.id] or 0) <= now
+            and type(row.playing) == "number" and type(row.maxPlayers) == "number"
+            and row.playing > 0 and row.playing < row.maxPlayers
+            and (not best or row.playing > best.playing) then
+            best = row
         end
-        searchCatalogs[class] = catalog
     end
-    local pool = rule.searchPool
-    if not pool then
-        pool = {}
-        for _, item in pairs(searchCatalogs[class]) do
-            if matches(rule, item) then pool[#pool + 1] = item end
+    return best
+end
+
+-- Đọc danh sách server công khai của đúng Plaza Normal.
+local function publicServerPage(cursor)
+    local url = "https://games.roblox.com/v1/games/" .. tostring(normalPlace)
+        .. "/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true"
+    if cursor then url = url .. "&cursor=" .. http:UrlEncode(cursor) end
+    local ok, body = pcall(game.HttpGet, game, url)
+    if not ok then
+        local send = request or http_request
+        if type(send) ~= "function" then error("Không đọc được danh sách server Roblox.") end
+        local response = send({ Url = url, Method = "GET" })
+        if type(response) ~= "table" or tonumber(response.StatusCode) ~= 200 then
+            error("Danh sách server trả HTTP " .. tostring(type(response) == "table" and response.StatusCode))
         end
-        table.sort(pool, function(a, b) return a:StackKey() < b:StackKey() end)
-        if #pool > 0 then rule.searchPool = pool end
+        body = response.Body
     end
-    if #pool == 0 then
-        searchCatalogs[class] = nil
-        setStatus("Terminal chưa có mục khớp " .. rule.name .. "; sẽ tải lại danh mục.")
-        return
-    end
-    local offset = (searchOffsets[searchIndex] or 0) % #pool + 1
-    searchOffsets[searchIndex] = offset
-    local target = pool[offset]
-    setStatus(("Terminal: %s (%d/%d loại khớp %s)"):format(target:GetName(), offset, #pool, rule.name))
-    return { class = class, name = target:GetName(), stackKey = target:StackKey() }, 1
+    local page = http:JSONDecode(body)
+    assert(type(page) == "table" and type(page.data) == "table", "Danh sách server không hợp lệ.")
+    return page
 end
 
-local function searchStillEnabled(rule)
-    return sniperEnabled and hopEnabled and environment.RobloxHubTradingRun == runToken
-end
-
--- Đứng cạnh pad của máy Terminal theo vị trí được tải ở server hiện tại.
-local function approachTerminal()
-    local plaza = workspace:FindFirstChild("TradingPlaza")
-    local interact = plaza and plaza:FindFirstChild("INTERACT")
-    local machines = interact and interact:FindFirstChild("Machines")
-    local machine = machines and machines:FindFirstChild("TradingTerminal")
-    local pad = machine and (machine:FindFirstChild("Pad", true) or machine.PrimaryPart)
-    local character = player.Character
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    local root = humanoid and humanoid.RootPart
-    if not pad or not pad:IsA("BasePart") or not root or humanoid.Health <= 0 then
-        setStatus("Đang chờ máy Trading Terminal và nhân vật tải xong.")
-        return false
-    end
-    if (root.Position - pad.Position).Magnitude > 10 then
-        setStatus("Đang đến máy Trading Terminal để tìm vật phẩm.")
-        local height = root.Size.Y / 2 + humanoid.HipHeight + pad.Size.Y / 2 + 0.5
-        local leg = humanoid.RigType == Enum.HumanoidRigType.R6 and character:FindFirstChild("Left Leg")
-        if leg then height += leg.Size.Y end
-        local offset = root.CFrame:ToObjectSpace(character:GetPivot())
-        root.AssemblyLinearVelocity = Vector3.zero
-        character:PivotTo(CFrame.new(pad.Position + Vector3.new(0, height, 0)) * root.CFrame.Rotation * offset)
-        task.wait(0.5)
-    end
-    return player.Character == character and root.Parent == character and humanoid.Health > 0
-end
-
--- Dùng Terminal sau khi đủ 5 giây không có listing phù hợp.
+-- Sau 5 giây hết món đạt giá, chuyển tới Plaza Normal đông người còn chỗ.
 local function searchNextServer()
-    if not hopEnabled then
-        setStatus("Hop đang tắt; chỉ quét server hiện tại.")
-        return
-    end
+    if not hopEnabled or not sniperEnabled then return end
     if not nextSearchAt or os.clock() < nextSearchAt then return end
-    nextSearchAt = os.clock() + 1
-    if not approachTerminal() or not searchStillEnabled() then return end
+    nextSearchAt = os.clock() + 10
     local now = os.clock()
     for id, expiresAt in pairs(rejectedServers) do
         if expiresAt <= now then rejectedServers[id] = nil end
     end
-    local rule, retryDelay = nextSearchRule()
-    if not rule then
-        nextSearchAt = os.clock() + 1
-        return
+    setStatus("Đang tìm server Plaza Normal đông người còn chỗ trống.")
+    local cursor, result
+    for _ = 1, 3 do
+        local ok, page = pcall(publicServerPage, cursor)
+        if not ok then
+            nextSearchAt = os.clock() + 15
+            notice(tostring(page))
+            setStatus("Không đọc được danh sách server; sẽ thử lại sau 15 giây.")
+            return
+        end
+        if not sniperEnabled or environment.RobloxHubTradingRun ~= runToken then return end
+        result = crowdedServer(page.data, os.clock())
+        if result then break end
+        cursor = page.nextPageCursor
+        if type(cursor) ~= "string" or cursor == "" then break end
     end
-    nextSearchAt = os.clock() + retryDelay
-    local key = terminalKey(rule)
-    if not key then return end
-    local okVoice, voice = pcall(function()
-        return game:GetService("VoiceChatService"):IsVoiceEnabledForUserIdAsync(player.UserId)
-    end)
-    if not searchStillEnabled(rule) then return end
-    local ok, result, reason = pcall(network.Invoke, "TradingTerminal_Search", rule.class, key, nil, okVoice and voice == true)
-    if not searchStillEnabled(rule) then return end
-    nextSearchAt = os.clock() + retryDelay
-    if not ok or type(result) ~= "table" then
-        local message = tostring((ok and reason or result) or "không tìm thấy listing")
-        local cooldown = tonumber(message:lower():match("wait (%d+) seconds?"))
-        if cooldown then nextSearchAt = os.clock() + math.max(cooldown, retryDelay) end
-        setStatus(("Terminal · %s · %s"):format(rule.name, message))
-        return
-    end
-    if result.place_id ~= normalPlace or type(result.job_id) ~= "string" or result.job_id == ""
-        or result.job_id == game.JobId or table.find(visited, result.job_id)
-        or (rejectedServers[result.job_id] or 0) > os.clock() then
-        setStatus("Terminal trả server hiện tại/đã ghé/không phù hợp; đang thử loại tiếp theo.")
+    if not result then
+        setStatus("Chưa có server khác còn chỗ; sẽ kiểm tra lại.")
         return
     end
 
-    -- Kiểm tra lại server hiện tại sau thời gian chờ phản hồi Terminal.
+    -- Ưu tiên mua món mới xuất hiện trong thời gian đọc danh sách server.
     local balance = currency.Get("Diamonds")
     local booths = getBooths()
     if not booths or type(balance) ~= "number" or balance <= 0 or findListing(booths, balance) then
@@ -728,27 +654,19 @@ local function searchNextServer()
         return
     end
     rememberServer(game.JobId)
-    local resumed = queueResume(result.job_id)
-    if not resumed then
-        setStatus("Đã tìm thấy server. Executor cần chạy lại launcher sau khi chuyển.")
-    end
-
-    -- Chờ lỗi teleport bất đồng bộ như server đầy trước khi thử món khác.
-    local attempt = { jobId = result.job_id, deadline = os.clock() + 25 }
+    local resumed = queueResume(result.id)
+    local attempt = { jobId = result.id, deadline = os.clock() + 25 }
     attempt.connection = teleport.TeleportInitFailed:Connect(function(who, outcome, message, placeId, options)
         if pendingHop ~= attempt or who ~= player or placeId ~= normalPlace then return end
         local failedJob = options and options.ServerInstanceId
-        if failedJob and failedJob ~= "" and failedJob ~= result.job_id then return end
+        if failedJob and failedJob ~= "" and failedJob ~= result.id then return end
         failHop(message ~= "" and message or outcome)
     end)
     pendingHop = attempt
-    setStatus("Đang chuyển tới server có " .. rule.name
-        .. (resumed and "" or " · cần exec lại khi đến."))
-    -- Sniper tự đọc lại booth sau khi đến server tìm được.
+    setStatus(("Đang vào Plaza Normal %d/%d người%s"):format(result.playing, result.maxPlayers,
+        resumed and "" or " · cần exec lại khi đến."))
     local sent, failure = pcall(function()
-        teleport:TeleportToPlaceInstance(normalPlace, result.job_id, player, nil, {
-            TradingSniperTarget = { class = rule.class, stackKey = key, boothId = result.booth },
-        })
+        teleport:TeleportToPlaceInstance(normalPlace, result.id, player)
     end)
     if not sent and pendingHop == attempt then failHop(failure) end
 end
