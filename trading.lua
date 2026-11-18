@@ -651,6 +651,33 @@ local function searchStillEnabled(rule)
     return sniperEnabled and hopEnabled and environment.RobloxHubTradingRun == runToken
 end
 
+-- Đứng cạnh pad của máy Terminal theo vị trí được tải ở server hiện tại.
+local function approachTerminal()
+    local plaza = workspace:FindFirstChild("TradingPlaza")
+    local interact = plaza and plaza:FindFirstChild("INTERACT")
+    local machines = interact and interact:FindFirstChild("Machines")
+    local machine = machines and machines:FindFirstChild("TradingTerminal")
+    local pad = machine and (machine:FindFirstChild("Pad", true) or machine.PrimaryPart)
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = humanoid and humanoid.RootPart
+    if not pad or not pad:IsA("BasePart") or not root or humanoid.Health <= 0 then
+        setStatus("Đang chờ máy Trading Terminal và nhân vật tải xong.")
+        return false
+    end
+    if (root.Position - pad.Position).Magnitude > 10 then
+        setStatus("Đang đến máy Trading Terminal để tìm vật phẩm.")
+        local height = root.Size.Y / 2 + humanoid.HipHeight + pad.Size.Y / 2 + 0.5
+        local leg = humanoid.RigType == Enum.HumanoidRigType.R6 and character:FindFirstChild("Left Leg")
+        if leg then height += leg.Size.Y end
+        local offset = root.CFrame:ToObjectSpace(character:GetPivot())
+        root.AssemblyLinearVelocity = Vector3.zero
+        character:PivotTo(CFrame.new(pad.Position + Vector3.new(0, height, 0)) * root.CFrame.Rotation * offset)
+        task.wait(0.5)
+    end
+    return player.Character == character and root.Parent == character and humanoid.Health > 0
+end
+
 -- Dùng Terminal sau khi đủ 5 giây không có listing phù hợp.
 local function searchNextServer()
     if not hopEnabled then
@@ -658,10 +685,8 @@ local function searchNextServer()
         return
     end
     if not nextSearchAt or os.clock() < nextSearchAt then return end
-    if not teleportQueue() then
-        notice("Không hop được: executor thiếu hàm queue teleport để tiếp tục sniper ở server mới.")
-        return
-    end
+    nextSearchAt = os.clock() + 1
+    if not approachTerminal() or not searchStillEnabled() then return end
     local now = os.clock()
     for id, expiresAt in pairs(rejectedServers) do
         if expiresAt <= now then rejectedServers[id] = nil end
@@ -703,7 +728,10 @@ local function searchNextServer()
         return
     end
     rememberServer(game.JobId)
-    if not queueResume(result.job_id) then return end
+    local resumed = queueResume(result.job_id)
+    if not resumed then
+        setStatus("Đã tìm thấy server. Executor cần chạy lại launcher sau khi chuyển.")
+    end
 
     -- Chờ lỗi teleport bất đồng bộ như server đầy trước khi thử món khác.
     local attempt = { jobId = result.job_id, deadline = os.clock() + 25 }
@@ -714,9 +742,14 @@ local function searchNextServer()
         failHop(message ~= "" and message or outcome)
     end)
     pendingHop = attempt
-    setStatus("Đang chuyển tới server có " .. rule.name)
+    setStatus("Đang chuyển tới server có " .. rule.name
+        .. (resumed and "" or " · cần exec lại khi đến."))
     -- Sniper tự đọc lại booth sau khi đến server tìm được.
-    local sent, failure = pcall(teleport.TeleportToPlaceInstance, teleport, normalPlace, result.job_id, player)
+    local sent, failure = pcall(function()
+        teleport:TeleportToPlaceInstance(normalPlace, result.job_id, player, nil, {
+            TradingSniperTarget = { class = rule.class, stackKey = key, boothId = result.booth },
+        })
+    end)
     if not sent and pendingHop == attempt then failHop(failure) end
 end
 
