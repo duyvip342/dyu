@@ -26,6 +26,8 @@ local rules, visited, pending = {}, {}, {}
 local sniperEnabled, webhookEnabled, hopEnabled = false, false, true
 local searchCatalogs, searchOffsets = {}, {}
 local sellEnabled = false
+local autoTradeEnabled = false
+local configureAutoTrade
 local sellRules, pendingSales = {}, {}
 local nextSellAt = 0
 local nextClaimAt, sellerBoothId = 0, nil
@@ -306,7 +308,7 @@ local function queueResume(targetJobId)
         toggles = { TradingSniperBooth = sniperEnabled,
             TradingWebhook = webhookEnabled, TradingAutoSell = sellEnabled },
         trading = { items = exportRules(rules), webhookUrl = webhookUrl, minDiamond = minDiamond, hop = hopEnabled,
-            visited = visited, searchIndex = searchIndex, sell = exportRules(sellRules) },
+            visited = visited, searchIndex = searchIndex, sell = exportRules(sellRules), autoTrade = autoTradeEnabled },
     }
     local source = ([=[
 local env = type(getgenv) == "function" and getgenv() or _G
@@ -978,9 +980,95 @@ local function start(shared)
     end)
 end
 
+-- Auto Trade / Điều khiển từ trading.autoTrade trong launcher.
+do
+    local players = game:GetService("Players")
+    local trading = require(client.TradingCmds)
+    local targetName = "duyvip453"
+    local controller = { enabled = false }
+    local worker
+    local lastError
+
+    controller.stop = function()
+        controller.enabled = false
+        autoTradeEnabled = false
+    end
+
+-- Chỉ nhận đúng username Roblox của tài khoản được phép.
+local function allowed(other)
+    return other and other ~= player and other.Name:lower() == targetName
+end
+
+-- Phần gửi của mình phải trống trước khi Ready hoặc Confirm.
+local function hasOwnItems(state, index)
+    for _, group in pairs(state._items[index] or {}) do
+        if next(group) then return true end
+    end
+    return false
+end
+
+-- Xử lý lời mời đang tồn tại qua đúng API nhận trade của game.
+local function processInvitations()
+    for _, other in ipairs(players:GetPlayers()) do
+        if not controller.enabled then return end
+        if other ~= player and trading.HasRequestFromPlayer(other) then
+            if allowed(other) then
+                return trading.Request(other)
+            else
+                trading.Reject(other)
+            end
+        end
+    end
+end
+
+-- Theo trạng thái thật để không bấm Ready thành Unready.
+local function step()
+    local state = trading.GetState()
+    if not state then return processInvitations() end
+    if state._destroyed or state._executing then return end
+    local index = state:PlayerIndex(player)
+    if not index then return end
+    if not allowed(state:Player2(index)) then return trading.Decline() end
+
+    if hasOwnItems(state, index) then
+        if state._ready[index] then trading.SetReady(false) end
+        return false, "Phần gửi của bạn có đồ hoặc kim cương; tự động xác nhận đang chờ."
+    end
+    if not state._ready[index] then return trading.SetReady(true) end
+    if state._readyTimer ~= nil and state:IsEveryoneReady() and not state._confirmed[index] then
+        return trading.SetConfirmed(true)
+    end
+end
+
+    -- Chỉ chạy một worker cho tài khoản được phép.
+    configureAutoTrade = function(on)
+        local previous = environment.DuyTrustedAutoTrade
+        if previous ~= controller and type(previous) == "table" and type(previous.stop) == "function" then
+            previous.stop()
+        end
+        environment.DuyTrustedAutoTrade = controller
+        autoTradeEnabled = on == true
+        controller.enabled = autoTradeEnabled
+        if not controller.enabled or worker then return end
+        worker = task.defer(function()
+            while controller.enabled and environment.DuyTrustedAutoTrade == controller
+                and environment.RobloxHubTradingRun == runToken do
+                local ok, accepted, reason = pcall(step)
+                local problem = not ok and tostring(accepted)
+                    or (accepted == false and tostring(reason or "Game chưa chấp nhận thao tác."))
+                if problem and problem ~= lastError then warn("[Auto Trade] " .. problem) end
+                lastError = problem
+                task.wait(1)
+            end
+            worker = nil
+        end)
+    end
+end
+
 -- Chuẩn hóa quy tắc săn từ cấu hình launcher.
 local function configure(config)
     config = type(config) == "table" and config or {}
+    configureAutoTrade(config.autoTrade == true)
     webhookUrl = clean(config.webhookUrl)
     minDiamond = parseDiamonds(config.minDiamond) or 0
     hopEnabled = config.hop ~= false
