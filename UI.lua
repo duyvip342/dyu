@@ -94,6 +94,7 @@ local urls = {
     "https://raw.githubusercontent.com/duyvip453/dyu/main/webhook.lua",
     "https://raw.githubusercontent.com/duyvip453/dyu/main/event.lua",
     "https://raw.githubusercontent.com/duyvip453/dyu/main/trading.lua",
+    "https://raw.githubusercontent.com/duyvip453/dyu/main/setting.lua",
 }
 
 -- Gộp tính năng từ các module theo tên flag.
@@ -165,7 +166,8 @@ local trading = window:CreateTab({ name = "trading" })
 local rank = window:CreateTab({ name = "rank" })
 local automatic = window:CreateTab({ name = "automatic" })
 local webhook = window:CreateTab({ name = "webhook" })
-window:CreateTab({ name = "setting" })
+local setting = window:CreateTab({ name = "setting" })
+local runtimeToggles = {}
 
 -- 4. Hàm tạo toggle dùng chung
 -- Launcher bật toggle qua RobloxHubConfig.toggles[flag] = true.
@@ -175,6 +177,7 @@ local function createToggle(tab, name, flag)
     local applied = false
     -- Áp dụng trạng thái bật tắt từ giao diện hoặc launcher.
     local function apply(enabled)
+        runtimeToggles[flag] = enabled
         local feature = features[flag]
         if feature and (not launchConfig or applied ~= enabled) then
             applied = enabled
@@ -193,6 +196,34 @@ local function createToggle(tab, name, flag)
 end
 
 -- 5. Cấu hình các tab
+
+-- Setting / Khoảng thời gian chuyển server đông người.
+do
+    local timedHop = features.SettingsTimedHop
+    if timedHop then
+        local preset = launchConfig and launchConfig.settings
+        preset = type(preset) == "table" and preset or {}
+        timedHop.setMinutes(preset.time or 30)
+        timedHop.setVisited(preset.visited)
+        setting:CreateInput({
+            name = "Time (phút)",
+            flag = "SettingsHopTime",
+            value = tostring(timedHop.getMinutes()),
+            callback = function(value)
+                if not timedHop.setMinutes(value) then warn("[Timed Hop] Time phải lớn hơn 0 và không quá 10080 phút.") end
+            end,
+        })
+        timedHop.setResumeConfig(function()
+            if not launchConfig then return nil end
+            local config = game:GetService("HttpService"):JSONDecode(game:GetService("HttpService"):JSONEncode(launchConfig))
+            config.toggles = type(config.toggles) == "table" and config.toggles or {}
+            for flag, value in pairs(runtimeToggles) do config.toggles[flag] = value end
+            config.settings = { time = timedHop.getMinutes(), visited = timedHop.getVisited() }
+            return config
+        end)
+        createToggle(setting, "Hop server đông người", "SettingsTimedHop")
+    end
+end
 
 -- Tạo toggle mở map event.
 do
