@@ -161,7 +161,9 @@ local window = Rayfield:CreateWindow({
 })
 
 -- Khai báo các tab theo thứ tự xuất hiện trên menu.
-local controlFactory = loadRemoteModule("https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/ui_controls.lua", "ui_controls.lua")()
+-- Ghim bản registry đã kiểm tra để tránh CDN trả bản cũ hoặc file bị cắt.
+-- Khi cập nhật ui_controls.lua trên GitHub, thay commit này cùng lượt cập nhật UI.lua.
+local controlFactory = loadRemoteModule("https://raw.githubusercontent.com/duyvip453/dyu/f9d26e4fb7ee0c064163480d33bc315642ab467a/ui_controls.lua", "ui_controls.lua")()
 local ui = controlFactory(window)
 environment.RobloxHubUI = ui
 local function createTab(name)
