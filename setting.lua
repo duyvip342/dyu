@@ -8,7 +8,7 @@ local environment = type(getgenv) == "function" and getgenv() or _G
 local previous = environment.RobloxHubTimedHop
 if type(previous) == "table" and type(previous.stop) == "function" then previous.stop() end
 
-local controller = { enabled = false }
+local controller = { enabled = false, manual = false }
 environment.RobloxHubTimedHop = controller
 local minutes, dueAt = 30, 0
 local seeking = false
@@ -30,6 +30,7 @@ end
 -- Dọn listener và worker khi tắt hoặc exec lại launcher.
 controller.stop = function()
     controller.enabled = false
+    controller.manual = false
     seeking = false
     pending = nil
     if failureConnection then failureConnection:Disconnect(); failureConnection = nil end
@@ -120,13 +121,17 @@ local function tick()
         if os.clock() >= pending.deadline then fail("Hết thời gian chờ chuyển server.") end
         return
     end
-    if os.clock() < dueAt or trading.GetState() then return end
+    if os.clock() < dueAt then return end
+    if trading.GetState() then
+        if controller.manual then report("Đang giao dịch; sẽ hop ngay khi giao dịch kết thúc.") end
+        return
+    end
     seeking = true
     for id, expires in pairs(rejected) do if expires <= os.clock() then rejected[id] = nil end end
     local cursor, selected, revisitable
     for _ = 1, 3 do
         local page = serverPage(cursor)
-        if not controller.enabled then return end
+        if not (controller.enabled or controller.manual) then return end
         selected = pickServer(page.data)
         if selected then break end
         local candidate = pickServer(page.data, true)
@@ -140,11 +145,11 @@ local function tick()
         report("Chưa có server còn chỗ; tiếp tục tìm sau 5 giây.")
         return
     end
-    if not controller.enabled or trading.GetState() then return end
+    if not (controller.enabled or controller.manual) or trading.GetState() then return end
     table.insert(visited, game.JobId)
     if #visited > 12 then table.remove(visited, 1) end
     queueLauncher(selected.id)
-    if not controller.enabled then return end
+    if not (controller.enabled or controller.manual) then return end
     pending = { id = selected.id, deadline = os.clock() + 25 }
     print(("[Timed Hop] Đang chuyển tới server %d/%d người."):format(selected.playing, selected.maxPlayers))
     local ok, reason = pcall(function() teleport:TeleportToPlaceInstance(game.PlaceId, selected.id, player) end)
@@ -170,7 +175,7 @@ features.SettingsTimedHop = {
     end,
     duy = function(on)
         if not on then controller.stop(); return end
-        if controller.enabled then return end
+        if controller.enabled and job then return end
         controller.enabled = true
         seeking = false
         dueAt = os.clock() + minutes * 60
@@ -182,7 +187,7 @@ features.SettingsTimedHop = {
         end)
         if job then return end
         job = task.defer(function()
-            while controller.enabled and environment.RobloxHubTimedHop == controller do
+            while (controller.enabled or controller.manual) and environment.RobloxHubTimedHop == controller do
                 local ok, reason = pcall(tick)
                 if not ok then dueAt = os.clock() + retrySeconds; report(reason) end
                 task.wait(1)
@@ -191,5 +196,20 @@ features.SettingsTimedHop = {
         end)
     end,
 }
+
+-- Dùng chung bộ tìm server và xử lý lỗi, không bật lịch hop định kỳ.
+features.SettingsTimedHop.hopNow = function()
+    if pending or controller.manual then
+        report("Đang tìm hoặc chuyển server, vui lòng chờ.")
+        return
+    end
+    local wasEnabled = controller.enabled
+    -- Khởi động worker/listener nếu lịch định kỳ đang tắt.
+    features.SettingsTimedHop.duy(true)
+    controller.enabled = wasEnabled
+    controller.manual = true
+    seeking = true
+    dueAt = 0
+end
 
 return features
