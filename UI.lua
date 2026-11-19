@@ -106,7 +106,11 @@ local function loadRemoteModule(url, filename)
     for attempt = 1, 3 do
         local target = url
         if attempt > 1 then
-            target = url:gsub("/refs/heads/main/", "/main/")
+            if url:find("/refs/heads/main/", 1, true) then
+                target = url:gsub("/refs/heads/main/", "/main/")
+            else
+                target = url:gsub("/main/", "/refs/heads/main/")
+            end
             target ..= "?reload=" .. tostring(os.time()) .. "-" .. tostring(attempt)
         end
         local ok, source = pcall(game.HttpGet, game, target)
@@ -157,7 +161,7 @@ local window = Rayfield:CreateWindow({
 })
 
 -- Khai báo các tab theo thứ tự xuất hiện trên menu.
-local controlFactory = loadRemoteModule("https://raw.githubusercontent.com/duyvip453/dyu/main/ui_controls.lua", "ui_controls.lua")()
+local controlFactory = loadRemoteModule("https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/ui_controls.lua", "ui_controls.lua")()
 local ui = controlFactory(window)
 environment.RobloxHubUI = ui
 local function createTab(name)
