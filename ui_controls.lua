@@ -100,6 +100,8 @@ return function(window)
                         local id = props.flag or (tabName .. "/" .. props.name)
                         assert(not records[id], "Trùng flag control: " .. id)
                         local target = kind == "toggle" and quick or container
+                        -- Rayfield Gen2 không có CreateInput trên Group; đặt input ở Tab.
+                        if type(target[method]) ~= "function" then target = tab end
                         local control = target[method](target, options)
                         records[id] = { kind = kind, control = control, callback = props.callback,
                             name = props.name, tab = tabName }
