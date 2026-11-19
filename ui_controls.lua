@@ -62,3 +62,58 @@ return function(window)
         for id in pairs(values) do
             assert(record(id).kind ~= "button", "Đặt nút trong actions: " .. id)
         end
+        -- Class được tạo trước Item; cấu hình chạy trước toggle.
+        for _, toggles in ipairs({ false, true }) do
+            for _, id in ipairs(order) do
+                local entry = records[id]
+                if (entry.kind == "toggle") == toggles and values[id] ~= nil
+                    and (not phase or (phase == "toggles") == toggles) then
+                    self:Set(id, values[id])
+                end
+            end
+        end
+    end
+    function api:Run(actions)
+        for _, action in ipairs(actions or {}) do
+            assert(type(action) == "table", "Mỗi action cần là bảng {set=..., value=...} hoặc {press=...}")
+            if action.set then self:Set(action.set, action.value)
+            elseif action.press then self:Press(action.press)
+            else error("Action thiếu set hoặc press") end
+        end
+    end
+    function api:WrapTab(tab, tabName)
+        local quick = tab:CreateGroup({ direction = "column" })
+        quick:CreateSection({ name = "Bật / tắt" })
+        local details = tab:CreateGroup({ direction = "column" })
+        details:CreateSection({ name = "Cấu hình / danh sách" })
+        local function wrap(container)
+            return setmetatable({}, { __index = function(_, method)
+                if method == "CreateGroup" then
+                    return function(_, props) return wrap(container:CreateGroup(props)) end
+                end
+                local kinds = { CreateToggle = "toggle", CreateInput = "input", CreateDropdown = "dropdown", CreateButton = "button" }
+                local kind = kinds[method]
+                if kind then
+                    return function(_, props)
+                        local options = {}
+                        for key, value in pairs(props) do options[key] = value end
+                        local id = props.flag or (tabName .. "/" .. props.name)
+                        assert(not records[id], "Trùng flag control: " .. id)
+                        local target = kind == "toggle" and quick or container
+                        local control = target[method](target, options)
+                        records[id] = { kind = kind, control = control, callback = props.callback,
+                            name = props.name, tab = tabName }
+                        order[#order + 1] = id
+                        return control
+                    end
+                end
+                if type(container[method]) == "function" then
+                    return function(_, ...) return container[method](container, ...) end
+                end
+                return container[method]
+            end })
+        end
+        return wrap(details)
+    end
+    return api
+end
