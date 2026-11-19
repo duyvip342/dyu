@@ -157,16 +157,22 @@ local window = Rayfield:CreateWindow({
 })
 
 -- Khai báo các tab theo thứ tự xuất hiện trên menu.
+local controlFactory = loadRemoteModule("https://raw.githubusercontent.com/duyvip453/dyu/main/ui_controls.lua", "ui_controls.lua")()
+local ui = controlFactory(window)
+environment.RobloxHubUI = ui
+local function createTab(name)
+    return ui:WrapTab(window:CreateTab({ name = name }), name)
+end
 window:CreateTab({ name = "Stats" })
-local farm = window:CreateTab({ name = "farm" })
-local optimize = window:CreateTab({ name = "optimize" })
-local event = window:CreateTab({ name = "Event" })
-local mail = window:CreateTab({ name = "mail" })
-local trading = window:CreateTab({ name = "trading" })
-local rank = window:CreateTab({ name = "rank" })
-local automatic = window:CreateTab({ name = "automatic" })
-local webhook = window:CreateTab({ name = "webhook" })
-local setting = window:CreateTab({ name = "setting" })
+local farm = createTab("farm")
+local optimize = createTab("optimize")
+local event = createTab("Event")
+local mail = createTab("mail")
+local trading = createTab("trading")
+local rank = createTab("rank")
+local automatic = createTab("automatic")
+local webhook = createTab("webhook")
+local setting = createTab("setting")
 local runtimeToggles = {}
 
 -- 4. Hàm tạo toggle dùng chung
@@ -174,6 +180,9 @@ local runtimeToggles = {}
 -- Nối toggle Rayfield với tính năng cùng flag.
 local function createToggle(tab, name, flag)
     local initial = launchToggles[flag] == true
+    if launchConfig and type(launchConfig.controls) == "table" and launchConfig.controls[flag] ~= nil then
+        initial = launchConfig.controls[flag] == true
+    end
     local applied = false
     -- Áp dụng trạng thái bật tắt từ giao diện hoặc launcher.
     local function apply(enabled)
@@ -218,10 +227,19 @@ do
             local config = game:GetService("HttpService"):JSONDecode(game:GetService("HttpService"):JSONEncode(launchConfig))
             config.toggles = type(config.toggles) == "table" and config.toggles or {}
             for flag, value in pairs(runtimeToggles) do config.toggles[flag] = value end
+            config.controls = ui:Snapshot()
+            config.actions = nil -- Nút chỉ chạy khi được yêu cầu, không bấm lại sau hop.
             config.settings = { time = timedHop.getMinutes(), visited = timedHop.getVisited() }
             return config
         end)
         createToggle(setting, "Hop server đông người", "SettingsTimedHop")
+        if timedHop.hopNow then
+            setting:CreateButton({
+                name = "Hop Server ngay",
+                flag = "SettingsHopNow",
+                callback = timedHop.hopNow,
+            })
+        end
     end
 end
 
@@ -426,6 +444,7 @@ do
     end
     mail:CreateButton({
         name = "Add Item",
+        flag = "MailGiftAddItem",
         callback = function()
             local added, reason = gift.add(selectedClass, itemDropdown.value[1], amount.value, keep.value)
             if added then updateGiftText() else warn("[Auto Gift] " .. reason) end
@@ -433,6 +452,7 @@ do
     })
     mail:CreateButton({
         name = "Clear 1 Item",
+        flag = "MailGiftRemoveLast",
         callback = function()
             gift.removeLast()
             updateGiftText()
@@ -548,6 +568,7 @@ do
     createToggle(webhook, "Start Webhook", "WebhookEnabled")
     webhook:CreateButton({
         name = "Test Webhook",
+        flag = "WebhookTest",
         callback = function()
             if petWebhook then petWebhook.test() end
         end,
@@ -585,6 +606,7 @@ do
     createToggle(webhook, "Start Rank Webhook", "RankWebhookEnabled")
     webhook:CreateButton({
         name = "Test Rank Webhook",
+        flag = "RankWebhookTest",
         callback = function()
             if rankWebhook then rankWebhook.test() end
         end,
@@ -669,6 +691,7 @@ do
     end
     automatic:CreateButton({
         name = "add enchant",
+        flag = "AutoEnchantAdd",
         callback = function()
             local name = selectedEnchant or enchantDropdown.value[1]
             if name then
@@ -681,6 +704,7 @@ do
     })
     automatic:CreateButton({
         name = "clear enchant",
+        flag = "AutoEnchantClear",
         callback = function()
             enchantFeature.clear()
             saveEnchantList(enchantFeature.getList())
@@ -729,4 +753,10 @@ end
 
 -- 6. Áp dụng cấu hình khởi chạy
 -- Áp dụng các toggle được launcher đặt sẵn.
+if launchConfig then ui:Apply(launchConfig.controls, "values") end
 for _, start in ipairs(startupActions) do start() end
+if launchConfig then
+    ui:Apply(launchConfig.controls, "toggles")
+    ui:Run(launchConfig.actions)
+end
+ui.ready = true
