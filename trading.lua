@@ -310,6 +310,10 @@ local function queueResume(targetJobId)
         trading = { items = exportRules(rules), webhookUrl = webhookUrl, minDiamond = minDiamond, hop = hopEnabled,
             visited = visited, searchIndex = searchIndex, sell = exportRules(sellRules), autoTrade = autoTradeEnabled },
     }
+    local ui = environment.RobloxHubUI
+    if type(ui) == "table" and ui.ready and type(ui.Snapshot) == "function" then
+        config.controls = ui:Snapshot()
+    end
     local source = ([=[
 local env = type(getgenv) == "function" and getgenv() or _G
 if not game:IsLoaded() then game.Loaded:Wait() end
@@ -428,77 +432,27 @@ local function itemThumbnail(embed, item)
     end
 end
 
--- Gộp số còn lại trong kho và số đang rao theo từng loại/biến thể.
-local function sellInventoryEmbeds()
+-- Tổng số đơn vị hàng khớp list sell, không khóa và có thể đăng bán.
+local function sellInventoryTotal()
     local container = inventory.Container()
-    if not container then
-        return { { title = "Hàng còn lại trong list sell", description = "Kho chưa tải xong.", color = 15595273 } }
-    end
-    local groups, matchedRules, listed = {}, {}, {}
-    local callbackReader = getcallbackvalue or getcallbackmember
-    if type(callbackReader) == "function" then
-        local ok, booths = pcall(function()
-            local callback = callbackReader(signal.Invoked("Booths_GetIdWithStackKey"), "OnInvoke")
-            local first, second = debug.getupvalue(callback, 1)
-            return type(second) == "table" and second or first
-        end)
-        local own = ok and type(booths) == "table" and booths[player]
-        for _, row in pairs(own and own.Listings or {}) do
-            local key = row.Item.Class.Name .. ":" .. row.Item:StackKey()
-            listed[key] = (listed[key] or 0) + row.Item:GetAmount()
-        end
-    end
-    local count = 0
+    if not container then return "Đang đồng bộ" end
+    local total, scanned = 0, 0
     for _, class in pairs(items.Types) do
         for _, item in pairs(container:All(class)) do
-            local selected = false
-            for index, rule in ipairs(sellRules) do
-                if matchesSale(rule, item) then
-                    matchedRules[index] = true
-                    selected = true
+            if not item:IsLocked() and item:IsTradable() then
+                for _, rule in ipairs(sellRules) do
+                    if matchesSale(rule, item) and rulePrice(rule, item, true) then
+                        total += item:GetAmount()
+                        break -- Một stack chỉ đếm một lần khi khớp nhiều quy tắc.
+                    end
                 end
             end
-            if selected then
-                local key = item.Class.Name .. ":" .. item:StackKey()
-                local group = groups[key] or { item = item, amount = 0, listed = listed[key] or 0 }
-                group.amount += item:GetAmount()
-                groups[key] = group
-            end
-            count += 1
-            if count % 64 == 0 then task.wait() end
+            scanned += 1
+            if scanned % 64 == 0 then task.wait() end
         end
     end
-    local rows = {}
-    for _, group in pairs(groups) do rows[#rows + 1] = group end
-    table.sort(rows, function(a, b) return a.item:GetName() < b.item:GetName() end)
-    local embeds = {}
-    for _, group in ipairs(rows) do
-        local embed = {
-            title = group.item:GetName(),
-            description = ("**Trong kho:** %s\n**Đang rao:** %s"):format(
-                formatDiamonds(group.amount), formatDiamonds(group.listed)),
-            color = 15595273,
-        }
-        itemThumbnail(embed, group.item)
-        embeds[#embeds + 1] = embed
-    end
-    local empty = {}
-    for index, rule in ipairs(sellRules) do
-        if not matchedRules[index] then empty[#empty + 1] = rule.name .. " ×0" end
-    end
-    if #empty > 0 then
-        -- Chia danh sách đã hết thành các embed nhỏ theo giới hạn Discord.
-        local lines = ""
-        for _, line in ipairs(empty) do
-            if #lines + #line > 3500 then
-                embeds[#embeds + 1] = { title = "Đã hết trong kho", description = lines, color = 15595273 }
-                lines = ""
-            end
-            lines ..= line .. "\n"
-        end
-        if lines ~= "" then embeds[#embeds + 1] = { title = "Đã hết trong kho", description = lines, color = 15595273 } end
-    end
-    return embeds
+    -- Hàng đang rao vẫn thuộc kho; không cộng listing thêm lần nữa.
+    return formatDiamonds(total)
 end
 
 -- Đọc số kim cương thực nhận từ phía Received của lịch sử giao dịch.
@@ -536,16 +490,13 @@ local function reportSale(record)
         local embed = {
             title = "Sold!",
             description = ("**you just sold:**\n%s\n**Số lượng đã bán:** %s\n**Kim cương thực nhận:** +%s 💎\n"
-                .. "**Kim cương hiện tại:** %s 💎\n\n**time: %s**"):format(
+                .. "**Kim cương hiện tại:** %s 💎\n**Hàng còn có thể bán:** %s\n\n**time: %s**"):format(
                     table.concat(names, "\n"), formatDiamonds(amount), formatDiamonds(net),
-                    type(balance) == "number" and formatDiamonds(balance) or "Đang đồng bộ", soldAt),
+                    type(balance) == "number" and formatDiamonds(balance) or "Đang đồng bộ", sellInventoryTotal(), soldAt),
             color = 15595273,
         }
         itemThumbnail(embed, sold[1])
-        local embeds = { embed }
-        local remaining = sellInventoryEmbeds()
-        for _, row in ipairs(remaining) do embeds[#embeds + 1] = row end
-        return embeds
+        return { embed }
     end)
 end
 
