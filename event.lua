@@ -27,7 +27,8 @@ local fastFarmInterval = 0.2
 local pressTimeout = 2
 local retryDelay = 5
 local yellowRetryDelay = 15
-local lastZone = tycoonTypes.PART1_ZONES
+-- Lấy giới hạn từ game mỗi lượt, không khóa ở Part 1.
+local bestAreaEnabled = false
 local hatchGoal = 15
 local hatchInterval = 1
 local hatchCounts = {}
@@ -37,6 +38,14 @@ local fastFarmEnabled = false
 local workerRunning = false
 local cocoaTick
 local generation = 0
+
+-- Giới hạn khu đang hoạt động; quyền sở hữu từng khu vẫn do Buttons quyết định.
+local function lastEventZone()
+    if type(tycoon.Part2) == "function" and not tycoon.Part2() then
+        return math.min(tycoonTypes.PART1_ZONES, #tycoonTypes.ZONES)
+    end
+    return #tycoonTypes.ZONES
+end
 
 -- Vào map sự kiện.
 
@@ -136,12 +145,30 @@ local function pressPad(folder, pad, character, humanoid, root, runGeneration)
 end
 
 -- Xác định zone cao nhất trên đảo của người chơi.
-local function getFarmZone()
+local function getFarmZone(position)
     local owned = tycoon.Feature("Buttons").State()
     local plot = tycoon.Feature("Island").Plot()
     local model = plot and plot:GetModel()
     if not owned or not model then return end
-    local zone = buttons.FarmZone(owned, lastZone)
+    local limit = lastEventZone()
+    if position then
+        -- Fast Farm chỉ chọn khu hiện đang đứng trên đảo của mình.
+        for zone = limit, 1, -1 do
+            if buttons.Owned(owned, tycoonTypes.ZONES[zone].Section .. "_Zone") then
+                local slab = buttons.ZoneSlab(model, zone)
+                if slab then
+                    local point = slab.CFrame:PointToObjectSpace(position)
+                    if math.abs(point.X) <= slab.Size.X / 2
+                        and math.abs(point.Z) <= slab.Size.Z / 2
+                        and point.Y >= -slab.Size.Y / 2 - 3 and point.Y <= slab.Size.Y / 2 + 12 then
+                        return zone, slab, plot.ModelId, owned
+                    end
+                end
+            end
+        end
+        return nil, nil, plot.ModelId, owned
+    end
+    local zone = buttons.FarmZone(owned, limit)
     local slab = zone and buttons.ZoneSlab(model, zone)
     return zone, slab, plot.ModelId, owned
 end
@@ -295,16 +322,36 @@ local function hatchFinalEgg(state, egg)
     end
 end
 
--- Tạm dừng mở pad trong lúc chuẩn bị đủ 15 trứng của zone.
-local function updateEvent(state, character, humanoid, root)
-    local zone, slab, plotId, owned = getFarmZone()
-    if not enabled then
-        if zone and slab then
-            standInZone(character, humanoid, root, slab)
-            farmZone(state, zone, plotId)
-        end
+-- Tele Best Area ở event: đứng cạnh trứng của khu cao nhất đã mở rồi hatch.
+local function teleBestEvent(state, character, humanoid, root)
+    local zone, slab = getFarmZone()
+    if not zone or not slab then return end
+    local egg = findZoneEgg(zone, slab.Position)
+    if standInZone(character, humanoid, root, slab, egg and egg:GetPosition()) then
+        state.nextHatch = os.clock() + scanInterval
         return
     end
+    if bestAreaEnabled and egg then hatchFinalEgg(state, egg) end
+end
+
+local function farmCurrentEventZone(state, root)
+    local zone, slab, plotId = getFarmZone(root.Position)
+    if state.farmZone ~= zone or state.farmPlot ~= plotId then
+        clearFarmTargets(state)
+        state.farmZone, state.farmPlot = zone, plotId
+    end
+    if zone and slab then farmZone(state, zone, plotId) else clearFarmTargets(state) end
+end
+
+-- Mở pad/đủ số trứng chỉ thuộc Auto Open Map; Fast Farm không dịch chuyển/hatch.
+local function updateEvent(state, character, humanoid, root)
+    if not enabled then
+        if bestAreaEnabled then teleBestEvent(state, character, humanoid, root) end
+        if fastFarmEnabled then farmCurrentEventZone(state, root) end
+        return
+    end
+    local lastZone = lastEventZone()
+    local zone, slab, plotId, owned = getFarmZone()
     local finalEgg = zone == lastZone and slab and findZoneEgg(zone, slab.Position)
     if finalEgg then
         if standInZone(character, humanoid, root, slab, finalEgg:GetPosition()) then
@@ -455,7 +502,7 @@ local function startWorker()
             nextHatch = 0,
         }
         local nextEntryAt = 0
-        while enabled or pumpkinEnabled or fastFarmEnabled or cocoaTick do
+        while enabled or bestAreaEnabled or pumpkinEnabled or fastFarmEnabled or cocoaTick do
             local character = player.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             local root = humanoid and humanoid.RootPart
@@ -474,7 +521,7 @@ local function startWorker()
                     if pumpkin then
                         clearFarmTargets(state)
                         attackPumpkin(pumpkin, character, humanoid, root)
-                    elseif enabled or fastFarmEnabled then
+                    elseif enabled or bestAreaEnabled or fastFarmEnabled then
                         local ok, err = pcall(updateEvent, state, character, humanoid, root)
                         if not ok then
                             warn("[Auto Open Map Event] " .. tostring(err))
@@ -493,6 +540,14 @@ local function startWorker()
         workerRunning = false
     end)
 end
+
+-- Cầu nối nội bộ cho FarmTeleToBestArea; không thêm toggle/flag UI mới.
+features.EventTeleToBestArea = {
+    duy = function(on)
+        bestAreaEnabled = on == true
+        if bestAreaEnabled then startWorker() end
+    end,
+}
 
 -- Quét riêng PumpkinTycoonPads để bỏ qua các nút thưởng trong PumpkinTycoonIslands.
 features.EventAutoOpenMap = {
@@ -565,7 +620,7 @@ features.EventAutoPumpkin = {
     end,
 }
 
--- Bật Fast Farm cho zone cao nhất đã mở trên đảo.
+-- Fast Farm chỉ đánh khu hiện tại, không điều khiển vị trí hoặc mở trứng.
 features.EventFastFarm = {
     duy = function(on)
         fastFarmEnabled = on
@@ -879,7 +934,8 @@ end
 do
     local definitions = require(library.Types.PumpkinTycoon.Upgrades)
     local eventUpgrades = require(library.Directory.EventUpgrades)
-    -- Sửa danh sách dropdown tại đây bằng tên hiển thị và ID nâng cấp.
+    local upgradeUtil = require(library.Util.PumpkinTycoonUpgrades)
+    -- Giữ thứ tự cũ; tự thêm track mới từ ROWS khi game cập nhật.
     local catalog = {
         { name = "Spawn Luck", track = "SpawnLuck" },
         { name = "Patch Coin Payout", track = "PumpkinCoins" },
@@ -891,6 +947,15 @@ do
         { name = "Merchant Luck", track = "MerchantLuck" },
         { name = "Auto Break", track = "AutoBreakRules" },
     }
+    local known, additions = {}, {}
+    for _, entry in ipairs(catalog) do known[entry.track] = true end
+    for track, definition in pairs(definitions.ROWS) do
+        if not known[track] and type(definition) == "table" and type(definition.Powers) == "table" then
+            additions[#additions + 1] = {name = definition.Name or track, track = track}
+        end
+    end
+    table.sort(additions, function(a, b) return a.track < b.track end)
+    for _, entry in ipairs(additions) do catalog[#catalog + 1] = entry end
     local options, tracksByName = {}, {}
     local selected = {}
     local retryAt = {}
@@ -920,7 +985,8 @@ do
             -- Bỏ qua mục chưa được game đăng ký để các nâng cấp khác vẫn chạy.
             if not definition or not rawget(eventUpgrades, instanceId .. track) then continue end
             local tier = upgrades.Tier(track)
-            if tier >= #definition.Powers or upgrades.Capped(track, tier) then continue end
+            local cap = upgradeUtil.MaxTier(track, player)
+            if tier >= cap or (entry.tier and tier >= entry.tier) or upgrades.Capped(track, tier) then continue end
             local cost = upgrades.Cost(track, tier + 1)
             if cost and tokens >= cost then
                 local success = plot:Invoke(upgrades.VERB_BUY, track)
@@ -941,6 +1007,24 @@ do
 
     -- Giữ một vòng nâng cấp và đọc lại giá sau mỗi lượt.
     features.EventAutoPumpkinUpgrade = {
+        configureCatalog = function(values)
+            assert(type(values) == "table", "lists.pumpkinUpgrades phải là bảng")
+            local aliases = {}
+            for _, entry in ipairs(catalog) do aliases[entry.name] = entry.track end
+            local entries, names, tracks = {}, {}, {}
+            for _, value in ipairs(values) do
+                local raw = type(value) == "table" and (value.id or value.name) or value
+                local track = aliases[raw] or raw
+                assert(type(track) == "string" and definitions.ROWS[track], "ID nâng cấp không hợp lệ: " .. tostring(raw))
+                local tier = type(value) == "table" and value.tier or nil
+                assert(not tier or (type(tier) == "number" and tier >= 1 and tier % 1 == 0 and tier <= #definitions.ROWS[track].Powers), "Mốc cấp nâng cấp không hợp lệ")
+                local name = type(value) == "table" and (value.name or track) or raw
+                entries[#entries+1] = {name=name, track=track, tier=tier}
+                names[#names+1], tracks[name] = name, track
+            end
+            catalog, options, tracksByName = entries, names, tracks
+            table.clear(selected)
+        end,
         getOptions = function() return table.clone(options) end,
         setSelection = setSelection,
         duy = function(on)
@@ -1016,7 +1100,7 @@ do
     -- Tìm stack có đúng ID và cấp được chọn.
     local function findBoost(inventory, entry)
         for uid, item in pairs(inventory) do
-            if item.id == entry.id and (item.tn or 1) == entry.tier
+            if item.id == entry.id and (not entry.tier or (item.tn or 1) == entry.tier)
                 and not item._lk and (item._am or 1) > 0 then
                 return uid
             end
@@ -1063,6 +1147,19 @@ do
 
     -- Đồng bộ lựa chọn từ dropdown hoặc launcher.
     features.EventAutoEquipBoost = {
+        configureCatalog = function(values, resolve)
+            local families = {}
+            for _, entry in ipairs(catalog) do families[entry.id] = entry.family end
+            local entries, labels = resolve({Consumables=directory}, "Consumable", values)
+            for _, entry in ipairs(entries) do
+                local family = entry.family or families[entry.id]
+                assert(family == "Coins" or family == "Damage" or family == "IslandLuck",
+                    "Boost cần family Coins/Damage/IslandLuck: " .. entry.id)
+                entry.family = family
+            end
+            catalog, options = entries, labels
+            table.clear(selected)
+        end,
         getOptions = function() return table.clone(options) end,
         resolveSelection = resolveSelection,
         setSelection = function(values)
