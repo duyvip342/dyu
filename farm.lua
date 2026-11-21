@@ -4,6 +4,7 @@ local playerPet = require(game:GetService("ReplicatedStorage").Library.Client.Pl
 local originalSpeedMultiplier = playerPet.CalculateSpeedMultiplier
 local client = game:GetService("ReplicatedStorage").Library.Client
 local tele = require(client.TeleportMapCmds)
+local instancing = require(client.InstancingCmds)
 local worlds = require(client.Parent.Util.WorldsUtil)
 
 local dir = require(client.Parent.Directory)
@@ -219,15 +220,20 @@ features.FarmAutoCollectOrb = {
 -- Mỗi tính năng có thể yêu cầu dịch chuyển mà không tắt toggle của người dùng.
 local function teleportFeature(setEnabled)
     local owners = {}
+    local sharedFeatures
     -- Giữ vòng teleport chạy khi còn ít nhất một tính năng yêu cầu.
-    local function request(owner, on)
+    local function request(owner, on, shared)
+        local previousShared = sharedFeatures
+        sharedFeatures = shared or sharedFeatures
         local wasEnabled = next(owners) ~= nil
         owners[owner] = on and true or nil
         local enabled = next(owners) ~= nil
-        if enabled ~= wasEnabled then setEnabled(enabled) end
+        if enabled ~= wasEnabled or (enabled and sharedFeatures ~= previousShared) then
+            setEnabled(enabled, sharedFeatures)
+        end
     end
     return {
-        duy = function(on) request("farm", on) end,
+        duy = function(on, shared) request("farm", on, shared) end,
         request = request,
     }
 end
@@ -239,7 +245,7 @@ local areaDataWarning
 local function getAreaData()
     if areaData then return areaData end
     local ok, result = pcall(function()
-        local source = game:HttpGet("https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/id%20area.lua")
+        local source = game:HttpGet("https://raw.githubusercontent.com/duyvip342/dyu/refs/heads/main/id%20area.lua")
         source = source:gsub("^\239\187\191", "") -- Bỏ UTF-8 BOM nếu có.
         local chunk, compileError = loadstring(source, "@id area.lua")
         if not chunk then error("Lỗi cú pháp: " .. tostring(compileError), 0) end
@@ -276,8 +282,12 @@ end
 local areaXZTolerance = 0.1
 
 -- Đưa nhân vật về tọa độ đã lưu của area mục tiêu.
-features.FarmTeleToBestArea = teleportFeature(function(on)
+features.FarmTeleToBestArea = teleportFeature(function(on, shared)
+    local eventTele = shared and shared.EventTeleToBestArea
+    if eventTele then eventTele.duy(on, shared) end
     run("area", on, 3, function()
+        -- Event có điều phối riêng, không kéo nhân vật ra tọa độ overworld.
+        if instancing.GetInstanceID() == "PumpkinTycoon" then return end
         local char = player.Character
         local world = worlds.GetWorldNumber()
         if not char or not char:FindFirstChild("HumanoidRootPart") or not world then return end
@@ -291,6 +301,7 @@ features.FarmTeleToBestArea = teleportFeature(function(on)
         -- Chưa điền tọa độ: chờ, không tự dò map hoặc teleport của game.
         if type(position) == "table" and type(position[1]) == "number" and type(position[2]) == "number" and type(position[3]) == "number" then
             -- HttpGet có thể yield: kiểm tra lại trước khi dịch chuyển.
+            if instancing.GetInstanceID() == "PumpkinTycoon" then return end
             if player.Character ~= char or worlds.GetWorldNumber() ~= world then return end
             if getTargetArea(world) ~= target then return end
             local current = char:GetPivot().Position
