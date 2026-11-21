@@ -52,7 +52,7 @@ do
         end
     end
 
-    if setSpace then
+    if setSpace and (not launchConfig or launchConfig.antiAfk ~= false) then
         local player = game:GetService("Players").LocalPlayer
         -- Báo số giây Roblox vẫn tính là idle.
         environment.RobloxHubAntiAfkIdleConnection = player.Idled:Connect(function(seconds)
@@ -78,7 +78,7 @@ do
             end)
             if not ok then warn("[Anti-AFK] Gửi Space lỗi: " .. tostring(err)) end
         end)
-    else
+    elseif not setSpace and (not launchConfig or launchConfig.antiAfk ~= false) then
         warn("[Anti-AFK] Executor không có API gửi phím dùng được.")
     end
 end
@@ -144,6 +144,25 @@ for _, url in ipairs(urls) do
     assert(type(moduleFeatures) == "table", filename .. " phải trả về bảng features")
     for flag, feature in pairs(moduleFeatures) do
         features[flag] = feature
+    end
+end
+
+-- Danh sách do launcher quản lý; không chạy worker khi thiết lập catalog.
+if launchConfig and type(launchConfig.lists) == "table" then
+    local lists = launchConfig.lists
+    local resolve = loadRemoteModule("https://raw.githubusercontent.com/duyvip342/dyu/main/item_catalog.lua", "item_catalog.lua")()
+    local targets = {
+        {"mail", "MailAutoGift"}, {"enchants", "AutoEquipEnchant"},
+        {"gifts", "AutoOpenGifts"}, {"pumpkinUpgrades", "EventAutoPumpkinUpgrade"},
+        {"boosts", "EventAutoEquipBoost"},
+    }
+    for _, entry in ipairs(targets) do
+        local feature = features[entry[2]]
+        if lists[entry[1]] ~= nil then
+            assert(feature and type(feature.configureCatalog) == "function",
+                "Module chưa hỗ trợ lists." .. entry[1] .. "; cần cập nhật module cùng UI")
+            feature.configureCatalog(lists[entry[1]], resolve)
+        end
     end
 end
 
@@ -318,7 +337,7 @@ local function enchantHandlers(feature)
         if #list == 0 then return end
         local ok, err = runInventoryAction(function()
             for _, name in ipairs(list) do
-                if type(name) == "string" then feature.add(name) end
+                if type(name) == "string" or type(name) == "table" then feature.add(name) end
             end
         end)
         if not ok then warn("[Enchant UI] " .. tostring(err)) end
@@ -404,6 +423,9 @@ do
             or (type(inputs) == "table" and inputs[inputFlag])
             or launchToggles[inputFlag]
         )
+        if launchConfig and type(launchConfig.controls) == "table" and launchConfig.controls[inputFlag] ~= nil then
+            preset = launchConfig.controls[inputFlag]
+        end
         local recipient = type(preset) == "string" and preset:match("^%s*(.-)%s*$") or ""
         local input = event:CreateInput({
             name = "Gift Huge User Name",
