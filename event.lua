@@ -295,16 +295,18 @@ local function findZoneEgg(zone, nearPosition)
     return closest
 end
 
--- Mở đúng một quả khi đủ xu và đếm lượt server xác nhận.
-local function hatchOne(state, zone, egg)
+-- Mở tối đa mỗi lượt; đếm số quả được server chấp nhận, cho phép vượt mốc 15.
+local function hatchProgressEgg(state, zone, egg)
     local now = os.clock()
     if now < state.nextHatch then return end
     state.nextHatch = now + hatchInterval
     local directory = egg:Directory()
+    local count = egg:GetMaxEggCount() or eggs.GetMaxHatch(directory)
+    if type(count) ~= "number" or count < 1 or count % 1 ~= 0 then return end
     local price = eggPrice(directory, nil, not egg._allowChargedAndGolden)
-    if not currency.CanAfford(directory.currency, price) then return end
-    local success = network.Invoke("CustomEggs_Hatch", egg._uid, 1)
-    if success == true then hatchCounts[zone] = (hatchCounts[zone] or 0) + 1 end
+    if not currency.CanAfford(directory.currency, price * count) then return end
+    local success = network.Invoke("CustomEggs_Hatch", egg._uid, count)
+    if success == true then hatchCounts[zone] = (hatchCounts[zone] or 0) + count end
 end
 
 -- Mở trứng zone cuối theo giới hạn hiện tại của game.
@@ -343,7 +345,7 @@ local function farmCurrentEventZone(state, root)
     if zone and slab then farmZone(state, zone, plotId) else clearFarmTargets(state) end
 end
 
--- Mở pad/đủ số trứng chỉ thuộc Auto Open Map; Fast Farm không dịch chuyển/hatch.
+-- Đợi đạt/vượt 15 quả trước khi mở pad tiếp; Fast Farm không dịch chuyển/hatch.
 local function updateEvent(state, character, humanoid, root)
     if not enabled then
         if bestAreaEnabled then teleBestEvent(state, character, humanoid, root) end
@@ -371,7 +373,7 @@ local function updateEvent(state, character, humanoid, root)
         standInZone(character, humanoid, root, slab, egg and egg:GetPosition())
         farmZone(state, zone, plotId)
         if waitingForEgg then
-            if egg then hatchOne(state, zone, egg) end
+            if egg then hatchProgressEgg(state, zone, egg) end
             return
         end
     elseif zone and zone < lastZone and (hatchCounts[zone] or 0) < hatchGoal
