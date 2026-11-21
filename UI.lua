@@ -475,11 +475,14 @@ end
 -- ============================================================================
 do
     -- Farm và di chuyển
+    farm:CreateSection({ name = "farm" })
     createToggle(farm, "inf pet speed", "FarmInfinityPetSpeed")
     createToggle(farm, "fast farm", "FarmFastFarm")
     createToggle(farm, "auto tap", "FarmAutoTap")
     createToggle(farm, "Tự nhặt orb", "FarmAutoCollectOrb")
     createToggle(farm, "tele to best area", "FarmTeleToBestArea")
+
+    farm:CreateSection({ name = "map" })
     createToggle(farm, "tele to best world", "FarmTeleToBestWorld")
     createToggle(farm, "auto buy next area", "FarmAutoBuyNextArea")
 
@@ -492,11 +495,9 @@ end
 -- TAB: optimize
 -- ============================================================================
 do
-    optimize:CreateSection({ name = "Loot boxes" })
+    optimize:CreateSection({ name = "optimize" })
     createToggle(optimize, "disable loot boxes", "OptimizeDisableLootBoxes")
-    optimize:CreateSection({ name = "Dropped objects" })
     createToggle(optimize, "disable objects", "OptimizeDisableObjects")
-    optimize:CreateSection({ name = "Combined" })
     createToggle(optimize, "super optimize", "OptimizeSuper")
 
     -- Cấu hình giới hạn FPS của client.
@@ -513,7 +514,7 @@ do
         flag = "OptimizeFpsTarget",
         numeric = true,
         value = initialFps,
-        placeholder = "Nhập FPS mong muốn",
+        placeholder = "FPS",
         callback = function(value)
             if fpsLimit then fpsLimit.setTarget(value) end
         end,
@@ -525,7 +526,9 @@ end
 -- TAB: mail
 -- ============================================================================
 do
+    mail:CreateSection({ name = "auto claim mail" })
     createToggle(mail, "Tự nhận thư", "MailAutoClaim")
+     mail:CreateSection({ name = "auto gift" })
     local gift = features.MailAutoGift
     if not gift then return end
     local handlers = mailHandlers(gift)
