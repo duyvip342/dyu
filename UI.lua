@@ -86,15 +86,15 @@ end
 -- 2. Tải các module tính năng
 -- Thêm một URL Raw vào danh sách cho mỗi file xử lý mới.
 local urls = {
-    "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/farm.lua",
-    "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/rank.lua",
-    "https://raw.githubusercontent.com/duyvip453/dyu/main/automatic.lua",
-    "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/optimize.lua",
-    "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/mail.lua",
-    "https://raw.githubusercontent.com/duyvip453/dyu/main/webhook.lua",
-    "https://raw.githubusercontent.com/duyvip453/dyu/main/event.lua",
-    "https://raw.githubusercontent.com/duyvip453/dyu/main/trading.lua",
-    "https://raw.githubusercontent.com/duyvip453/dyu/main/setting.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/refs/heads/main/farm.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/refs/heads/main/rank.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/main/automatic.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/refs/heads/main/optimize.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/refs/heads/main/mail.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/main/webhook.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/main/event.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/main/trading.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/main/setting.lua",
 }
 
 -- Gộp tính năng từ các module theo tên flag.
@@ -163,7 +163,7 @@ local window = Rayfield:CreateWindow({
 -- Khai báo các tab theo thứ tự xuất hiện trên menu.
 -- Ghim bản registry đã kiểm tra để tránh CDN trả bản cũ hoặc file bị cắt.
 -- Khi cập nhật ui_controls.lua trên GitHub, thay commit này cùng lượt cập nhật UI.lua.
-local controlFactory = loadRemoteModule("https://raw.githubusercontent.com/duyvip453/dyu/f9d26e4fb7ee0c064163480d33bc315642ab467a/ui_controls.lua", "ui_controls.lua")()
+local controlFactory = loadRemoteModule("https://raw.githubusercontent.com/duyvip342/dyu/f9d26e4fb7ee0c064163480d33bc315642ab467a/ui_controls.lua", "ui_controls.lua")()
 local ui = controlFactory(window)
 environment.RobloxHubUI = ui
 local function createTab(name)
