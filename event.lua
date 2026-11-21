@@ -892,54 +892,133 @@ features.EventFastFarm = {
     end,
 }
 
--- Auto Buy Pumpkin / Mua bí ngô từ merchant trong Pumpkin Tycoon.
+-- Auto Buy Pumpkin / Cùng một toggle mua bí ngô và Pet Net/Ultra Pet Net.
 do
     local merchantData = require(library.Types.PumpkinTycoon.Merchant)
+    local netStoreData = require(library.Util.PumpkinTycoonStore)
+    local env = type(getgenv) == "function" and getgenv() or _G
+    local previous = env.RobloxHubEventBuy
+    if type(previous) == "table" and type(previous.stop) == "function" then previous.stop() end
+    local session = type(previous) == "table" and type(previous.session) == "table" and previous.session or {}
+    local controller = {active = true, session = session}
     local buying = false
     local buyJob
+    local nextKind = "nets"
+    local lastError
 
-    -- Chọn cấp cao nhất còn hàng mà số xu hiện tại mua được.
+    local function active()
+        return controller.active and buying and isInEvent() and not rebirthWaiting
+    end
+
+    -- Một request tại một thời điểm, kể cả vừa exec lại module.
+    local function purchase(action)
+        session.inFlight = true
+        local ok, accepted, reason = pcall(action)
+        session.inFlight = false
+        if not ok then error(accepted) end
+        if accepted ~= true then
+            local problem = tostring(reason or "Game chưa chấp nhận lượt mua.")
+            if problem ~= lastError then warn("[Auto Buy Pumpkin/Net] " .. problem) end
+            lastError = problem
+        else
+            lastError = nil
+        end
+        return accepted == true
+    end
+
+    -- Chọn cấp bí ngô cao nhất còn hàng và đủ xu.
     local function chooseBand(items, coins)
         local config = merchantData.Config()
         for index = #merchantData.BANDS, 1, -1 do
             local band = merchantData.BANDS[index]
             local offer = config[band]
-            if offer and (items[band] or 0) > 0 and coins >= offer.Price then
-                return band
-            end
+            if offer and (items[band] or 0) > 0 and coins >= offer.Price then return band end
         end
-        return nil
     end
 
-    -- Đọc lại quầy và sức chứa trước mỗi lần mua.
     local function buyPumpkin()
-        if not isInEvent() then return 2 end
         local merchant = tycoon.Feature("Merchant")
-        if not merchant.Enabled() or not merchant.Unlocked() then return 2 end
+        if not merchant.Enabled() or not merchant.Unlocked() then return false, 2 end
         local island = tycoon.Feature("Island")
         local plot = island.Plot()
-        if not plot then return 2 end
-
+        if not plot then return false, 2 end
         local stock = merchantData.CleanStock(island.Get(nil, tycoonTypes.VAR.Stock))
-        if #stock >= merchant.Slots() then return 2 end
+        if #stock >= merchant.Slots() then return false, 2 end
         local offers = merchantData.Clean(island.Get(nil, tycoonTypes.VAR.Merchant))
         local coins = currency.Get(tycoonTypes.COIN)
-        if not offers or type(coins) ~= "number" then return 2 end
+        if not offers or type(coins) ~= "number" then return false, 2 end
         local band = chooseBand(offers.Items, coins)
-        if not band then return 2 end
-
-        local success = plot:Invoke(merchantData.VERB_BUY, band)
-        return success == true and 1 or 3
+        if not band or not active() or island.Plot() ~= plot then return false, 2 end
+        local success = purchase(function() return plot:Invoke(merchantData.VERB_BUY, band) end)
+        return true, success and 1 or 3
     end
 
-    -- Giữ một vòng mua để tránh gửi trùng khi bật tắt nhanh.
+    local function buyPetNet()
+        if not tycoon.Part2() or not tycoon.OwnPlotPart2() then return false, 2 end
+        local store = tycoon.Feature("Store")
+        if not store.TabOpen() or store.AutoOn() then return false, 2 end
+        local island = tycoon.Feature("Island")
+        local plot = island.Plot()
+        local shelf = store.Shelf()
+        if not plot or not shelf or type(shelf.seed) ~= "number" or type(shelf.offers) ~= "table" then return false, 2 end
+        if session.plot ~= plot or session.seed ~= shelf.seed then
+            session.plot, session.seed, session.purchased = plot, shelf.seed, {}
+        end
+        local coins = currency.Get(tycoonTypes.COIN)
+        if type(coins) ~= "number" then return false, 2 end
+        local selected
+        for _, id in ipairs({netStoreData.ULTRA_NET, netStoreData.NET}) do
+            for _, offer in ipairs(shelf.offers) do
+                if offer.item == id and type(offer.slot) == "number" and offer.slot >= 1 and offer.slot % 1 == 0
+                    and type(offer.left) == "number" and offer.left > 0
+                    and type(offer.price) == "number" and offer.price >= 0 and coins >= offer.price
+                    and session.purchased[offer.slot] ~= offer.left then
+                    if not selected or offer.price < selected.price
+                        or (offer.price == selected.price and offer.slot < selected.slot) then selected = offer end
+                end
+            end
+            if selected then break end
+        end
+        if not selected or not active() or island.Plot() ~= plot then return false, 2 end
+        -- Shelf seed/slot là dữ liệu quầy native, không dùng vị trí dòng đã gộp trên UI.
+        local selectedSeed, selectedSlot, selectedLeft = shelf.seed, selected.slot, selected.left
+        local purchased = session.purchased
+        local success = purchase(function()
+            return network.Invoke("Merchant_RequestPurchase", netStoreData.MERCHANT, selectedSlot, false, selectedSeed)
+        end)
+        if success then purchased[selectedSlot] = selectedLeft end
+        return true, success and 1 or 3
+    end
+
+    -- Luân phiên để cả kho bí ngô lẫn vợt đều được xét; nhóm không mua được không chặn nhóm kia.
+    local function buySupplies()
+        if not active() or session.inFlight then return 2 end
+        local first, second
+        if nextKind == "nets" then
+            nextKind = "pumpkin"
+            first, second = buyPetNet, buyPumpkin
+        else
+            nextKind = "nets"
+            first, second = buyPumpkin, buyPetNet
+        end
+        local attempted, delay = first()
+        if not attempted and active() then attempted, delay = second() end
+        return delay or 2
+    end
+
+    controller.stop = function()
+        controller.active, buying = false, false
+    end
+    env.RobloxHubEventBuy = controller
     features.EventAutoBuyPumpkin = {
         duy = function(on)
-            buying = on
-            if not on or buyJob then return end
+            if not controller.active then return end
+            buying = on == true
+            if not buying or buyJob then return end
             buyJob = task.defer(function()
-                while buying do
-                    local ok, delay = pcall(buyPumpkin)
+                while buying and controller.active do
+                    local ok, delay = pcall(buySupplies)
+                    if not ok and delay ~= lastError then warn("[Auto Buy Pumpkin/Net] " .. tostring(delay)); lastError = delay end
                     task.wait(ok and delay or 3)
                 end
                 buyJob = nil
