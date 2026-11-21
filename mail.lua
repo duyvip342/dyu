@@ -39,6 +39,9 @@ local giftCatalog = {
 }
 
 -- Ghép tên boost cấp II với ID gốc và cấp trong inventory.
+local configuredItems
+local resolveConfigured
+local directory = require(lib.Directory)
 local tierTwoBoostIds = {
     ["Patch Coin Boost II"] = "Patch Coin Boost",
     ["Pumpkin Damage Boost II"] = "Pumpkin Damage Boost",
@@ -56,7 +59,7 @@ local suffixes = { [""] = 1, k = 1e3, m = 1e6, b = 1e9, t = 1e12 }
 
 -- Đổi Amount hoặc Keep thành số nguyên hợp lệ.
 local function parseAmount(text)
-    local number, suffix = text:lower():gsub(",", ""):match("^%s*(%d+%.?%d*)%s*([kmbt]?)%s*$")
+    local number, suffix = tostring(text or ""):lower():gsub(",", ""):match("^%s*(%d+%.?%d*)%s*([kmbt]?)%s*$")
     if not number then return nil end
     local amount = tonumber(number) * suffixes[suffix]
     if amount > 2^53 - 1 or amount % 1 ~= 0 then return nil end
@@ -104,7 +107,7 @@ end
 local function findGiftStock(inventory, rule)
     local stock, largestUid, largest = 0, nil, 0
     for uid, entry in pairs(inventory[rule.class] or {}) do
-        if entry.id == rule.id and (not rule.tier or entry.tn == rule.tier) and canGiftItem(rule.class, entry) then
+        if entry.id == rule.id and (not rule.tier or (entry.tn or 1) == rule.tier) and canGiftItem(rule.class, entry) then
             local amount = entry._am or 1
             stock += amount
             if amount > largest then largestUid, largest = uid, amount end
@@ -122,7 +125,7 @@ local function sendRule(rule, revision)
     if not uid or stack < quantity then return end
     local fee = mailFee(data)
     if countDiamonds(inventory) < fee then return end
-    local isDiamonds = rule.class == "Currency" and rule.name == "Diamonds"
+    local isDiamonds = rule.class == "Currency" and rule.id == "Diamonds"
     local available = stock - rule.keep - (isDiamonds and fee or 0)
     if available < quantity or not giftEnabled or revision ~= giftRevision then return end
 
@@ -159,6 +162,16 @@ end
 
 -- Xuất chức năng cấu hình Auto Gift cho tab Mail.
 features.MailAutoGift = {
+    configureCatalog = function(values, resolve)
+        assert(type(values) == "table", "lists.mail phải là bảng Class -> danh sách")
+        local catalog, resolved = {}, {}
+        for class, names in pairs(values) do
+            assert(items.Types[class], "Mail Class không hợp lệ: " .. tostring(class))
+            local _, labels, byName = resolve(directory, class, names)
+            catalog[class], resolved[class] = labels, byName
+        end
+        giftCatalog, configuredItems, resolveConfigured = catalog, resolved, resolve
+    end,
     getFee = mailFee,
     setRecipient = function(value)
         local name = value:match("^%s*(.-)%s*$")
@@ -177,19 +190,26 @@ features.MailAutoGift = {
     end,
     add = function(class, name, amountText, keepText)
         local ids = giftCatalog[class]
-        if not ids or not name or not table.find(ids, name) then
+        local selected
+        if configuredItems and ids and name then
+            local ok, entries = pcall(resolveConfigured, directory, class, {name})
+            if not ok then return false, tostring(entries) end
+            selected = entries[1]
+            name = selected.name
+        end
+        if not ids or not name or (not selected and not table.find(ids, name)) then
             return false, "Chọn Item Class và Item ID trong cùng nhóm"
         end
         local amount, keep = parseAmount(amountText), parseAmount(keepText)
         if not amount or amount <= 0 or keep == nil then
             return false, "Amount phải lớn hơn 0 và Keep từ 0 trở lên"
         end
-        local boostId = class == "Consumable" and tierTwoBoostIds[name]
+        local boostId = not configuredItems and class == "Consumable" and tierTwoBoostIds[name]
         rules[#rules + 1] = {
             class = class,
             name = name,
-            id = boostId or name,
-            tier = boostId and 2 or nil,
+            id = selected and selected.id or boostId or name,
+            tier = selected and selected.tier or (boostId and 2 or nil),
             amount = amount,
             keep = keep,
         }
