@@ -38,6 +38,9 @@ local enchantOrder = {
     
 }
 
+local resolveCatalog
+local enchantRules = {}
+local giftByName = {}
 local selectedGifts = {}
 local openingGifts = false
 local giftJob
@@ -92,7 +95,8 @@ local function openSelectedGifts()
         if amounts then
             if not current or not amounts[current] or amounts[current] <= 0 then
                 current = nil
-                for _, id in ipairs(giftOrder) do
+                for _, name in ipairs(giftOrder) do
+                    local id = giftByName[name] and giftByName[name].id or name
                     if (amounts[id] or 0) > 0 then
                         current = id
                         retryDelay = 0.25
@@ -130,10 +134,18 @@ end
 
 -- Xuất tính năng tự mở quà cho tab Automatic.
 features.AutoOpenGifts = {
+    configureCatalog = function(values, resolve)
+        local entries, labels, byName = resolve(dir, "Misc", values)
+        for _, entry in ipairs(entries) do
+            assert(not entry.tier, "GiftBag_Open nhận ID quà, không chọn được tier; dùng đúng ID quà riêng")
+        end
+        giftOrder, giftByName = labels, byName
+    end,
     getOptions = function() return table.clone(giftOrder) end,
     setSelection = function(values)
         selectedGifts = {}
-        for _, id in ipairs(values or {}) do
+        for _, name in ipairs(values or {}) do
+            local id = giftByName[name] and giftByName[name].id or name
             selectedGifts[id] = true
         end
     end,
@@ -190,7 +202,9 @@ local function enchantPlan(items, slots, rejected)
     for index, name in ipairs(enchantWanted) do
         if #plan >= #slots then break end
         for _, item in ipairs(items) do
-            if item.name == name and not rejected[index .. ":" .. item.uid]
+            if item.name == (enchantRules[name] and enchantRules[name].id or name)
+                and (not enchantRules[name] or not enchantRules[name].tier or item.tier == enchantRules[name].tier)
+                and not rejected[index .. ":" .. item.uid]
                 and (used[item.uid] or 0) < item.amount then
                 plan[#plan + 1] = {uid = item.uid, index = index}
                 used[item.uid] = (used[item.uid] or 0) + 1
@@ -203,10 +217,19 @@ end
 
 -- Xuất tính năng trang bị theo danh sách Add Enchant.
 features.AutoEquipEnchant = {
+    configureCatalog = function(values, resolve)
+        local _, labels, byName = resolve(dir, "Enchant", values)
+        enchantOrder, enchantRules, resolveCatalog = labels, byName, resolve
+    end,
     getNames = function() return table.clone(enchantOrder) end,
     getList = function() return table.clone(enchantWanted) end,
     add = function(name)
-        if not table.find(enchantOrder, name) then return false end
+        if resolveCatalog then
+            local entries = resolveCatalog(dir, "Enchant", {name})
+            local entry = entries[1]
+            enchantRules[entry.name] = entry
+            name = entry.name
+        elseif not table.find(enchantOrder, name) then return false end
         enchantWanted[#enchantWanted + 1] = name
         enchantRevision += 1
         return true
