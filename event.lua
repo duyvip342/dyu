@@ -35,8 +35,22 @@ local hatchCounts = {}
 local enabled = false
 local pumpkinEnabled = false
 local fastFarmEnabled = false
+local rebirthEnabled = false
+local rebirthWaiting = false
+-- Dừng quyền auto rebirth của module cũ khi exec lại; giữ request đang chờ xác nhận.
+local rebirthEnvironment = type(getgenv) == "function" and getgenv() or _G
+local previousRebirth = rebirthEnvironment.RobloxHubEventRebirth
+if type(previousRebirth) == "table" and type(previousRebirth.stop) == "function" then previousRebirth.stop() end
+local rebirthState = type(previousRebirth) == "table" and previousRebirth.state or {}
+local rebirthController = {active = true, state = rebirthState}
+rebirthController.stop = function()
+    rebirthController.active = false
+    rebirthEnabled, rebirthWaiting = false, false
+end
+rebirthEnvironment.RobloxHubEventRebirth = rebirthController
 local workerRunning = false
 local cocoaTick
+local huntTick
 local generation = 0
 
 -- Giới hạn khu đang hoạt động; quyền sở hữu từng khu vẫn do Buttons quyết định.
@@ -390,6 +404,65 @@ local function updateEvent(state, character, humanoid, root)
     end
 end
 
+-- Cùng điều kiện với nút Rebirth của game, không dùng phần trăm UI đã làm tròn.
+local function readyRebirthPlot()
+    if not rebirthController.active or not rebirthEnabled or not isInEvent() or not tycoon.Part2() or not tycoon.OwnPlotPart2() then return end
+    local flags = require(library.Universal.FFlags)
+    if flags.Get(flags.Keys.PumpkinTycoon_Rebirth) ~= true then return end
+    local plot = tycoon.Feature("Island").Plot()
+    if not plot or plot:IsDestroyed() or plot:GetOwner() ~= player then return end
+    local owned = plot:Save(tycoonTypes.VAR.Buttons)
+    if type(owned) ~= "table" or not buttons.RebirthReady(owned) then return end
+    local _, total, progress = buttons.RebirthProgress(owned)
+    if total > 0 and progress >= 1 then return plot end
+end
+
+-- Một lệnh mỗi chu kỳ; chờ đảo reset trước khi cho phép chu kỳ tiếp theo.
+local function autoRebirthStep(state)
+    if not rebirthController.active then return false end
+    if rebirthState.pending then
+        if rebirthState.pending.inFlight then
+            rebirthWaiting = rebirthController.active and rebirthEnabled
+            return rebirthWaiting
+        end
+        local plot = tycoon.Feature("Island").Plot()
+        local owned = plot and not plot:IsDestroyed() and plot:Save(tycoonTypes.VAR.Buttons)
+        if type(owned) == "table" and (plot ~= rebirthState.pending.plot or not buttons.RebirthReady(owned)) then
+            rebirthState.pending = nil
+            rebirthWaiting = false
+            table.clear(hatchCounts)
+            table.clear(state.retryAt)
+            clearFarmTargets(state)
+            state.nextHatch = os.clock() + scanInterval
+            state.farmZone, state.farmPlot = nil, nil
+        else
+            -- Nếu replication chậm vẫn giữ chốt chống gửi lặp, nhưng không khóa farm mãi.
+            rebirthWaiting = rebirthController.active and rebirthEnabled and os.clock() < rebirthState.pending.deadline
+            return rebirthWaiting
+        end
+    end
+    local plot = readyRebirthPlot()
+    if not plot or os.clock() < (state.nextRebirth or 0) then return false end
+    if not rebirthEnabled or not isInEvent() or tycoon.Feature("Island").Plot() ~= plot then return false end
+    state.nextRebirth = os.clock() + 5
+    clearFarmTargets(state)
+    rebirthWaiting = true
+    rebirthState.pending = {plot = plot, inFlight = true}
+    local ok, accepted, reason = pcall(plot.Invoke, plot, tycoonTypes.NET.Rebirth)
+    if ok and accepted == true then
+        rebirthState.pending = {plot = plot, deadline = os.clock() + 15}
+        generation += 1
+        state.rebirthError = nil
+        return true
+    end
+    rebirthState.pending = nil
+    rebirthWaiting = false
+    local problem = tostring(ok and (reason or "Game chưa chấp nhận tái sinh.") or accepted)
+    if problem ~= state.rebirthError then warn("[Auto Rebirth Event] " .. problem) end
+    state.rebirthError = problem
+    return false
+end
+
 -- Auto Pumpkin / Chỉ chọn bí ngô còn sống trên đảo của mình.
 local function findPumpkin(position)
     local plot = tycoon.Feature("Island").Plot()
@@ -434,7 +507,8 @@ local function attackPumpkin(target, character, humanoid, root)
     local ok, err = pcall(function()
         petCmds.EquipBest()
         while pumpkinEnabled and isInEvent() and player.Character == character
-            and humanoid.Health > 0 and root.Parent == character do
+            and humanoid.Health > 0 and root.Parent == character and not readyRebirthPlot() do
+            if huntTick then huntTick(root) end
             local breaker = breakables.Get(target.uid)
             if not breaker or breaker.health <= 0 or not breaker.model or not breaker.model.Parent then break end
             if (root.Position - breaker.position).Magnitude > 8 then
@@ -504,7 +578,7 @@ local function startWorker()
             nextHatch = 0,
         }
         local nextEntryAt = 0
-        while enabled or bestAreaEnabled or pumpkinEnabled or fastFarmEnabled or cocoaTick do
+        while enabled or bestAreaEnabled or pumpkinEnabled or fastFarmEnabled or rebirthEnabled or cocoaTick or huntTick do
             local character = player.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             local root = humanoid and humanoid.RootPart
@@ -512,6 +586,16 @@ local function startWorker()
             if not inEvent or not (enabled or fastFarmEnabled) then clearFarmTargets(state) end
             if root and humanoid.Health > 0 then
                 if inEvent then
+                    local rebirthOk, hold = pcall(autoRebirthStep, state)
+                    if not rebirthOk then
+                        rebirthWaiting = false
+                        state.nextRebirth = os.clock() + 5
+                        if hold ~= state.rebirthError then warn("[Auto Rebirth Event] " .. tostring(hold)) end
+                        state.rebirthError = hold
+                    elseif hold then
+                        task.wait(scanInterval)
+                        continue
+                    end
                     if cocoaTick then
                         cocoaTick(character, humanoid, root)
                         if player.Character ~= character or humanoid.Health <= 0 or not isInEvent() then
@@ -519,6 +603,7 @@ local function startWorker()
                             continue
                         end
                     end
+                    if huntTick then huntTick(root) end
                     local pumpkin = pumpkinEnabled and findPumpkin(root.Position)
                     if pumpkin then
                         clearFarmTargets(state)
@@ -551,6 +636,182 @@ features.EventTeleToBestArea = {
     end,
 }
 
+-- Toggle riêng; không tự bật mở map/farm và không tự vào event.
+features.EventAutoRebirth = {
+    duy = function(on)
+        if not rebirthController.active then return end
+        rebirthEnabled = on == true
+        if rebirthEnabled then startWorker() else rebirthWaiting = false end
+    end,
+}
+
+-- Auto Hunt Pet riêng: ném vợt từng lượt, tùy chọn chỉ nằm trong launcher.
+do
+    local huntUtil = require(library.Util.PumpkinTycoonHunt)
+    local wildUtil = require(library.Util.PumpkinTycoonWild)
+    local wildTypes = require(library.Types.PumpkinTycoon.Wild)
+    local miscItem = require(library.Items.MiscItem)
+    local flags = require(library.Universal.FFlags)
+    local env = type(getgenv) == "function" and getgenv() or _G
+    local previous = env.RobloxHubEventHunt
+    if type(previous) == "table" and type(previous.stop) == "function" then previous.stop() end
+    local session = type(previous) == "table" and type(previous.session) == "table" and previous.session or {}
+    local controller = {active = true, enabled = false, session = session}
+    local rules = huntUtil.Default()
+    local variants = {}
+    local species = {}
+    local lastError
+    local minNames = {any=0, common=0, uncommon=1, rare=2, epic=3, huge=4}
+    local validVariants = {normal=true,golden=true,rainbow=true,shiny=true,shinygolden=true,shinyrainbow=true}
+
+    local function variantName(value)
+        local name = tostring(value):lower():gsub("[%s_%-]", "")
+        if name == "gold" then name = "golden" end
+        if name == "goldshiny" or name == "goldenshiny" then name = "shinygolden" end
+        if name == "rainbowshiny" then name = "shinyrainbow" end
+        return name
+    end
+
+    local function configure(config)
+        config = config or {}
+        assert(type(config) == "table", "eventHunt phải là bảng")
+        local minimum = config.minRarity
+        if minimum == nil then minimum = config.Min or 0 end
+        if type(minimum) == "string" then minimum = minNames[minimum:lower():gsub("[%s+]", "")] end
+        assert(type(minimum) == "number" and minimum >= 0 and minimum <= 4 and minimum % 1 == 0,
+            "eventHunt.minRarity: Any/Common/Uncommon/Rare/Epic/Huge hoặc 0..4")
+        local only = config.onlyVariants
+        if only == nil then only = config.Variant end
+        local ultra = config.ultraOnHuge
+        if ultra == nil then ultra = config.UltraOnHuge end
+        assert(only == nil or type(only) == "boolean", "onlyVariants cần true/false")
+        assert(ultra == nil or type(ultra) == "boolean", "ultraOnHuge cần true/false")
+        local selected = config.rarities or {}
+        if type(selected) == "string" then selected = selected == "" and {} or {selected} end
+        assert(type(selected) == "table", "eventHunt.rarities cần chuỗi hoặc danh sách")
+        local whitelist = {}
+        for _, value in ipairs(selected) do
+            local name = variantName(value)
+            assert(validVariants[name], "Biến thể không hợp lệ: " .. tostring(value))
+            whitelist[name] = true
+        end
+        rules = huntUtil.Clean({On=true,Min=minimum,Variant=only==true,UltraOnHuge=ultra~=false})
+        variants = whitelist
+    end
+
+    local function matchesVariant(entry)
+        local name = entry.R == true and "rainbow" or entry.G == true and "golden" or "normal"
+        if entry.S == true then name = name == "normal" and "shiny" or "shiny" .. name end
+        return not next(variants) or variants[name] == true
+    end
+
+    local function metadata(entry)
+        local zone = entry.Z
+        if not species[zone] then
+            local byPet = {}
+            for _, row in ipairs(wildTypes.Species(zone)) do byPet[row.PetId] = row end
+            species[zone] = byPet
+        end
+        return species[zone][entry.P]
+    end
+
+    local function step(root)
+        if not controller.active or not controller.enabled or session.inFlight or rebirthWaiting
+            or not isInEvent() or not tycoon.Part2() or not tycoon.OwnPlotPart2() or not wildUtil.Enabled() then return end
+        local plot = tycoon.Feature("Island").Plot()
+        local model = plot and not plot:IsDestroyed() and plot:GetModel()
+        if not model or plot:GetOwner() ~= player or not root or not root.Parent then return end
+        local cf, size = model:GetBoundingBox()
+        if not tycoonTypes.OnIsland(cf, size, root.Position) then return end
+
+        -- Chỉ tắt On; giữ nguyên bộ lọc native, chờ save xác nhận trước khi ném.
+        local native = tycoon.Feature("Hunt")
+        local saved = plot:Save(tycoonTypes.VAR.Hunt)
+        if (type(saved) == "table" and saved.On == true) or native.Saved().On or native.On() then
+            if os.clock() >= (session.nextDisable or 0) then
+                session.nextDisable = os.clock() + 3
+                native.Set({On=false})
+            end
+            return
+        end
+        if os.clock() < (session.nextThrow or 0) then return end
+        local netCount = miscItem(wildTypes.NET_ORDER[1]):CountExact()
+        local ultraCount = miscItem(wildTypes.NET_ORDER[2]):CountExact()
+        if netCount <= 0 and ultraCount <= 0 then return end
+        local reach = flags.Get(flags.Keys.PumpkinTycoon_ThrowReach)
+        if type(reach) ~= "number" or reach <= 0 then reach = 150 end
+        local range = math.min(huntUtil.Range(), reach)
+        local wild = tycoon.Feature("Wild")
+        local owned = plot:Save(tycoonTypes.VAR.Buttons)
+        local candidates = {}
+        for slot, physical in pairs(wild.All()) do
+            local entry = physical.Entry
+            local part = physical.CustomPet and physical.CustomPet.primaryPart
+            local zone = type(entry) == "table" and tycoonTypes.ZONES[entry.Z]
+            if type(slot) == "number" and zone and part and part.Parent
+                and not physical.Catching and not physical.AttemptingCatch
+                and buttons.Owned(owned, zone.Section .. "_Zone")
+                and (part.Position - root.Position).Magnitude <= range and matchesVariant(entry) then
+                local row = metadata(entry)
+                if row and not (row.Huge and wildUtil.SoldOut(entry.P)) then
+                    candidates[#candidates+1] = {slot=slot,entry=entry,tier=row.Tier or 0,huge=row.Huge==true,physical=physical}
+                end
+            end
+        end
+        local target, net = huntUtil.Pick(rules, candidates, netCount, ultraCount)
+        if not target then return end
+        local physical = wild.Physical(target.slot)
+        if not controller.active or not controller.enabled or physical ~= target.physical
+            or physical.Entry ~= target.entry or physical.Catching or physical.AttemptingCatch
+            or tycoon.Feature("Island").Plot() ~= plot or rebirthWaiting then return end
+
+        session.nextThrow = os.clock() + math.max(wildUtil.ThrowSeconds(), 0.5)
+        session.inFlight = true
+        physical.AttemptingCatch = true
+        local ok, accepted, reason, result = pcall(plot.Invoke, plot, tycoonTypes.NET.CatchWild, target.slot, net)
+        physical.AttemptingCatch = false
+        -- Có kết quả thật thì luôn hoàn tất hiển thị native, kể cả người dùng vừa tắt toggle.
+        if ok and accepted == true and type(result) == "table" then
+            local rendered, problem = pcall(function()
+                local nets = tycoon.Feature("Nets")
+                if wild.Physical(target.slot) == physical and physical.Entry == target.entry then
+                    nets.Throw(target.slot, result)
+                elseif result.outcome ~= "soldout" then
+                    -- Slot đã thay pet do replication: không phát hoạt ảnh lên pet mới.
+                    nets.Play(nil, result)
+                end
+            end)
+            session.inFlight = false
+            session.nextThrow = os.clock() + math.max(wildUtil.ThrowSeconds(), 0.5)
+            if not rendered then error("Hoạt ảnh bắt pet: " .. tostring(problem)) end
+            lastError = nil
+        else
+            session.inFlight = false
+            session.nextThrow = os.clock() + math.max(wildUtil.ThrowSeconds(), 3)
+            error(tostring(ok and (reason or "Game từ chối lượt bắt.") or accepted))
+        end
+    end
+
+    local function tick(root)
+        local ok, problem = pcall(step, root)
+        if not ok and problem ~= lastError then warn("[Auto Hunt Pet] " .. tostring(problem)); lastError = problem end
+    end
+    controller.stop = function()
+        controller.active, controller.enabled = false, false
+        huntTick = nil
+    end
+    env.RobloxHubEventHunt = controller
+    features.EventAutoHuntPet = {
+        configure = configure,
+        duy = function(on)
+            if not controller.active then return end
+            controller.enabled = on == true
+            huntTick = controller.enabled and tick or nil
+            if controller.enabled then startWorker() end
+        end,
+    }
+end
+
 -- Quét riêng PumpkinTycoonPads để bỏ qua các nút thưởng trong PumpkinTycoonIslands.
 features.EventAutoOpenMap = {
     duy = function(on)
@@ -566,6 +827,7 @@ local pumpkinSettingsJob
 
 -- Dùng trạng thái đã lưu của game để chỉ gửi lệnh khi cần sửa.
 local function syncPumpkinSettings(state)
+    if rebirthWaiting then return end
     local island = tycoon.Feature("Island")
     local plot = island.Plot()
     if not plot then return end
@@ -972,7 +1234,7 @@ do
 
     -- Tìm một cấp đã chọn mà ví Pumpkin Tokens trả được.
     local function upgradeOne()
-        if not isInEvent() or not next(selected) then return end
+        if rebirthWaiting or not isInEvent() or not next(selected) then return end
         local upgrades = tycoon.Feature("Upgrades")
         if not upgrades.Enabled() or not upgrades.Unlocked() then return end
         local plot = tycoon.Feature("Island").Plot()
