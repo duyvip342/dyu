@@ -11,6 +11,22 @@ return function(window)
     local function record(id)
         return assert(records[id], "Không có control: " .. tostring(id))
     end
+    -- Native game UI previews can register controls without creating a Rayfield tab.
+    function api:Register(id, kind, control, callback, metadata)
+        assert(type(id) == "string" and not records[id], "Trùng/sai flag control: " .. tostring(id))
+        assert(kind == "toggle" or kind == "input" or kind == "dropdown" or kind == "button", "Loại control chưa hỗ trợ")
+        metadata = metadata or {}
+        records[id] = {kind=kind, control=control, callback=callback,
+            name=metadata.name or id, tab=metadata.tab or "external"}
+        order[#order+1] = id
+        return control
+    end
+    function api:Unregister(id)
+        if not records[id] then return end
+        records[id] = nil
+        local index = table.find(order, id)
+        if index then table.remove(order, index) end
+    end
     function api:Get(id)
         return copy(record(id).control.value)
     end
@@ -82,14 +98,14 @@ return function(window)
         end
     end
     function api:WrapTab(tab, tabName)
-        local quick = tab:CreateGroup({ direction = "column" })
-        quick:CreateSection({ name = "Bật / tắt" })
-        local details = tab:CreateGroup({ direction = "column" })
-        details:CreateSection({ name = "Cấu hình / danh sách" })
+        -- Dùng chung một luồng dọc trên Tab để giữ đúng thứ tự Create... .
+        -- Group của Rayfield thiếu CreateInput; tách control sang nhiều parent
+        -- khiến section đứng sai chỗ. Group qua registry là nhóm logic, không
+        -- tạo thêm parent/column và không tự gom toggle lên đầu.
         local function wrap(container)
             return setmetatable({}, { __index = function(_, method)
                 if method == "CreateGroup" then
-                    return function(_, props) return wrap(container:CreateGroup(props)) end
+                    return function(_, _props) return wrap(container) end
                 end
                 local kinds = { CreateToggle = "toggle", CreateInput = "input", CreateDropdown = "dropdown", CreateButton = "button" }
                 local kind = kinds[method]
@@ -99,13 +115,8 @@ return function(window)
                         for key, value in pairs(props) do options[key] = value end
                         local id = props.flag or (tabName .. "/" .. props.name)
                         assert(not records[id], "Trùng flag control: " .. id)
-                        local target = kind == "toggle" and quick or container
-                        -- Rayfield Gen2 không có CreateInput trên Group; đặt input ở Tab.
-                        if type(target[method]) ~= "function" then target = tab end
-                        local control = target[method](target, options)
-                        records[id] = { kind = kind, control = control, callback = props.callback,
-                            name = props.name, tab = tabName }
-                        order[#order + 1] = id
+                        local control = container[method](container, options)
+                        api:Register(id, kind, control, props.callback, {name=props.name, tab=tabName})
                         return control
                     end
                 end
@@ -115,7 +126,7 @@ return function(window)
                 return container[method]
             end })
         end
-        return wrap(details)
+        return wrap(tab)
     end
     return api
 end
