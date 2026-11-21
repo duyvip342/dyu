@@ -51,6 +51,7 @@ rebirthEnvironment.RobloxHubEventRebirth = rebirthController
 local workerRunning = false
 local cocoaTick
 local huntTick
+local buyTick
 local generation = 0
 
 -- Giới hạn khu đang hoạt động; quyền sở hữu từng khu vẫn do Buttons quyết định.
@@ -508,6 +509,8 @@ local function attackPumpkin(target, character, humanoid, root)
         petCmds.EquipBest()
         while pumpkinEnabled and isInEvent() and player.Character == character
             and humanoid.Health > 0 and root.Parent == character and not readyRebirthPlot() do
+            if buyTick then buyTick(character, humanoid, root) end
+            if player.Character ~= character or humanoid.Health <= 0 or not isInEvent() then break end
             if huntTick then huntTick(root) end
             local breaker = breakables.Get(target.uid)
             if not breaker or breaker.health <= 0 or not breaker.model or not breaker.model.Parent then break end
@@ -578,7 +581,7 @@ local function startWorker()
             nextHatch = 0,
         }
         local nextEntryAt = 0
-        while enabled or bestAreaEnabled or pumpkinEnabled or fastFarmEnabled or rebirthEnabled or cocoaTick or huntTick do
+        while enabled or bestAreaEnabled or pumpkinEnabled or fastFarmEnabled or rebirthEnabled or cocoaTick or huntTick or buyTick do
             local character = player.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             local root = humanoid and humanoid.RootPart
@@ -593,6 +596,11 @@ local function startWorker()
                         if hold ~= state.rebirthError then warn("[Auto Rebirth Event] " .. tostring(hold)) end
                         state.rebirthError = hold
                     elseif hold then
+                        task.wait(scanInterval)
+                        continue
+                    end
+                    if buyTick then buyTick(character, humanoid, root) end
+                    if player.Character ~= character or humanoid.Health <= 0 or not isInEvent() then
                         task.wait(scanInterval)
                         continue
                     end
@@ -902,7 +910,7 @@ do
     local session = type(previous) == "table" and type(previous.session) == "table" and previous.session or {}
     local controller = {active = true, session = session}
     local buying = false
-    local buyJob
+    local nextCheckAt = 0
     local nextKind = "nets"
     local lastError
 
@@ -926,6 +934,69 @@ do
         return accepted == true
     end
 
+
+    -- Chỉ mở chuỗi tiên quyết của đúng quầy; không tự nhận thưởng/rebirth.
+    local function unlockShop(id, character, humanoid, root)
+        local owned = tycoon.Feature("Buttons").State()
+        if type(owned) ~= "table" then return false, 2 end
+        local seen = {}
+        local function missing(key)
+            if buttons.Owned(owned, key) or seen[key] then return end
+            seen[key] = true
+            local definition = buttons.Get(key)
+            if not definition then return end
+            for _, prerequisite in ipairs(definition.Required or {}) do
+                if not buttons.Owned(owned, prerequisite) then return missing(prerequisite) end
+            end
+            if buttons.CanBuy(owned, key, lastEventZone(), tycoon.Part2()) then return key end
+        end
+        local key = missing(id)
+        local folder = workspace:FindFirstChild("PumpkinTycoonPads")
+        local pad = key and folder and folder:FindFirstChild(key)
+        if not pad or not active() then return false, 2 end
+        local delay = pressPad(folder, pad, character, humanoid, root, generation)
+        return delay ~= nil, delay or 2
+    end
+
+    -- Điều phối chung giữ các tính năng di chuyển khác chờ tới khi mua xong.
+    local function visitShop(plot, machine, character, humanoid, root, action)
+        local model = plot:GetModel()
+        local pad = model and buttons.MachinePad(model, machine)
+        if not pad or not pad.Parent then return false, 2 end
+        local function valid()
+            return active() and player.Character == character and humanoid.Health > 0
+                and root.Parent == character and tycoon.Feature("Island").Plot() == plot
+                and plot:GetModel() == model and model.Parent ~= nil and pad.Parent ~= nil
+        end
+        if not valid() then return false, 2 end
+        local original = character:GetPivot()
+        local offset = root.CFrame:ToObjectSpace(original)
+        local height = root.Size.Y / 2 + humanoid.HipHeight + pad.Size.Y / 2 + 0.5
+        local leg = humanoid.RigType == Enum.HumanoidRigType.R6 and character:FindFirstChild("Left Leg")
+        if leg then height += leg.Size.Y end
+        session.inFlight = true
+        local ok, attempted, delay = pcall(function()
+            root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+            character:PivotTo(CFrame.new(pad.Position + Vector3.new(0, height, 0)) * root.CFrame.Rotation * offset)
+            task.wait(0.35)
+            if not valid() or not buttons.AtPad(pad, root.Position, 12) then return false, 2 end
+            return action()
+        end)
+        -- Kể cả vừa tắt nút vẫn trả về, nhưng controller cũ không dịch chuyển bản chạy mới.
+        local restored, restoreError = pcall(function()
+            if controller.active and isInEvent() and not rebirthWaiting
+                and player.Character == character and humanoid.Health > 0 and root.Parent == character
+                and tycoon.Feature("Island").Plot() == plot and plot:GetModel() == model and model.Parent then
+                root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+                character:PivotTo(original)
+            end
+        end)
+        session.inFlight = false
+        if not restored then warn("[Auto Buy Pumpkin/Net] Trả vị trí: " .. tostring(restoreError)) end
+        if not ok then error(attempted) end
+        return attempted, delay
+    end
+
     -- Chọn cấp bí ngô cao nhất còn hàng và đủ xu.
     local function chooseBand(items, coins)
         local config = merchantData.Config()
@@ -936,9 +1007,10 @@ do
         end
     end
 
-    local function buyPumpkin()
+    local function buyPumpkin(character, humanoid, root, arrived)
         local merchant = tycoon.Feature("Merchant")
-        if not merchant.Enabled() or not merchant.Unlocked() then return false, 2 end
+        if not merchant.Enabled() then return false, 2 end
+        if not merchant.Unlocked() then return unlockShop(merchantData.BUTTON, character, humanoid, root) end
         local island = tycoon.Feature("Island")
         local plot = island.Plot()
         if not plot then return false, 2 end
@@ -949,14 +1021,20 @@ do
         if not offers or type(coins) ~= "number" then return false, 2 end
         local band = chooseBand(offers.Items, coins)
         if not band or not active() or island.Plot() ~= plot then return false, 2 end
+        if not arrived then
+            return visitShop(plot, merchantData.MACHINE, character, humanoid, root, function()
+                return buyPumpkin(character, humanoid, root, true)
+            end)
+        end
         local success = purchase(function() return plot:Invoke(merchantData.VERB_BUY, band) end)
         return true, success and 1 or 3
     end
 
-    local function buyPetNet()
+    local function buyPetNet(character, humanoid, root, arrived)
         if not tycoon.Part2() or not tycoon.OwnPlotPart2() then return false, 2 end
         local store = tycoon.Feature("Store")
-        if not store.TabOpen() or store.AutoOn() then return false, 2 end
+        if not store.TabOpen() then return unlockShop("PetNetStore", character, humanoid, root) end
+        if store.AutoOn() then return false, 2 end
         local island = tycoon.Feature("Island")
         local plot = island.Plot()
         local shelf = store.Shelf()
@@ -980,6 +1058,11 @@ do
             if selected then break end
         end
         if not selected or not active() or island.Plot() ~= plot then return false, 2 end
+        if not arrived then
+            return visitShop(plot, netStoreData.MERCHANT, character, humanoid, root, function()
+                return buyPetNet(character, humanoid, root, true)
+            end)
+        end
         -- Shelf seed/slot là dữ liệu quầy native, không dùng vị trí dòng đã gộp trên UI.
         local selectedSeed, selectedSlot, selectedLeft = shelf.seed, selected.slot, selected.left
         local purchased = session.purchased
@@ -991,7 +1074,7 @@ do
     end
 
     -- Luân phiên để cả kho bí ngô lẫn vợt đều được xét; nhóm không mua được không chặn nhóm kia.
-    local function buySupplies()
+    local function buySupplies(character, humanoid, root)
         if not active() or session.inFlight then return 2 end
         local first, second
         if nextKind == "nets" then
@@ -1001,28 +1084,29 @@ do
             nextKind = "nets"
             first, second = buyPumpkin, buyPetNet
         end
-        local attempted, delay = first()
-        if not attempted and active() then attempted, delay = second() end
+        local attempted, delay = first(character, humanoid, root)
+        if not attempted and active() then attempted, delay = second(character, humanoid, root) end
         return delay or 2
     end
 
     controller.stop = function()
         controller.active, buying = false, false
+        buyTick = nil
     end
     env.RobloxHubEventBuy = controller
     features.EventAutoBuyPumpkin = {
         duy = function(on)
             if not controller.active then return end
             buying = on == true
-            if not buying or buyJob then return end
-            buyJob = task.defer(function()
-                while buying and controller.active do
-                    local ok, delay = pcall(buySupplies)
-                    if not ok and delay ~= lastError then warn("[Auto Buy Pumpkin/Net] " .. tostring(delay)); lastError = delay end
-                    task.wait(ok and delay or 3)
-                end
-                buyJob = nil
-            end)
+            if not buying then buyTick = nil; return end
+            buyTick = function(character, humanoid, root)
+                if not active() or os.clock() < nextCheckAt then return end
+                nextCheckAt = os.clock() + 2
+                local ok, delay = pcall(buySupplies, character, humanoid, root)
+                if not ok and delay ~= lastError then warn("[Auto Buy Pumpkin/Net] " .. tostring(delay)); lastError = delay end
+                nextCheckAt = os.clock() + (ok and delay or 3)
+            end
+            startWorker()
         end,
     }
 end
