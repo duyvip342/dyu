@@ -166,6 +166,13 @@ if launchConfig and type(launchConfig.lists) == "table" then
     end
 end
 
+-- Auto Hunt chỉ có một toggle UI; các bộ lọc đọc từ launcher.
+if features.EventAutoHuntPet then
+    features.EventAutoHuntPet.configure(launchConfig and launchConfig.eventHunt)
+elseif launchConfig and launchConfig.eventHunt then
+    error("event.lua chưa hỗ trợ eventHunt; cần cập nhật module cùng UI")
+end
+
 -- 3. Tạo cửa sổ và các tab
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
 
@@ -409,6 +416,8 @@ end
 -- ============================================================================
 do
     createToggle(event, "auto open map event", "EventAutoOpenMap")
+    createToggle(event, "Auto Rebirth Event (100%)", "EventAutoRebirth")
+    createToggle(event, "Auto Hunt Pet", "EventAutoHuntPet")
     createToggle(event, "auto pumpkin", "EventAutoPumpkin")
     createToggle(event, "auto buy pumkin", "EventAutoBuyPumpkin")
     createToggle(event, "Auto Hot Coca", "EventAutoHotCoca")
