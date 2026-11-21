@@ -1347,10 +1347,13 @@ do
     local save = require(client.Save)
     local directory = require(library.Directory).Consumables
     local catalog = {
+        { name = "Patch Coin Boost III", id = "Patch Coin Boost", family = "Coins", tier = 3 },
         { name = "Patch Coin Boost II", id = "Patch Coin Boost", family = "Coins", tier = 2 },
         { name = "Patch Coin Boost I", id = "Patch Coin Boost", family = "Coins", tier = 1 },
+        { name = "Pumpkin Damage Boost III", id = "Pumpkin Damage Boost", family = "Damage", tier = 3 },
         { name = "Pumpkin Damage Boost II", id = "Pumpkin Damage Boost", family = "Damage", tier = 2 },
         { name = "Pumpkin Damage Boost I", id = "Pumpkin Damage Boost", family = "Damage", tier = 1 },
+        { name = "Island Luck Boost III", id = "Island Luck Boost", family = "IslandLuck", tier = 3 },
         { name = "Island Luck Boost II", id = "Island Luck Boost", family = "IslandLuck", tier = 2 },
         { name = "Island Luck Boost I", id = "Island Luck Boost", family = "IslandLuck", tier = 1 },
     }
@@ -1365,6 +1368,7 @@ do
     local function findBoost(inventory, entry)
         for uid, item in pairs(inventory) do
             if item.id == entry.id and (not entry.tier or (item.tn or 1) == entry.tier)
+                and boostUtil.Allowed(player, item.tn or 1)
                 and not item._lk and (item._am or 1) > 0 then
                 return uid
             end
@@ -1374,7 +1378,7 @@ do
 
     -- Dùng một boost mỗi lượt sau khi kiểm tra điều kiện và hiệu ứng đang chạy.
     local function equipBoost()
-        if not isInEvent() or not boostUtil.Enabled(player) then return end
+        if rebirthWaiting or not isInEvent() or not boostUtil.Enabled(player) then return end
         local data = save.Get()
         local inventory = data and data.Inventory and data.Inventory.Consumable
         if not inventory then return end
@@ -1397,7 +1401,7 @@ do
         end
     end
 
-    -- Đọc tên cũ không có hậu tố như lựa chọn cả hai cấp.
+    -- Đọc tên không có hậu tố như lựa chọn mọi cấp trong catalog (III -> II -> I).
     local function resolveSelection(values)
         local names = {}
         if type(values) ~= "table" then return names end
