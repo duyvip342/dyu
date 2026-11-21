@@ -210,9 +210,156 @@ local function createToggle(tab, name, flag)
     return control
 end
 
--- 5. Cấu hình các tab
+-- 5. Hàm xử lý và dữ liệu dùng cho giao diện
+-- Phần này không khai báo control. Các lệnh Create... nằm ở mục 6 cuối file.
 
--- Setting / Khoảng thời gian chuyển server đông người.
+local function selectedOptions(options, preset)
+    local selected = {}
+    if type(preset) == "table" then
+        for _, name in ipairs(options) do
+            if table.find(preset, name) then table.insert(selected, name) end
+        end
+    end
+    return selected
+end
+
+local function setHopMinutes(value)
+    if not features.SettingsTimedHop.setMinutes(value) then
+        warn("[Timed Hop] Time phải lớn hơn 0 và không quá 10080 phút.")
+    end
+end
+
+local function resumeConfig()
+    if not launchConfig then return nil end
+    local timedHop = features.SettingsTimedHop
+    local httpService = game:GetService("HttpService")
+    local config = httpService:JSONDecode(httpService:JSONEncode(launchConfig))
+    config.toggles = type(config.toggles) == "table" and config.toggles or {}
+    for flag, value in pairs(runtimeToggles) do config.toggles[flag] = value end
+    config.controls = ui:Snapshot()
+    config.actions = nil -- Nút chỉ chạy khi được yêu cầu, không bấm lại sau hop.
+    config.settings = { time = timedHop.getMinutes(), visited = timedHop.getVisited() }
+    return config
+end
+
+-- Các callback giữ chung trạng thái với control được gắn ở phần TAB: mail.
+local function mailHandlers(gift)
+    local state = {}
+    function state.selectClass(class)
+        local changed = state.selectedClass ~= nil and state.selectedClass ~= class
+        state.selectedClass = class
+        if state.itemDropdown then
+            if changed then state.itemDropdown:Set("", true) end
+            state.itemDropdown:Refresh(gift.getNames(class))
+        end
+    end
+    function state.updateText()
+        local lines = {}
+        for _, rule in ipairs(gift.getList()) do
+            lines[#lines + 1] = ("%s, %s, %s, %s"):format(rule.class, rule.name, rule.amount, rule.keep)
+        end
+        state.text:Set(#lines > 0 and table.concat(lines, "\n") or "Danh sách gift: (trống)")
+    end
+    function state.add()
+        local added, reason = gift.add(state.selectedClass, state.itemDropdown.value[1], state.amount.value, state.keep.value)
+        if added then state.updateText() else warn("[Auto Gift] " .. reason) end
+    end
+    function state.removeLast()
+        gift.removeLast()
+        state.updateText()
+    end
+    function state.restore(preset, recipient)
+        if type(preset) ~= "table" then return end
+        gift.setRecipient(recipient)
+        for _, rule in ipairs(type(preset.items) == "table" and preset.items or {}) do
+            if type(rule) == "table" then
+                local added, reason = gift.add(rule.class, rule.name, tostring(rule.amount), tostring(rule.keep))
+                if not added then warn("[Auto Gift] " .. reason) end
+            end
+        end
+        state.updateText()
+    end
+    return state
+end
+
+-- Đọc kho ở luồng riêng để giữ quyền tạo UI của Rayfield.
+local function runInventoryAction(action, ...)
+    local result
+    task.spawn(function(...)
+        result = table.pack(pcall(action, ...))
+    end, ...)
+    while not result do task.wait() end
+    return table.unpack(result, 1, result.n)
+end
+
+local function enchantHandlers(feature)
+    local state = {}
+    local path = "RobloxHubEnchantList_" .. game:GetService("Players").LocalPlayer.UserId .. ".json"
+    local httpService = game:GetService("HttpService")
+    local function loadList()
+        if launchConfig then return type(launchConfig.enchants) == "table" and launchConfig.enchants or {} end
+        if type(readfile) ~= "function" then return {} end
+        if type(isfile) == "function" and not isfile(path) then return {} end
+        local ok, list = pcall(function() return httpService:JSONDecode(readfile(path)) end)
+        return ok and type(list) == "table" and list or {}
+    end
+    local function saveList()
+        if launchConfig then return end
+        local ok = pcall(function() writefile(path, httpService:JSONEncode(feature.getList())) end)
+        if not ok then warn("[Enchant UI] Không lưu được danh sách enchant vào config") end
+    end
+    function state.select(value) state.selected = value end
+    function state.updateText()
+        local list = feature.getList()
+        state.text:Set("enchant : " .. (#list > 0 and table.concat(list, ", ") or "(trống)"))
+    end
+    function state.restore()
+        local list = loadList()
+        if #list == 0 then return end
+        local ok, err = runInventoryAction(function()
+            for _, name in ipairs(list) do
+                if type(name) == "string" then feature.add(name) end
+            end
+        end)
+        if not ok then warn("[Enchant UI] " .. tostring(err)) end
+        state.updateText()
+    end
+    function state.add()
+        local name = state.selected or state.dropdown.value[1]
+        if name then
+            local ok, err = runInventoryAction(feature.add, name)
+            if not ok then warn("[Enchant UI] " .. tostring(err)) end
+            if ok and err then saveList() end
+        end
+        state.updateText()
+    end
+    function state.clear()
+        feature.clear()
+        saveList()
+        state.updateText()
+    end
+    return state
+end
+
+local function setGiftSelection(values)
+    local feature = features.AutoOpenGifts
+    if feature then feature.setSelection(values) end
+end
+
+-- ============================================================================
+-- 6. KHU VỰC TẠO CONTROL — THÊM NÚT MỚI TẠI TAB TƯƠNG ỨNG BÊN DƯỚI
+-- ============================================================================
+-- Toggle: createToggle(tab, "Tên hiển thị", "FlagTinhNang")
+--         Module phải có features.FlagTinhNang.duy(on, shared).
+-- Input / dropdown / button: tab:CreateInput / CreateDropdown / CreateButton.
+-- Luôn đặt flag riêng; tab đã wrap sẽ tự đăng ký vào RobloxHubUI.
+-- Giữ Class trước Item. Hàm xử lý dài đặt ở mục 5, callback gọi hàm đó.
+-- Thêm control trước mục 7 để controls/actions từ launcher tìm được nó.
+
+
+-- ============================================================================
+-- TAB: setting
+-- ============================================================================
 do
     local timedHop = features.SettingsTimedHop
     if timedHop then
@@ -224,20 +371,9 @@ do
             name = "Time (phút)",
             flag = "SettingsHopTime",
             value = tostring(timedHop.getMinutes()),
-            callback = function(value)
-                if not timedHop.setMinutes(value) then warn("[Timed Hop] Time phải lớn hơn 0 và không quá 10080 phút.") end
-            end,
+            callback = setHopMinutes,
         })
-        timedHop.setResumeConfig(function()
-            if not launchConfig then return nil end
-            local config = game:GetService("HttpService"):JSONDecode(game:GetService("HttpService"):JSONEncode(launchConfig))
-            config.toggles = type(config.toggles) == "table" and config.toggles or {}
-            for flag, value in pairs(runtimeToggles) do config.toggles[flag] = value end
-            config.controls = ui:Snapshot()
-            config.actions = nil -- Nút chỉ chạy khi được yêu cầu, không bấm lại sau hop.
-            config.settings = { time = timedHop.getMinutes(), visited = timedHop.getVisited() }
-            return config
-        end)
+        timedHop.setResumeConfig(resumeConfig)
         createToggle(setting, "Hop server đông người", "SettingsTimedHop")
         if timedHop.hopNow then
             setting:CreateButton({
@@ -249,7 +385,9 @@ do
     end
 end
 
--- Tạo toggle mở map event.
+-- ============================================================================
+-- TAB: Event
+-- ============================================================================
 do
     createToggle(event, "auto open map event", "EventAutoOpenMap")
     createToggle(event, "auto pumpkin", "EventAutoPumpkin")
@@ -296,13 +434,7 @@ do
     local upgrade = features.EventAutoPumpkinUpgrade
     if upgrade then
         local options = upgrade.getOptions()
-        local initial = {}
-        local preset = launchConfig and launchConfig.pumpkinUpgrades
-        if type(preset) == "table" then
-            for _, name in ipairs(options) do
-                if table.find(preset, name) then table.insert(initial, name) end
-            end
-        end
+        local initial = selectedOptions(options, launchConfig and launchConfig.pumpkinUpgrades)
         event:CreateDropdown({
             name = "Pumpkin Upgrades",
             flag = "EventPumpkinUpgradeSelection",
@@ -322,10 +454,8 @@ do
         local preset = launchConfig and launchConfig.boosts
         if boost.resolveSelection then
             initial = boost.resolveSelection(preset)
-        elseif type(preset) == "table" then
-            for _, name in ipairs(options) do
-                if table.find(preset, name) then table.insert(initial, name) end
-            end
+        else
+            initial = selectedOptions(options, preset)
         end
         event:CreateDropdown({
             name = "Boosts",
@@ -340,7 +470,9 @@ do
     end
 end
 
--- Tạo giao diện cho các tính năng farm.
+-- ============================================================================
+-- TAB: farm
+-- ============================================================================
 do
     -- Farm và di chuyển
     createToggle(farm, "inf pet speed", "FarmInfinityPetSpeed")
@@ -356,7 +488,9 @@ do
     createToggle(farm, "auto upd egg slot", "FarmAutoEggSlot")
 end
 
--- Tạo các toggle tối ưu hiển thị.
+-- ============================================================================
+-- TAB: optimize
+-- ============================================================================
 do
     optimize:CreateSection({ name = "Loot boxes" })
     createToggle(optimize, "disable loot boxes", "OptimizeDisableLootBoxes")
@@ -387,11 +521,14 @@ do
     createToggle(optimize, "Limit FPS", "OptimizeFpsLimit")
 end
 
--- Tạo giao diện nhận thư và cấu hình gửi quà.
+-- ============================================================================
+-- TAB: mail
+-- ============================================================================
 do
     createToggle(mail, "Tự nhận thư", "MailAutoClaim")
     local gift = features.MailAutoGift
     if not gift then return end
+    local handlers = mailHandlers(gift)
     local preset = launchConfig and launchConfig.mailGift
     local recipient = type(preset) == "table" and type(preset.recipient) == "string" and preset.recipient or ""
     mail:CreateInput({
@@ -402,83 +539,51 @@ do
         callback = gift.setRecipient,
     })
 
-    local selectedClass, itemDropdown
-    -- Đổi danh sách Item ID theo Class đang chọn.
-    local function selectClass(class)
-        local changed = selectedClass ~= nil and selectedClass ~= class
-        selectedClass = class
-        if itemDropdown then
-            if changed then itemDropdown:Set("", true) end
-            itemDropdown:Refresh(gift.getNames(class))
-        end
-    end
     mail:CreateDropdown({
         name = "Item Class",
         flag = "MailGiftClass",
         options = gift.getClasses(),
         multiSelect = false,
-        callback = selectClass,
+        callback = handlers.selectClass,
     })
-    itemDropdown = mail:CreateDropdown({
+    handlers.itemDropdown = mail:CreateDropdown({
         name = "Item ID",
         flag = "MailGiftItem",
         options = {},
         multiSelect = false,
     })
-    if selectedClass then selectClass(selectedClass) end
+    if handlers.selectedClass then handlers.selectClass(handlers.selectedClass) end
 
-    local amount = mail:CreateInput({
+    handlers.amount = mail:CreateInput({
         name = "Amount",
         flag = "MailGiftAmount",
         value = "",
         placeholder = "Ví dụ: 100k",
     })
-    local keep = mail:CreateInput({
+    handlers.keep = mail:CreateInput({
         name = "Keep",
         flag = "MailGiftKeep",
         value = "",
         placeholder = "Ví dụ: 10k hoặc 0",
     })
-    local giftText = mail:CreateText({ text = "Danh sách gift: (trống)" })
-    -- Hiện mỗi quy tắc gửi quà trên một dòng.
-    local function updateGiftText()
-        local lines = {}
-        for _, rule in ipairs(gift.getList()) do
-            lines[#lines + 1] = ("%s, %s, %s, %s"):format(rule.class, rule.name, rule.amount, rule.keep)
-        end
-        giftText:Set(#lines > 0 and table.concat(lines, "\n") or "Danh sách gift: (trống)")
-    end
+    handlers.text = mail:CreateText({ text = "Danh sách gift: (trống)" })
     mail:CreateButton({
         name = "Add Item",
         flag = "MailGiftAddItem",
-        callback = function()
-            local added, reason = gift.add(selectedClass, itemDropdown.value[1], amount.value, keep.value)
-            if added then updateGiftText() else warn("[Auto Gift] " .. reason) end
-        end,
+        callback = handlers.add,
     })
     mail:CreateButton({
         name = "Clear 1 Item",
         flag = "MailGiftRemoveLast",
-        callback = function()
-            gift.removeLast()
-            updateGiftText()
-        end,
+        callback = handlers.removeLast,
     })
-    -- Nạp người nhận và danh sách trước khi launcher bật Auto Gift.
-    if type(preset) == "table" then
-        gift.setRecipient(recipient)
-        for _, rule in ipairs(type(preset.items) == "table" and preset.items or {}) do
-            if type(rule) == "table" then
-                local added, reason = gift.add(rule.class, rule.name, tostring(rule.amount), tostring(rule.keep))
-                if not added then warn("[Auto Gift] " .. reason) end
-            end
-        end
-        updateGiftText()
-    end
+    handlers.restore(preset, recipient)
     createToggle(mail, "auto gift", "MailAutoGift")
 end
 
--- Tạo các nhóm giao diện giao dịch.
+-- ============================================================================
+-- TAB: trading
+-- ============================================================================
 do
     local boothSnipe = trading:CreateGroup({ direction = "column" })
     boothSnipe:CreateSection({ name = "Săn món ở gian hàng" })
@@ -524,7 +629,9 @@ do
     if features.TradingAutoSell then createToggle(trading, "Auto Sell", "TradingAutoSell") end
 end
 
--- Tạo giao diện cho các tính năng rank.
+-- ============================================================================
+-- TAB: rank
+-- ============================================================================
 do
     createToggle(rank, "auto claim rank reward", "RankAutoClaimReward")
     rank:CreateSection({ name = "auto quest" })
@@ -532,19 +639,16 @@ do
     createToggle(rank, "stats gui", "RankStatsGui")
 end
 
--- Tạo giao diện cấu hình webhook.
+-- ============================================================================
+-- TAB: webhook
+-- ============================================================================
 do
     -- Webhook chung: URL, loại thông báo và nút điều khiển.
     local petWebhook = features.WebhookEnabled
     local petPreset = launchConfig and type(launchConfig.petWebhook) == "table" and launchConfig.petWebhook or {}
     local initialPetUrl = type(petPreset.url) == "string" and petPreset.url or ""
     local petOptions = petWebhook and petWebhook.getOptions() or {}
-    local initialPetEvents = {}
-    if type(petPreset.events) == "table" then
-        for _, category in ipairs(petOptions) do
-            if table.find(petPreset.events, category) then table.insert(initialPetEvents, category) end
-        end
-    end
+    local initialPetEvents = selectedOptions(petOptions, petPreset.events)
     webhook:CreateSection({ name = "webhook" })
     webhook:CreateInput({
         name = "Webhook URL",
@@ -619,103 +723,41 @@ do
     })
 end
 
--- Tạo giao diện cho các tính năng tự động.
+-- ============================================================================
+-- TAB: automatic
+-- ============================================================================
 do
-    -- Danh sách Add Enchant không phải control có flag, nên lưu riêng theo tài khoản.
-    local enchantConfigPath = "RobloxHubEnchantList_" .. game:GetService("Players").LocalPlayer.UserId .. ".json"
-    local httpService = game:GetService("HttpService")
-
-    -- Đọc danh sách enchant đã lưu của tài khoản.
-    local function loadEnchantList()
-        if launchConfig then
-            return type(launchConfig.enchants) == "table" and launchConfig.enchants or {}
-        end
-        if type(readfile) ~= "function" then return {} end
-        if type(isfile) == "function" and not isfile(enchantConfigPath) then return {} end
-        local ok, list = pcall(function()
-            return httpService:JSONDecode(readfile(enchantConfigPath))
-        end)
-        return ok and type(list) == "table" and list or {}
-    end
-
-    -- Lưu thứ tự Add Enchant vào JSON cục bộ.
-    local function saveEnchantList(list)
-        if launchConfig then return end
-        local ok = pcall(function()
-            writefile(enchantConfigPath, httpService:JSONEncode(list))
-        end)
-        if not ok then warn("[Enchant UI] Không lưu được danh sách enchant vào config") end
-    end
-
-    -- Đọc kho ở luồng riêng để giữ quyền tạo UI của Rayfield.
-    local function runInventoryAction(action, ...)
-        local result
-        task.spawn(function(...)
-            result = table.pack(pcall(action, ...))
-        end, ...)
-        while not result do task.wait() end
-        return table.unpack(result, 1, result.n)
-    end
-
     -- Nhận quà online
     createToggle(automatic, "auto claim free gift", "AutoClaimFreeGift")
 
     -- Trang bị enchant
     automatic:CreateSection({ name = "Enchant" })
     local enchantFeature = features.AutoEquipEnchant
-    local selectedEnchant
+    local handlers = enchantHandlers(enchantFeature)
 
     local hasEnchantNames, enchantNames = runInventoryAction(enchantFeature.getNames)
     if not hasEnchantNames then
         warn("[Enchant UI] " .. tostring(enchantNames))
         enchantNames = {}
     end
-    local enchantDropdown = automatic:CreateDropdown({
+    handlers.dropdown = automatic:CreateDropdown({
         name = "Enchant",
         flag = "AutoEnchantSelection",
         multiSelect = false,
         options = enchantNames,
-        callback = function(value) selectedEnchant = value end,
+        callback = handlers.select,
     })
-    local enchantText = automatic:CreateText({ text = "enchant : (trống)" })
-    -- Hiện sách theo đúng thứ tự trong danh sách Add Enchant.
-    local function updateEnchantText()
-        local list = enchantFeature.getList()
-        enchantText:Set("enchant : " .. (#list > 0 and table.concat(list, ", ") or "(trống)"))
-    end
-
-    -- Khôi phục danh sách trước khi Rayfield có thể bật lại Auto Equip từ config.
-    local savedEnchants = loadEnchantList()
-    if #savedEnchants > 0 then
-        local ok, err = runInventoryAction(function()
-            for _, name in ipairs(savedEnchants) do
-                if type(name) == "string" then enchantFeature.add(name) end
-            end
-        end)
-        if not ok then warn("[Enchant UI] " .. tostring(err)) end
-        updateEnchantText()
-    end
+    handlers.text = automatic:CreateText({ text = "enchant : (trống)" })
+    handlers.restore()
     automatic:CreateButton({
         name = "add enchant",
         flag = "AutoEnchantAdd",
-        callback = function()
-            local name = selectedEnchant or enchantDropdown.value[1]
-            if name then
-                local ok, err = runInventoryAction(enchantFeature.add, name)
-                if not ok then warn("[Enchant UI] " .. tostring(err)) end
-                if ok and err then saveEnchantList(enchantFeature.getList()) end
-            end
-            updateEnchantText()
-        end,
+        callback = handlers.add,
     })
     automatic:CreateButton({
         name = "clear enchant",
         flag = "AutoEnchantClear",
-        callback = function()
-            enchantFeature.clear()
-            saveEnchantList(enchantFeature.getList())
-            updateEnchantText()
-        end,
+        callback = handlers.clear,
     })
     createToggle(automatic, "auto equip enchant", "AutoEquipEnchant")
 
@@ -739,12 +781,6 @@ do
             end
         end
     end
-    -- Chuyển các loại quà đã chọn sang module Automatic.
-    local function setGiftSelection(values)
-        local feature = features.AutoOpenGifts
-        if feature then feature.setSelection(values) end
-    end
-
     automatic:CreateDropdown({
         name = "Gifts",
         flag = "AutoOpenGiftTypes",
@@ -757,7 +793,9 @@ do
     createToggle(automatic, "auto open gifts", "AutoOpenGifts")
 end
 
--- 6. Áp dụng cấu hình khởi chạy
+-- ============================================================================
+-- 7. Áp dụng cấu hình sau khi tất cả control đã đăng ký
+-- ============================================================================
 -- Áp dụng các toggle được launcher đặt sẵn.
 if launchConfig then ui:Apply(launchConfig.controls, "values") end
 for _, start in ipairs(startupActions) do start() end
