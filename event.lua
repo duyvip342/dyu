@@ -52,6 +52,8 @@ local workerRunning = false
 local cocoaTick
 local huntTick
 local buyTick
+local turkeyTick, turkeyPending
+local turkeyEnabled = false
 local generation = 0
 
 -- Giới hạn khu đang hoạt động; quyền sở hữu từng khu vẫn do Buttons quyết định.
@@ -508,7 +510,8 @@ local function attackPumpkin(target, character, humanoid, root)
     local ok, err = pcall(function()
         petCmds.EquipBest()
         while pumpkinEnabled and isInEvent() and player.Character == character
-            and humanoid.Health > 0 and root.Parent == character and not readyRebirthPlot() do
+            and humanoid.Health > 0 and root.Parent == character and not readyRebirthPlot()
+            and not (turkeyPending and turkeyPending()) do
             if buyTick then buyTick(character, humanoid, root) end
             if player.Character ~= character or humanoid.Health <= 0 or not isInEvent() then break end
             if huntTick then huntTick(root) end
@@ -581,7 +584,7 @@ local function startWorker()
             nextHatch = 0,
         }
         local nextEntryAt = 0
-        while enabled or bestAreaEnabled or pumpkinEnabled or fastFarmEnabled or rebirthEnabled or cocoaTick or huntTick or buyTick do
+        while enabled or bestAreaEnabled or pumpkinEnabled or fastFarmEnabled or rebirthEnabled or cocoaTick or huntTick or buyTick or turkeyEnabled do
             local character = player.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             local root = humanoid and humanoid.RootPart
@@ -589,6 +592,16 @@ local function startWorker()
             if not inEvent or not (enabled or fastFarmEnabled) then clearFarmTargets(state) end
             if root and humanoid.Health > 0 then
                 if inEvent then
+                    if turkeyTick then
+                        local ok, handled = pcall(turkeyTick, state, character, humanoid, root)
+                        if not ok then
+                            if handled ~= state.turkeyError then warn("[Auto Turkey] " .. tostring(handled)) end
+                            state.turkeyError = handled
+                        elseif handled then
+                            task.wait(scanInterval)
+                            continue
+                        end
+                    end
                     local rebirthOk, hold = pcall(autoRebirthStep, state)
                     if not rebirthOk then
                         rebirthWaiting = false
@@ -652,6 +665,198 @@ features.EventAutoRebirth = {
         if rebirthEnabled then startWorker() else rebirthWaiting = false end
     end,
 }
+
+
+-- Auto Turkey / Độc quyền tác vụ cho tới khi boss chết hoặc biến mất.
+do
+    local turkeyData = require(library.Util.PumpkinTycoonTurkey)
+    local enchantCmds = require(client.EnchantCmds)
+    local env = type(getgenv) == "function" and getgenv() or _G
+    local previous = env.RobloxHubEventTurkey
+    if type(previous) == "table" and type(previous.stop) == "function" then previous.stop(true) end
+    local controller = {active = true, busy = false}
+    local sharedFeatures = features
+    local visit
+    local nextTryAt = 0
+
+    local function sharedModel()
+        local things = workspace:FindFirstChild("__THINGS")
+        local instances = things and things:FindFirstChild("Instances")
+        local instance = instances and instances:FindFirstChild(instanceId)
+        return instance and instance:FindFirstChild(tycoon.Feature("Island").SHARED_NAME)
+    end
+
+    local function live(shared)
+        if not shared or not shared.Parent then return false end
+        local health = shared:GetAttribute(turkeyData.ATTR.Health)
+        local endsAt = shared:GetAttribute(turkeyData.ATTR.EndsAt)
+        return shared:GetAttribute(turkeyData.ATTR.Alive) == true
+            and type(health) == "number" and health > 0
+            and (type(endsAt) ~= "number" or endsAt > workspace:GetServerTimeNow())
+    end
+
+    turkeyPending = function()
+        return controller.active and turkeyEnabled and not rebirthWaiting and isInEvent()
+            and tycoon.Part2() and tycoon.OwnPlotPart2() and turkeyData.Enabled()
+            and tycoon.Feature("Turkey").OwnsCannon() and live(sharedModel())
+            and os.clock() >= nextTryAt
+    end
+
+    local function gameplay(flag)
+        return flag ~= "EventAutoTurkey" and not flag:match("^Optimize")
+            and flag ~= "EventOptimize" and not flag:match("StatsGui$")
+            and not flag:find("Webhook", 1, true)
+    end
+
+    -- UI vẫn giữ lựa chọn của người dùng, worker thực tế tạm dừng.
+    local function pause(record)
+        local ui = env.RobloxHubUI
+        assert(ui and type(ui.Snapshot) == "function", "Chưa có registry UI để tạm dừng các tác vụ.")
+        record.paused = {}
+        controller.busy = true
+        for flag, on in pairs(ui:Snapshot()) do
+            local feature = sharedFeatures[flag]
+            if on == true and gameplay(flag) and feature and type(feature.duy) == "function" then
+                record.paused[flag] = true
+                feature.duy(false, sharedFeatures)
+            end
+        end
+    end
+
+    local function finish(reloading)
+        local record = visit
+        if not record then controller.busy = false; return end
+        visit = nil
+        local cleared, clearError = pcall(function()
+            for _, pet in pairs(playerPet.GetByPlayer(player) or {}) do
+                if pet.euid and pet:GetTargetType() == "Breakable" and record.targets[pet:GetTargetValue()] then
+                    pet:ClearTarget()
+                end
+            end
+        end)
+        if not cleared then warn("[Auto Turkey] Dọn mục tiêu: " .. tostring(clearError)) end
+        local ok, problem = pcall(function()
+            if isInEvent() and player.Character == record.character and record.humanoid.Health > 0
+                and record.root.Parent == record.character and tycoon.Feature("Island").Plot() == record.plot
+                and record.plot:GetModel() == record.model and record.model.Parent then
+                record.root.AssemblyLinearVelocity, record.root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+                record.character:PivotTo(record.original)
+            end
+        end)
+        controller.busy = false
+        if not ok then warn("[Auto Turkey] Trở về: " .. tostring(problem)) end
+        if not reloading then
+            for flag, on in pairs(record.paused or {}) do
+                if on and sharedFeatures[flag] then
+                    local resumed, err = pcall(sharedFeatures[flag].duy, true, sharedFeatures)
+                    if not resumed then warn("[Auto Turkey] Khôi phục " .. flag .. ": " .. tostring(err)) end
+                end
+            end
+        end
+    end
+
+    local function target()
+        local things = workspace:FindFirstChild("__THINGS")
+        local folder = things and things:FindFirstChild("Breakables")
+        for _, model in ipairs(folder and folder:GetChildren() or {}) do
+            local uid = model:GetAttribute("BreakableUID")
+            local data = uid and breakables.Get(uid)
+            if data and data.parentID == instanceId and data.clientAttributes
+                and data.clientAttributes.PumpkinTurkey == true
+                and data.health > 0 and not data.disableDamage and data.model and data.model.Parent then
+                return data
+            end
+        end
+    end
+
+    turkeyTick = function(state, character, humanoid, root)
+        if not turkeyPending() then return false end
+        local plot = tycoon.Feature("Island").Plot()
+        local model = plot and plot:GetModel()
+        local shared = sharedModel()
+        local arena = shared and shared:FindFirstChild("TurkeyArena", true)
+        local spawn = arena and arena:FindFirstChild("TurkeySpawn", true)
+        if not model or not spawn or not spawn:IsA("BasePart") then return false end
+        local record = {character=character, humanoid=humanoid, root=root, plot=plot, model=model,
+            original=character:GetPivot(), targets={}}
+        visit = record
+        local ok, problem = pcall(function()
+            pause(record)
+            clearFarmTargets(state)
+            -- Đợi các worker đã tắt thoát khỏi lượt đang thực hiện rồi mới rời đảo.
+            task.wait(0.35)
+            local missingSince
+            local nextAssign, nextTap = 0, 0
+            while controller.active and turkeyEnabled and isInEvent() and live(shared)
+                and player.Character == character and humanoid.Health > 0 and root.Parent == character
+                and tycoon.Feature("Island").Plot() == plot and plot:GetModel() == model do
+                local boss = target()
+                local position = boss and boss.position or spawn.Position
+                local flat = Vector3.new(root.Position.X-position.X, 0, root.Position.Z-position.Z)
+                local direction = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(1,0,0)
+                local height = root.Size.Y/2 + humanoid.HipHeight + 0.5
+                local leg = humanoid.RigType == Enum.HumanoidRigType.R6 and character:FindFirstChild("Left Leg")
+                if leg then height += leg.Size.Y end
+                if (root.Position-position).Magnitude > 28 then
+                    local offset = root.CFrame:ToObjectSpace(character:GetPivot())
+                    root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+                    character:PivotTo(CFrame.new(position + direction*22 + Vector3.new(0,height,0))
+                        * root.CFrame.Rotation * offset)
+                end
+                local now = os.clock()
+                if boss then
+                    missingSince = nil
+                    record.lastUid = boss.uid
+                    record.targets[boss.uid] = true
+                    if now >= nextAssign then
+                        local batch = {}
+                        for _, pet in pairs(playerPet.GetByPlayer(player) or {}) do
+                            if pet.euid then batch[pet.euid] = boss.uid end
+                        end
+                        if next(batch) then network.Fire("Breakables_JoinPetBulk", batch) end
+                        nextAssign = now + 1
+                    end
+                    if now >= nextTap then
+                        local power = enchantCmds.GetPower("Swift Taps")
+                        local taps = type(power) == "number" and power > 0 and math.min(8*(1+power/100),16) or 8
+                        nextTap = now + 1/taps
+                        network.UnreliableFire("Breakables_PlayerDealDamage", boss.uid)
+                    end
+                else
+                    local last = record.lastUid and breakables.Get(record.lastUid)
+                    if record.lastUid and (not last or last.health <= 0) then break end
+                    missingSince = missingSince or now
+                    if now-missingSince > 10 then break end
+                end
+                task.wait(0.05)
+            end
+        end)
+        finish(false)
+        nextTryAt = os.clock() + (ok and 1 or 5)
+        if not ok then warn("[Auto Turkey] " .. tostring(problem)) end
+        return true
+    end
+
+    controller.stop = function(reloading)
+        controller.active, turkeyEnabled = false, false
+        finish(reloading == true)
+    end
+    env.RobloxHubEventTurkey = controller
+    features.EventAutoTurkey = {
+        -- Lựa chọn bật/tắt mới trong khi đánh sẽ áp dụng khi trở về.
+        deferControl = function(flag, on)
+            if not controller.busy or not gameplay(flag) then return false end
+            if visit then visit.paused[flag] = on == true end
+            return true
+        end,
+        duy = function(on, shared)
+            if not controller.active then return end
+            if type(shared) == "table" then sharedFeatures = shared end
+            turkeyEnabled = on == true
+            if turkeyEnabled then startWorker() end
+        end,
+    }
+end
 
 -- Auto Hunt Pet riêng: ném vợt từng lượt, tùy chọn chỉ nằm trong launcher.
 do
