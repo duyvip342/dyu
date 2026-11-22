@@ -2139,6 +2139,8 @@ end
 -- Stats Event / Số dư, zone, kho bí ngô và pet trên nền đen.
 do
     local save = require(client.Save)
+    local leaderboard = require(client.LeaderboardCmds)
+    local contests = require(library.Util.PumpkinTycoonContests)
     local boostUtil = require(library.Util.PumpkinTycoonBoosts)
     local items = require(library.Items)
     local petDirectory = require(library.Directory.Pets)
@@ -2150,6 +2152,18 @@ do
     local onQuickClose
     local accent = Color3.fromRGB(255, 191, 105)
     local petRefreshInterval = 12
+
+    -- Hạng toàn cầu từ dữ liệu game đã nhận, không suy ra từ thứ tự trong server.
+    local function leaderboardText()
+        local board = leaderboard.Get(contests.BOARD_ID)
+        local own = type(board) == "table" and board.LocalPlayer
+        local rank = type(own) == "table" and tonumber(own.GlobalRank)
+        if rank and rank == rank and rank > 0 and rank < math.huge and rank % 1 == 0 then
+            return ("TOP BẮT PET · #%.0f"):format(rank)
+        end
+        if rank == 0 then return "TOP BẮT PET · Chưa xếp hạng" end
+        return "TOP BẮT PET · Đang cập nhật"
+    end
 
     -- Tổng rebirth của nhân vật từ save đảo; không đếm riêng phiên chạy script.
     local function rebirthText()
@@ -2348,8 +2362,18 @@ do
         zoneTextSize.Parent = zones
         local diamonds = balanceRow(content, "Diamonds", 0.30)
         local coins = balanceRow(content, "Pumpkin Coins", 0.44)
-        local uptime = label(content, UDim2.new(0.03, 0, 0, 58), UDim2.new(0.43, 0, 0, 40), Enum.TextXAlignment.Left, 14)
+        local uptime = label(content, UDim2.fromScale(0.03, 0.15), UDim2.fromScale(0.43, 0.045), Enum.TextXAlignment.Left, 14)
         uptime.Text = uptimeText()
+        uptime.TextScaled, uptime.TextWrapped = true, false
+        local uptimeSize = Instance.new("UITextSizeConstraint")
+        uptimeSize.MinTextSize, uptimeSize.MaxTextSize = 1, 14
+        uptimeSize.Parent = uptime
+        local top = label(content, UDim2.fromScale(0.03, 0.21), UDim2.fromScale(0.43, 0.075), Enum.TextXAlignment.Left, 26)
+        top.Text, top.TextColor3 = leaderboardText(), accent
+        top.TextScaled, top.TextWrapped = true, false
+        local topSize = Instance.new("UITextSizeConstraint")
+        topSize.MinTextSize, topSize.MaxTextSize = 1, 26
+        topSize.Parent = top
         local stock = label(content, UDim2.fromScale(0.49, 0.03), UDim2.fromScale(0.48, 0.26), Enum.TextXAlignment.Right, 14)
         stock.TextYAlignment = Enum.TextYAlignment.Top
         local title = label(content, UDim2.fromScale(0.49, 0.59), UDim2.fromScale(0.48, 0.045), Enum.TextXAlignment.Right, 14)
@@ -2370,6 +2394,7 @@ do
         local nextPetsAt = 0
         local function refresh()
             uptime.Text = uptimeText()
+            top.Text = leaderboardText()
             diamonds.Text = formatBalance(currency.Get("Diamonds"))
             coins.Text = formatBalance(currency.Get(tycoonTypes.COIN))
             local data = save.Get()
