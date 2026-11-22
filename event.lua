@@ -514,7 +514,9 @@ local function attackPumpkin(target, character, humanoid, root)
             and not (turkeyPending and turkeyPending()) do
             if buyTick then buyTick(character, humanoid, root) end
             if player.Character ~= character or humanoid.Health <= 0 or not isInEvent() then break end
-            if huntTick then huntTick(root) end
+            if huntTick then huntTick(character, humanoid, root) end
+            if player.Character ~= character or humanoid.Health <= 0 or not isInEvent()
+                or (turkeyPending and turkeyPending()) then break end
             local breaker = breakables.Get(target.uid)
             if not breaker or breaker.health <= 0 or not breaker.model or not breaker.model.Parent then break end
             if (root.Position - breaker.position).Magnitude > 8 then
@@ -624,7 +626,12 @@ local function startWorker()
                             continue
                         end
                     end
-                    if huntTick then huntTick(root) end
+                    if huntTick then huntTick(character, humanoid, root) end
+                    if player.Character ~= character or humanoid.Health <= 0 or not isInEvent()
+                        or (turkeyPending and turkeyPending()) or readyRebirthPlot() then
+                        task.wait(scanInterval)
+                        continue
+                    end
                     local pumpkin = pumpkinEnabled and findPumpkin(root.Position)
                     if pumpkin then
                         clearFarmTargets(state)
@@ -874,6 +881,9 @@ do
     local variants = {}
     local species = {}
     local lastError
+    local checkInterval
+    local visit
+    local finishPatrol
     local minNames = {any=0, common=0, uncommon=1, rare=2, epic=3, huge=4}
     local validVariants = {normal=true,golden=true,rainbow=true,shiny=true,shinygolden=true,shinyrainbow=true}
 
@@ -910,6 +920,11 @@ do
         end
         rules = huntUtil.Clean({On=true,Min=minimum,Variant=only==true,UltraOnHuge=ultra~=false})
         variants = whitelist
+        local interval = config.checkInterval
+        assert(interval == nil or (type(interval) == "number" and interval == interval
+            and interval >= 10 and interval < math.huge), "eventHunt.checkInterval cần số giây >= 10")
+        checkInterval = interval
+        session.nextPatrolAt = 0
     end
 
     local function matchesVariant(entry)
@@ -928,14 +943,14 @@ do
         return species[zone][entry.P]
     end
 
-    local function step(root)
+    local function step(root, visited)
         if not controller.active or not controller.enabled or session.inFlight or rebirthWaiting
-            or not isInEvent() or not tycoon.Part2() or not tycoon.OwnPlotPart2() or not wildUtil.Enabled() then return end
+            or not isInEvent() or not tycoon.Part2() or not tycoon.OwnPlotPart2() or not wildUtil.Enabled() then return "stop" end
         local plot = tycoon.Feature("Island").Plot()
         local model = plot and not plot:IsDestroyed() and plot:GetModel()
-        if not model or plot:GetOwner() ~= player or not root or not root.Parent then return end
+        if not model or plot:GetOwner() ~= player or not root or not root.Parent then return "stop" end
         local cf, size = model:GetBoundingBox()
-        if not tycoonTypes.OnIsland(cf, size, root.Position) then return end
+        if not tycoonTypes.OnIsland(cf, size, root.Position) then return "stop" end
 
         -- Chỉ tắt On; giữ nguyên bộ lọc native, chờ save xác nhận trước khi ném.
         local native = tycoon.Feature("Hunt")
@@ -945,12 +960,12 @@ do
                 session.nextDisable = os.clock() + 3
                 native.Set({On=false})
             end
-            return
+            return "wait"
         end
-        if os.clock() < (session.nextThrow or 0) then return end
+        if os.clock() < (session.nextThrow or 0) then return "wait" end
         local netCount = miscItem(wildTypes.NET_ORDER[1]):CountExact()
         local ultraCount = miscItem(wildTypes.NET_ORDER[2]):CountExact()
-        if netCount <= 0 and ultraCount <= 0 then return end
+        if netCount <= 0 and ultraCount <= 0 then return "noNets" end
         local reach = flags.Get(flags.Keys.PumpkinTycoon_ThrowReach)
         if type(reach) ~= "number" or reach <= 0 then reach = 150 end
         local range = math.min(huntUtil.Range(), reach)
@@ -961,7 +976,7 @@ do
             local entry = physical.Entry
             local part = physical.CustomPet and physical.CustomPet.primaryPart
             local zone = type(entry) == "table" and tycoonTypes.ZONES[entry.Z]
-            if type(slot) == "number" and zone and part and part.Parent
+            if type(slot) == "number" and not (visited and visited[slot]) and zone and part and part.Parent
                 and not physical.Catching and not physical.AttemptingCatch
                 and buttons.Owned(owned, zone.Section .. "_Zone")
                 and (part.Position - root.Position).Magnitude <= range and matchesVariant(entry) then
@@ -972,12 +987,13 @@ do
             end
         end
         local target, net = huntUtil.Pick(rules, candidates, netCount, ultraCount)
-        if not target then return end
+        if not target then return "empty" end
         local physical = wild.Physical(target.slot)
         if not controller.active or not controller.enabled or physical ~= target.physical
             or physical.Entry ~= target.entry or physical.Catching or physical.AttemptingCatch
-            or tycoon.Feature("Island").Plot() ~= plot or rebirthWaiting then return end
+            or tycoon.Feature("Island").Plot() ~= plot or rebirthWaiting then return "stop" end
 
+        if visited then visited[target.slot] = true end
         session.nextThrow = os.clock() + math.max(wildUtil.ThrowSeconds(), 0.5)
         session.inFlight = true
         physical.AttemptingCatch = true
@@ -998,6 +1014,7 @@ do
             session.nextThrow = os.clock() + math.max(wildUtil.ThrowSeconds(), 0.5)
             if not rendered then error("Hoạt ảnh bắt pet: " .. tostring(problem)) end
             lastError = nil
+            return "caught"
         else
             session.inFlight = false
             session.nextThrow = os.clock() + math.max(wildUtil.ThrowSeconds(), 3)
@@ -1005,12 +1022,150 @@ do
         end
     end
 
-    local function tick(root)
-        local ok, problem = pcall(step, root)
-        if not ok and problem ~= lastError then warn("[Auto Hunt Pet] " .. tostring(problem)); lastError = problem end
+
+    -- Đây là thời gian đổi pet trung bình, không phải giờ hồi chính xác của từng slot.
+    local function intervalSeconds()
+        local key = flags.Keys.PumpkinTycoon_WildRefreshSeconds
+        local refresh = key and flags.Get(key)
+        local known = type(refresh) == "number" and refresh == refresh and refresh >= 0 and refresh < math.huge
+        local interval = checkInterval or (known and refresh > 0 and math.max(30, refresh) or 180)
+        return interval, known and refresh or nil
+    end
+
+    -- Thu thập vùng của chính đảo, không lưu tọa độ cố định theo server.
+    local function collectPoints(wild, owned)
+        local reach = flags.Get(flags.Keys.PumpkinTycoon_ThrowReach)
+        if type(reach) ~= "number" or reach <= 0 then reach = 150 end
+        local range = math.max(1, math.min(huntUtil.Range(), reach))
+        local points, seen = {}, {}
+        for zone = 1, lastEventZone() do
+            local definition = tycoonTypes.ZONES[zone]
+            if buttons.Owned(owned, definition.Section .. "_Zone") then
+                for _, area in ipairs(wild.Areas(zone)) do
+                    if area:IsA("BasePart") and area.Parent and not seen[area] then
+                        seen[area] = true
+                        -- Vùng rộng chia nhiều điểm để góc xa vẫn nằm trong tầm ném.
+                        local nx = math.max(1, math.ceil(area.Size.X / (range * 1.2)))
+                        local nz = math.max(1, math.ceil(area.Size.Z / (range * 1.2)))
+                        for x = 1, nx do
+                            for z = 1, nz do
+                                points[#points+1] = {zone=zone, area=area, localPosition=Vector3.new(
+                                    ((x-0.5)/nx-0.5)*area.Size.X, area.Size.Y/2,
+                                    ((z-0.5)/nz-0.5)*area.Size.Z)}
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return points
+    end
+
+    finishPatrol = function(record)
+        if visit ~= record then return end
+        visit = nil
+        controller.patrolling = false
+        local ok, problem = pcall(function()
+            if controller.active and isInEvent() and player.Character == record.character
+                and record.humanoid.Health > 0 and record.root.Parent == record.character
+                and tycoon.Feature("Island").Plot() == record.plot and not record.plot:IsDestroyed()
+                and record.plot:GetModel() == record.model and record.model.Parent
+                and record.plot:Save(tycoonTypes.VAR.Rebirths) == record.rebirths then
+                record.root.AssemblyLinearVelocity, record.root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+                record.character:PivotTo(record.original)
+            end
+        end)
+        if not ok then warn("[Auto Hunt Pet] Trả vị trí: " .. tostring(problem)) end
+    end
+
+    local function patrol(character, humanoid, root)
+        local island = tycoon.Feature("Island")
+        local plot = island.Plot()
+        local model = plot and not plot:IsDestroyed() and plot:GetModel()
+        if not model or plot:GetOwner() ~= player then return end
+        if session.patrolPlot ~= plot or session.patrolModel ~= model then
+            session.patrolPlot, session.patrolModel, session.nextPatrolAt = plot, model, 0
+        end
+        if os.clock() < (session.nextPatrolAt or 0) then return step(root) end
+        if not controller.enabled or not controller.active or session.inFlight or rebirthWaiting
+            or not isInEvent() or not tycoon.Part2() or not tycoon.OwnPlotPart2() or not wildUtil.Enabled()
+            or not character or player.Character ~= character or humanoid.Health <= 0 or root.Parent ~= character
+            or (turkeyPending and turkeyPending()) or readyRebirthPlot() then return end
+        -- Hết vợt thì chờ mua, không đi vòng quanh vô ích.
+        if miscItem(wildTypes.NET_ORDER[1]):CountExact() <= 0
+            and miscItem(wildTypes.NET_ORDER[2]):CountExact() <= 0 then return end
+        local wild = tycoon.Feature("Wild")
+        local points = collectPoints(wild, plot:Save(tycoonTypes.VAR.Buttons))
+        local interval, refresh = intervalSeconds()
+        controller.patrolInfo = {points=points, refreshSeconds=refresh, interval=interval}
+        if #points == 0 then session.nextPatrolAt = os.clock()+15; return end
+        local record = {character=character, humanoid=humanoid, root=root, plot=plot, model=model,
+            original=character:GetPivot(), rebirths=plot:Save(tycoonTypes.VAR.Rebirths)}
+        visit, controller.patrolling = record, true
+        local visited = {}
+        local function valid()
+            return visit == record and controller.active and controller.enabled and not rebirthWaiting
+                and isInEvent() and player.Character == character and humanoid.Health > 0 and root.Parent == character
+                and island.Plot() == plot and not plot:IsDestroyed() and plot:GetModel() == model and model.Parent
+                and plot:Save(tycoonTypes.VAR.Rebirths) == record.rebirths and tycoon.OwnPlotPart2()
+                and not (turkeyPending and turkeyPending()) and not readyRebirthPlot()
+        end
+        local function waitFor(seconds)
+            local untilAt = os.clock()+seconds
+            repeat
+                if not valid() then return false end
+                task.wait(0.1)
+            until os.clock() >= untilAt
+            return valid()
+        end
+        local complete = true
+        local ok, problem = pcall(function()
+            for _, point in ipairs(points) do
+                if not valid() then complete=false; break end
+                if not point.area.Parent or not buttons.Owned(plot:Save(tycoonTypes.VAR.Buttons),
+                    tycoonTypes.ZONES[point.zone].Section .. "_Zone") then continue end
+                local floor = point.area.CFrame:PointToWorldSpace(point.localPosition)
+                local height = root.Size.Y/2 + humanoid.HipHeight + 0.5
+                local leg = humanoid.RigType == Enum.HumanoidRigType.R6 and character:FindFirstChild("Left Leg")
+                if leg then height += leg.Size.Y end
+                local offset = root.CFrame:ToObjectSpace(character:GetPivot())
+                root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+                character:PivotTo(CFrame.new(floor + Vector3.new(0,height,0))*root.CFrame.Rotation*offset)
+                if not waitFor(0.75) then complete=false; break end
+                local deadline = os.clock()+60
+                local emptyChecks = 0
+                while valid() and os.clock() < deadline do
+                    -- Mỗi slot chỉ một lần/chuyến, kể cả nó đổi pet ngay sau lượt ném.
+                    local caught, outcome = pcall(step, root, visited)
+                    if not caught then
+                        if outcome ~= lastError then warn("[Auto Hunt Pet] " .. tostring(outcome)); lastError=outcome end
+                        emptyChecks=0
+                    elseif outcome == "stop" or outcome == "noNets" then
+                        complete=false
+                        return
+                    elseif outcome == "empty" then
+                        emptyChecks+=1
+                        if emptyChecks >= 3 then break end
+                    else emptyChecks=0 end
+                    if not waitFor(0.25) then complete=false; return end
+                end
+            end
+            if not valid() then complete=false end
+        end)
+        finishPatrol(record)
+        -- Turkey/rebirth ngắt chuyến: thử lại sớm sau khi nhiệm vụ ưu tiên kết thúc.
+        session.nextPatrolAt = os.clock() + (ok and complete and interval or 5)
+        if not ok then error(problem) end
+    end
+
+    local function tick(character, humanoid, root)
+        local ok, problem = pcall(patrol, character, humanoid, root)
+        if not ok and problem ~= lastError then warn("[Auto Hunt Pet] " .. tostring(problem)); lastError=problem end
     end
     controller.stop = function()
-        controller.active, controller.enabled = false, false
+        controller.enabled = false
+        if visit then finishPatrol(visit) end
+        controller.active = false
         huntTick = nil
     end
     env.RobloxHubEventHunt = controller
