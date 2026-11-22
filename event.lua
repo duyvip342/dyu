@@ -681,7 +681,10 @@ do
     local env = type(getgenv) == "function" and getgenv() or _G
     local previous = env.RobloxHubEventTurkey
     if type(previous) == "table" and type(previous.stop) == "function" then previous.stop(true) end
-    local controller = {active = true, busy = false}
+    local session = type(previous) == "table" and type(previous.session) == "table" and previous.session or {}
+    local controller = {active = true, busy = false, session = session}
+    local http = game:GetService("HttpService")
+    local players = game:GetService("Players")
     local sharedFeatures = features
     local visit
     local nextTryAt = 0
@@ -702,11 +705,46 @@ do
             and (type(endsAt) ~= "number" or endsAt > workspace:GetServerTimeNow())
     end
 
+    local function encounterKey(shared)
+        local endsAt = shared:GetAttribute(turkeyData.ATTR.EndsAt)
+        local stamp = type(endsAt) == "number" and endsAt
+            or math.floor(workspace:GetServerTimeNow() / turkeyData.Period())
+        return tostring(game.JobId) .. ":" .. tostring(stamp)
+    end
+
+    local function skipped(shared)
+        local skip = session.skipped
+        return skip and skip.shared == shared and skip.key == encounterKey(shared)
+    end
+
+    -- Cùng dữ liệu JSON mà TurkeyBoard.Paint dùng: {username, share, DPS}.
+    local function hasPartner(shared)
+        local raw = shared:GetAttribute(turkeyData.ATTR.Top)
+        if type(raw) ~= "string" then return false end
+        local ok, rows = pcall(http.JSONDecode, http, raw)
+        if not ok or type(rows) ~= "table" then return false end
+        for _, row in pairs(rows) do
+            if type(row) == "table" and type(row[1]) == "string" and row[1] ~= player.Name
+                and type(row[3]) == "number" and row[3] > 0 and row[3] < math.huge
+                and players:FindFirstChild(row[1]) then return true end
+        end
+        return false
+    end
+
+    local function clearTurkeyTargets(record)
+        for _, pet in pairs(playerPet.GetByPlayer(player) or {}) do
+            if pet.euid and pet:GetTargetType() == "Breakable" and record.targets[pet:GetTargetValue()] then
+                pet:ClearTarget()
+            end
+        end
+    end
+
     turkeyPending = function()
-        return controller.active and turkeyEnabled and not rebirthWaiting and isInEvent()
+        if not (controller.active and turkeyEnabled and not rebirthWaiting and isInEvent()
             and tycoon.Part2() and tycoon.OwnPlotPart2() and turkeyData.Enabled()
-            and tycoon.Feature("Turkey").OwnsCannon() and live(sharedModel())
-            and os.clock() >= nextTryAt
+            and tycoon.Feature("Turkey").OwnsCannon() and os.clock() >= nextTryAt) then return false end
+        local shared = sharedModel()
+        return live(shared) and not skipped(shared)
     end
 
     local function gameplay(flag)
@@ -750,7 +788,7 @@ do
                 record.character:PivotTo(record.original)
             end
         end)
-        controller.busy = false
+        controller.busy, controller.waitingForPartner = false, false
         if not ok then warn("[Auto Turkey] Trở về: " .. tostring(problem)) end
         if not reloading then
             for flag, on in pairs(record.paused or {}) do
@@ -785,7 +823,7 @@ do
         local spawn = arena and arena:FindFirstChild("TurkeySpawn", true)
         if not model or not spawn or not spawn:IsA("BasePart") then return false end
         local record = {character=character, humanoid=humanoid, root=root, plot=plot, model=model,
-            original=character:GetPivot(), targets={}}
+            original=character:GetPivot(), targets={}, encounter=encounterKey(shared)}
         visit = record
         local ok, problem = pcall(function()
             pause(record)
@@ -794,9 +832,11 @@ do
             task.wait(0.35)
             local missingSince
             local nextAssign, nextTap = 0, 0
+            local nextBoardCheck, partner, aloneSince, waitingCleared = 0, false, nil, false
             while controller.active and turkeyEnabled and isInEvent() and live(shared)
                 and player.Character == character and humanoid.Health > 0 and root.Parent == character
                 and tycoon.Feature("Island").Plot() == plot and plot:GetModel() == model do
+                if encounterKey(shared) ~= record.encounter then break end
                 local boss = target()
                 local position = boss and boss.position or spawn.Position
                 local flat = Vector3.new(root.Position.X-position.X, 0, root.Position.Z-position.Z)
@@ -811,11 +851,30 @@ do
                         * root.CFrame.Rotation * offset)
                 end
                 local now = os.clock()
+                if now >= nextBoardCheck then
+                    partner = hasPartner(shared)
+                    nextBoardCheck = now + 0.5
+                end
+                controller.waitingForPartner = not partner
+                if partner then
+                    aloneSince = nil
+                    waitingCleared = false
+                else
+                    aloneSince = aloneSince or now
+                    if now - aloneSince >= 30 then
+                        session.skipped = {shared=shared, key=record.encounter}
+                        break
+                    end
+                end
                 if boss then
                     missingSince = nil
                     record.lastUid = boss.uid
                     record.targets[boss.uid] = true
-                    if now >= nextAssign then
+                    if not partner and not waitingCleared then
+                        clearTurkeyTargets(record)
+                        waitingCleared = true
+                    end
+                    if partner and now >= nextAssign then
                         local batch = {}
                         for _, pet in pairs(playerPet.GetByPlayer(player) or {}) do
                             if pet.euid then batch[pet.euid] = boss.uid end
@@ -823,7 +882,7 @@ do
                         if next(batch) then network.Fire("Breakables_JoinPetBulk", batch) end
                         nextAssign = now + 1
                     end
-                    if now >= nextTap then
+                    if partner and now >= nextTap then
                         local power = enchantCmds.GetPower("Swift Taps")
                         local taps = type(power) == "number" and power > 0 and math.min(8*(1+power/100),16) or 8
                         nextTap = now + 1/taps
@@ -832,8 +891,10 @@ do
                 else
                     local last = record.lastUid and breakables.Get(record.lastUid)
                     if record.lastUid and (not last or last.health <= 0) then break end
-                    missingSince = missingSince or now
-                    if now-missingSince > 10 then break end
+                    if partner then
+                        missingSince = missingSince or now
+                        if now-missingSince > 10 then break end
+                    else missingSince = nil end
                 end
                 task.wait(0.05)
             end
