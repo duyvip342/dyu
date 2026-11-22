@@ -1541,7 +1541,8 @@ do
     local runToken = {}
     environment.RobloxHubHotCocoaRun = runToken
     local offers = {}
-    local nextAxis = "Coins"
+    local axes = {"Coins", "Damage", "IslandLuck"}
+    local nextIndex = 1
     local enabled = false
     local nextCheckAt = 0
     local lastError
@@ -1551,9 +1552,9 @@ do
         return enabled and environment.RobloxHubHotCocoaRun == runToken
     end
 
-    -- Lấy đúng hai offer Coin và Island Luck từ cấu hình quầy.
+    -- Lấy đủ ba offer Coin, Damage và Island Luck từ cấu hình quầy.
     for _, offer in ipairs(cocoaData.OFFERS) do
-        if offer.Axis == "Coins" or offer.Axis == "IslandLuck" then
+        if offer.Axis == "Coins" or offer.Axis == "Damage" or offer.Axis == "IslandLuck" then
             offers[offer.Axis] = offer
         end
     end
@@ -1566,7 +1567,7 @@ do
         warn("[Auto Hot Coca] " .. reason)
     end
 
-    -- Xét timer riêng cho Coin và Island Luck khi số dư trên 40B.
+    -- Xét timer riêng cho cả ba nhóm khi số dư trên 40B.
     local function buyCocoa(character, humanoid, root)
         if not isActive() or not isInEvent() then return 5 end
         local cocoa = tycoon.Feature("Cocoa")
@@ -1576,12 +1577,16 @@ do
             reportFailure("Hot Cocoa Stand chưa mở hoặc chưa sẵn sàng.")
             return 5
         end
-        local offer = offers[nextAxis]
-        if not offer or boosts.GetTimer(offer.Id) ~= 0 then
-            local otherAxis = nextAxis == "Coins" and "IslandLuck" or "Coins"
-            offer = offers[otherAxis]
-            if not offer or boosts.GetTimer(offer.Id) ~= 0 then return 5 end
+        local offer, selectedIndex
+        for offset = 0, #axes-1 do
+            local index = (nextIndex+offset-1) % #axes + 1
+            local candidate = offers[axes[index]]
+            if candidate and boosts.GetTimer(candidate.Id) == 0 then
+                offer, selectedIndex = candidate, index
+                break
+            end
         end
+        if not offer then return 5 end
 
         local plot = tycoon.Feature("Island").Plot()
         if not plot then return 5 end
@@ -1620,7 +1625,7 @@ do
                 or tycoon.Feature("Island").Plot() ~= plot or not pad.Parent
                 or type(currentCoins) ~= "number" or not (currentCoins > minimumCoins)
                 or quote.cost > math.floor(currentCoins / 3) or boosts.GetTimer(offer.Id) ~= 0 then return end
-            nextAxis = offer.Axis == "Coins" and "IslandLuck" or "Coins"
+            nextIndex = selectedIndex % #axes + 1
             local bought, message = plot:Invoke(cocoaData.VERB_BUY, offer.Key, quote.seconds // 60)
             return bought == true, message
         end)
@@ -1925,7 +1930,7 @@ do
     }
 end
 
--- Auto Equip Boost / Dùng boost đã chọn khi hiệu ứng cũ hết.
+-- Auto Equip Boost / Dùng hết stack ở cấp cao nhất đã chọn, không chờ timer cũ hết.
 do
     local boostUtil = require(library.Util.PumpkinTycoonBoosts)
     local save = require(client.Save)
@@ -1941,49 +1946,101 @@ do
         { name = "Island Luck Boost II", id = "Island Luck Boost", family = "IslandLuck", tier = 2 },
         { name = "Island Luck Boost I", id = "Island Luck Boost", family = "IslandLuck", tier = 1 },
     }
-    local options, selected, retryAt = {}, {}, {}
-    local refreshAt = {}
+    local options, selected = {}, {}
+    local env = type(getgenv) == "function" and getgenv() or _G
+    local previous = env.RobloxHubEventBoost
+    if type(previous) == "table" and type(previous.stop) == "function" then previous.stop() end
+    local session = type(previous) == "table" and type(previous.session) == "table" and previous.session or {}
+    session.pending = session.pending or {}
+    session.retryAt = session.retryAt or {}
+    session.batchLimit = session.batchLimit or {}
+    local controller = {active=true, session=session}
     local enabled = false
     local job
-
+    local axes, nextIndex = {"Coins", "Damage", "IslandLuck"}, 1
     for _, entry in ipairs(catalog) do table.insert(options, entry.name) end
 
-    -- Tìm stack có đúng ID và cấp được chọn.
-    local function findBoost(inventory, entry)
-        for uid, item in pairs(inventory) do
-            if item.id == entry.id and (not entry.tier or (item.tn or 1) == entry.tier)
-                and boostUtil.Allowed(player, item.tn or 1)
-                and not item._lk and (item._am or 1) > 0 then
-                return uid
-            end
-        end
-        return nil
+    local function active()
+        return controller.active and enabled and not rebirthWaiting and isInEvent()
+            and boostUtil.Enabled(player)
     end
 
-    -- Dùng một boost mỗi lượt sau khi kiểm tra điều kiện và hiệu ứng đang chạy.
+    -- Cấp ghi rõ trong lựa chọn là ưu tiên bắt buộc; entry không cấp chọn cao nhất có thể dùng.
+    local function chooseBoost(inventory, family)
+        local wanted, wildcard = 0, false
+        for _, entry in ipairs(catalog) do
+            if selected[entry.name] and entry.family == family then
+                if entry.tier then wanted=math.max(wanted,entry.tier) else wildcard=true end
+            end
+        end
+        if wildcard then
+            for _, entry in ipairs(catalog) do
+                if selected[entry.name] and entry.family == family and not entry.tier then
+                    for _, item in pairs(inventory) do
+                        if item.id == entry.id and not item._lk and (item._am or 1)>0
+                            and boostUtil.Allowed(player,item.tn or 1) then
+                            wanted=math.max(wanted,item.tn or 1)
+                        end
+                    end
+                end
+            end
+        end
+        local bestUid, bestItem
+        for uid, item in pairs(inventory) do
+            if (item.tn or 1) ~= wanted or item._lk or (item._am or 1)<=0
+                or not boostUtil.Allowed(player,item.tn or 1) then continue end
+            for _, entry in ipairs(catalog) do
+                if selected[entry.name] and entry.family == family and entry.id == item.id
+                    and (not entry.tier or entry.tier == wanted) then
+                    local definition = directory[entry.id]
+                    if definition and (not definition.Requirement or definition.Requirement(player)) then
+                        if not bestUid or tostring(uid)<tostring(bestUid) then bestUid,bestItem=uid,item end
+                    end
+                end
+            end
+        end
+        return bestUid,bestItem
+    end
+
     local function equipBoost()
-        if rebirthWaiting or not isInEvent() or not boostUtil.Enabled(player) then return end
+        if not active() or session.inFlight then return end
         local data = save.Get()
         local inventory = data and data.Inventory and data.Inventory.Consumable
         if not inventory then return end
-
-        for _, entry in ipairs(catalog) do
-            local name = entry.name
-            local now = os.clock()
-            if not selected[name] or now < (retryAt[name] or 0) or now < (refreshAt[entry.family] or 0)
-                or boostUtil.Power(player, entry.family) > 0 then continue end
-            local definition = directory[entry.id]
-            if not definition or (definition.Requirement and not definition.Requirement(player)) then continue end
-            local uid = findBoost(inventory, entry)
-            if uid then
-                retryAt[name] = now + 10
-                if network.Invoke("Consumables_Consume", uid, 1) == true then
-                    refreshAt[entry.family] = os.clock() + 10
-                end
-                return
+        for uid, pending in pairs(session.pending) do
+            local item = inventory[uid]
+            if not item or item.id~=pending.id or (item.tn or 1)~=pending.tier
+                or (item._am or 1)~=pending.amount then session.pending[uid]=nil end
+        end
+        for offset=0,#axes-1 do
+            local index=(nextIndex+offset-1) % #axes+1
+            local family=axes[index]
+            if os.clock()<(session.retryAt[family] or 0) then continue end
+            local uid,item=chooseBoost(inventory,family)
+            if not uid or session.pending[uid] then continue end
+            local amount=item._am or 1
+            local quantity=math.min(amount, session.batchLimit[uid] or amount)
+            if not active() then return end
+            nextIndex=index % #axes+1
+            session.retryAt[family]=os.clock()+1
+            session.inFlight=true
+            local ok,accepted=pcall(network.Invoke,"Consumables_Consume",uid,quantity)
+            session.inFlight=false
+            if ok and accepted==true then
+                session.pending[uid]={id=item.id,tier=item.tn or 1,amount=amount}
+                session.batchLimit[uid]=nil
+            else
+                -- Nếu server từ chối lô lớn, hạ số lượng; luôn giữ nguyên cấp đã chọn.
+                session.batchLimit[uid]=math.max(1,math.floor(quantity/2))
+                session.retryAt[family]=os.clock()+10
+                if not ok then error(accepted) end
             end
+            return
         end
     end
+
+    controller.stop=function()controller.active,enabled=false,false end
+    env.RobloxHubEventBoost=controller
 
     -- Đọc tên không có hậu tố như lựa chọn mọi cấp trong catalog (III -> II -> I).
     local function resolveSelection(values)
@@ -2021,10 +2078,11 @@ do
             end
         end,
         duy = function(on)
-            enabled = on
-            if not on or job then return end
+            if not controller.active then return end
+            enabled = on == true
+            if not enabled or job then return end
             job = task.defer(function()
-                while enabled do
+                while enabled and controller.active do
                     local ok, err = pcall(equipBoost)
                     if not ok then warn("[Auto Equip Boost] " .. tostring(err)) end
                     task.wait(ok and 1 or 3)
