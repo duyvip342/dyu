@@ -1946,7 +1946,16 @@ do
     local accent = Color3.fromRGB(255, 191, 105)
     local petRefreshInterval = 12
 
-    -- Hiện phần trăm hiệu lực của ba boost Pumpkin Tycoon.
+    -- Tổng rebirth của nhân vật từ save đảo; không đếm riêng phiên chạy script.
+    local function rebirthText()
+        local count = isInEvent() and tycoon.Feature("Island").Get(nil, tycoonTypes.VAR.Rebirths)
+        if type(count) ~= "number" or count < 0 or count ~= count or count == math.huge then
+            return "Số lần rebirth · —"
+        end
+        return ("Số lần rebirth · %.0f"):format(math.floor(count))
+    end
+
+    -- Hiện rebirth và phần trăm hiệu lực của ba boost Pumpkin Tycoon.
     local function eventBoostText()
         local available = isInEvent() and boostUtil.Enabled(player)
         local function status(family)
@@ -1955,6 +1964,8 @@ do
             return ("+%g%%"):format(power)
         end
         return table.concat({
+            rebirthText(),
+            "",
             "BOOST EVENT",
             "Patch Coin Boost · " .. status("Coins"),
             "Pumpkin Damage Boost · " .. status("Damage"),
