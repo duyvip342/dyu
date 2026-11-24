@@ -1930,7 +1930,7 @@ do
     }
 end
 
--- Auto Equip Boost / Dùng hết stack ở cấp cao nhất đã chọn, không chờ timer cũ hết.
+-- Auto Equip Boost / Dùng hết mọi cấp đã chọn, không chờ timer cũ hết.
 do
     local boostUtil = require(library.Util.PumpkinTycoonBoosts)
     local save = require(client.Save)
@@ -1965,36 +1965,21 @@ do
             and boostUtil.Enabled(player)
     end
 
-    -- Cấp ghi rõ trong lựa chọn là ưu tiên bắt buộc; entry không cấp chọn cao nhất có thể dùng.
+    -- Nhận mọi cấp được chọn; stack đang chờ replica không chặn các stack khác.
     local function chooseBoost(inventory, family)
-        local wanted, wildcard = 0, false
-        for _, entry in ipairs(catalog) do
-            if selected[entry.name] and entry.family == family then
-                if entry.tier then wanted=math.max(wanted,entry.tier) else wildcard=true end
-            end
-        end
-        if wildcard then
-            for _, entry in ipairs(catalog) do
-                if selected[entry.name] and entry.family == family and not entry.tier then
-                    for _, item in pairs(inventory) do
-                        if item.id == entry.id and not item._lk and (item._am or 1)>0
-                            and boostUtil.Allowed(player,item.tn or 1) then
-                            wanted=math.max(wanted,item.tn or 1)
-                        end
-                    end
-                end
-            end
-        end
         local bestUid, bestItem
         for uid, item in pairs(inventory) do
-            if (item.tn or 1) ~= wanted or item._lk or (item._am or 1)<=0
+            if session.pending[uid] or item._lk or (item._am or 1)<=0
                 or not boostUtil.Allowed(player,item.tn or 1) then continue end
             for _, entry in ipairs(catalog) do
                 if selected[entry.name] and entry.family == family and entry.id == item.id
-                    and (not entry.tier or entry.tier == wanted) then
+                    and (not entry.tier or entry.tier == (item.tn or 1)) then
                     local definition = directory[entry.id]
                     if definition and (not definition.Requirement or definition.Requirement(player)) then
-                        if not bestUid or tostring(uid)<tostring(bestUid) then bestUid,bestItem=uid,item end
+                        if not bestUid or (item.tn or 1) > (bestItem.tn or 1)
+                            or ((item.tn or 1) == (bestItem.tn or 1) and tostring(uid)<tostring(bestUid)) then
+                            bestUid,bestItem=uid,item
+                        end
                     end
                 end
             end
