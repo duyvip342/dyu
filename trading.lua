@@ -16,7 +16,7 @@ local itemTypes = require(library.Items.Types)
 local petTypes = require(library.Items.PetItem).Types
 local plazaPlaces = require(library.Modules.PlaceFile).LocalPlaces
 local normalPlace = plazaPlaces.Trading
-local launcherUrl = "https://raw.githubusercontent.com/duyvip453/dyu/refs/heads/main/UI.lua"
+local launcherUrl = "https://raw.githubusercontent.com/duyvip342/dyu/refs/heads/main/UI.lua"
 local diamondIcon = "https://tr.rbxcdn.com/180DAY-9b4d094e1819c1b5ea67575b824a9101/150/150/Image/Png/noFilter"
 
 local environment = type(getgenv) == "function" and getgenv() or _G
@@ -1040,14 +1040,16 @@ local function configure(config)
             if selling and entry.rap ~= nil then price = tostring(entry.rap):gsub("%%$", "") .. "%"
             else price = entry.minAmount or entry.maxUnitPrice end
         end
-        local percent = type(price) == "string" and tonumber(clean(price):match("^(%d+%.?%d*)%s*%%$")) or nil
+        local percent = type(price) == "string" and tonumber(clean(price):match("^(%-?%d+%.?%d*)%s*%%$")) or nil
         local diamonds = not percent and parseDiamonds(price) or nil
         local variant = clean(entry.rarities or entry.variant or entry.varities):lower():gsub("[^%a]", ""):gsub("gold$", "golden")
         if variant == "goldenshiny" or variant == "goldshiny" then variant = "shinygolden" end
         if variant == "rainbowshiny" then variant = "shinyrainbow" end
         local rawCap = entry.minPrice or entry["min price"]
         local cap = rawCap ~= nil and clean(tostring(rawCap)) ~= "" and parseDiamonds(rawCap) or nil
-        local validPrice = percent and percent >= 0 and percent < (selling and 2^53 or 100)
+        -- Sell nhận phần trăm giảm lớn hơn -100%; Sniper giữ mức giảm 0..dưới100%.
+        local validPrice = percent and (selling and percent > -100 or not selling and percent >= 0)
+            and percent < (selling and 2^53 or 100)
             or diamonds and diamonds >= 1
         if name == "" or not validPrice or (class ~= "" and not items.Types[class])
             or (not selling and class == "") or (huge and class ~= "Pet")
