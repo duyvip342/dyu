@@ -4,6 +4,19 @@ local players = game:GetService("Players")
 local localPlayer = players.LocalPlayer
 local playerGui = localPlayer:WaitForChild("PlayerGui")
 local tweenService = game:GetService("TweenService")
+local runService = game:GetService("RunService")
+local environment = type(getgenv) == "function" and getgenv() or _G
+local previous = environment.RobloxHubOptimize
+if type(previous) == "table" and type(previous.stop) == "function" then previous.stop() end
+local session = type(previous) == "table" and type(previous.session) == "table" and previous.session or {}
+session.renderOwners = session.renderOwners or {}
+if session.renderDisabled == nil then session.renderDisabled = false end
+local controller = {active=true, session=session, renderError=false, refreshEvent=false}
+local connections = {}
+local queue, pending = {}, setmetatable({}, {__mode="k"})
+local first, last = 1, 0
+local processing = false
+local syncItemPopups
 
 -- Chỉ thay đổi hiển thị cục bộ; không xóa instance hay thay đổi dữ liệu game.
 local states = {
@@ -12,10 +25,7 @@ local states = {
     super = false,
 }
 local originals = setmetatable({}, { __mode = "k" })
-local watchedFolders = setmetatable({}, { __mode = "k" })
-local fogOriginals
-local itemPopupOriginal
-local itemPopupJobRunning = false
+local applied = setmetatable({}, { __mode = "k" })
 -- Theo dõi khối thay thế của từng vật thể trong zone.
 local objectBoxes = {}
 local damageConnection
@@ -86,9 +96,9 @@ local function connectObjectDamage()
     if damageConnection then return end
     local client = game:GetService("ReplicatedStorage").Library.Client
     local breakables = require(client.BreakableCmds)
-    if not states.objects or damageConnection then return end
+    if not controller.active or not states.objects or states.super or damageConnection then return end
     damageConnection = breakables.DamageDealt:Connect(function(data)
-        if not states.objects or not data.model then return end
+        if not controller.active or not states.objects or states.super or not data.model then return end
         local object = getZoneObject(data.model)
         local record = object and objectBoxes[object]
         local now = os.clock()
@@ -185,9 +195,12 @@ end
 -- Chọn thuộc tính hiển thị cần đổi theo loại instance.
 local function getHiddenProperties(instance)
     if instance:IsA("BasePart") then
-        return { { "LocalTransparencyModifier", 1 } }
+        return states.super and {{"LocalTransparencyModifier",1},{"CastShadow",false}}
+            or {{"LocalTransparencyModifier",1}}
     elseif instance:IsA("Decal") or instance:IsA("Texture") then
         return { { "Transparency", 1 } }
+    elseif instance:IsA("Sky") then
+        return {{"CelestialBodiesShown",false},{"StarCount",0}}
     elseif instance:IsA("Atmosphere") then
         return {
             { "Density", 0 },
@@ -208,28 +221,56 @@ local function getHiddenProperties(instance)
     return nil
 end
 
--- Đổi hiển thị cục bộ có lưu giá trị để khôi phục.
-local function setLocalHidden(instance, hidden)
-    local properties = getHiddenProperties(instance)
-    if not properties then return end
+-- Lưu từng thuộc tính theo trạng thái mong muốn để các toggle không khôi phục đè nhau.
+local function readProperty(instance, property)
+    local ok, value = pcall(function() return instance[property] end)
+    if not ok and type(gethiddenproperty) == "function" then ok, value = pcall(gethiddenproperty, instance, property) end
+    return ok and value ~= nil, value
+end
 
+local function writeProperty(instance, property, value)
+    local ok = pcall(function() instance[property] = value end)
+    if not ok and type(sethiddenproperty) == "function" then ok = pcall(sethiddenproperty, instance, property, value) end
+    return ok
+end
+
+local function applyProperties(instance, desired)
     local saved = originals[instance]
-    if hidden then
-        if not saved then
-            saved = {}
-            originals[instance] = saved
+    local written = applied[instance] or {}
+    if saved then
+        for property, value in pairs(saved) do
+            if desired[property] == nil then
+                local ok, current = readProperty(instance, property)
+                -- Không ghi đè thay đổi mới của game hoặc Optimize Event.
+                if ok and current == written[property] then writeProperty(instance, property, value) end
+                saved[property] = nil
+                written[property] = nil
+            end
         end
-        for _, entry in ipairs(properties) do
-            local property, hiddenValue = entry[1], entry[2]
-            if saved[property] == nil then saved[property] = instance[property] end
-            instance[property] = hiddenValue
-        end
-    elseif saved then
-        for property, originalValue in pairs(saved) do
-            instance[property] = originalValue
-        end
-        originals[instance] = nil
     end
+    for property, value in pairs(desired) do
+        local ok, current = readProperty(instance, property)
+        if ok then
+            saved = saved or {}
+            originals[instance] = saved
+            if saved[property] == nil then saved[property] = current end
+            if current == value or writeProperty(instance, property, value) then written[property] = value end
+        end
+    end
+    if saved and next(saved) then applied[instance] = written
+    else originals[instance], applied[instance] = nil, nil end
+end
+
+local function setLocalHidden(instance, hidden)
+    local desired = {}
+    if hidden then
+        for _, entry in ipairs(getHiddenProperties(instance) or {}) do desired[entry[1]] = entry[2] end
+    end
+    if instance:IsA("Terrain") and states.super then
+        desired.WaterWaveSize, desired.WaterWaveSpeed = 0, 0
+        desired.WaterReflectance, desired.WaterTransparency, desired.Decoration = 0, 1, false
+    end
+    applyProperties(instance, desired)
 end
 
 -- Nhận diện các instance thuộc nhóm hiệu ứng hiển thị.
@@ -259,7 +300,13 @@ end
 
 -- Xác định instance có cần ẩn theo cấu hình hiện tại không.
 local function shouldHide(instance)
-    if states.super and isOtherCharacter(instance) then return true end
+    if states.super then
+        -- Giữ ScreenGui và UI có nút tương tác; không sửa dữ liệu/collision/Transparency của part.
+        if instance:IsA("BillboardGui") or instance:IsA("SurfaceGui") then
+            return not instance:FindFirstChildWhichIsA("GuiButton", true)
+        end
+        return instance:IsDescendantOf(workspace) or instance:IsDescendantOf(lighting)
+    end
     if states.objects then
         if getZoneObject(instance) then return true end
         if isWorldEffect(instance) then
@@ -280,114 +327,156 @@ local function shouldHide(instance)
         or ((states.lootBoxes or states.super) and isWorldEffect(instance))
 end
 
--- Áp dụng trạng thái hiển thị cho cả cây instance.
-local function applyTree(root)
-    setLocalHidden(root, shouldHide(root))
-    for _, descendant in ipairs(root:GetDescendants()) do
-        setLocalHidden(descendant, shouldHide(descendant))
+-- Dùng chung quyền tắt cảnh 3D giữa Super và Stats Event.
+local function requestRendering(owner, off)
+    if not controller.active then
+        local current = environment.RobloxHubOptimize
+        if current and current ~= controller then return current.requestRendering(owner, off) end
+        return false
+    end
+    session.renderOwners[owner] = off and true or nil
+    local disabled = next(session.renderOwners) ~= nil
+    if session.renderDisabled == disabled then return true end
+    local ok, problem = pcall(function() runService:Set3dRenderingEnabled(not disabled) end)
+    if ok then session.renderDisabled = disabled
+    elseif controller.renderError ~= tostring(problem) then
+        controller.renderError = tostring(problem)
+        warn("[Super Optimize] Tắt cảnh 3D không khả dụng, dùng bộ lọc hiển thị: " .. controller.renderError)
+    end
+    return ok
+end
+controller.requestRendering = requestRendering
+
+local function applyGlobalSettings()
+    local values = {}
+    if states.super or states.lootBoxes then values.FogStart, values.FogEnd = 0, 1000000 end
+    if states.super then
+        values.GlobalShadows, values.ShadowSoftness = false, 0
+        values.EnvironmentDiffuseScale, values.EnvironmentSpecularScale = 0, 0
+    end
+    applyProperties(lighting, values)
+    local ok, rendering = pcall(function() return settings().Rendering end)
+    if ok then
+        applyProperties(rendering, states.super and {
+            QualityLevel=Enum.QualityLevel.Level01,
+            MeshPartDetailLevel=Enum.MeshPartDetailLevel.Level01,
+        } or {})
+    end
+    local got, userSettings = pcall(function() return UserSettings():GetService("UserGameSettings") end)
+    if got then
+        applyProperties(userSettings, states.super and {SavedQualityLevel=Enum.SavedQualitySetting.QualityLevel1} or {})
     end
 end
 
--- Theo dõi object mới được thêm vào thư mục đã nhận diện.
-local function watchFolder(folder)
-    if watchedFolders[folder] then return end
-    watchedFolders[folder] = true
-    applyTree(folder)
-    folder.DescendantAdded:Connect(function(descendant)
-        setLocalHidden(descendant, shouldHide(descendant))
-    end)
+local function anyVisual()
+    return states.super or states.objects or states.lootBoxes
 end
 
--- Tìm các thư mục hiển thị dưới __THINGS và __DEBRIS.
-local function scanFolders()
-    for _, name in ipairs({ "__THINGS", "__DEBRIS" }) do
-        local container = workspace:FindFirstChild(name)
-        if container then
-            for _, instance in ipairs(container:GetChildren()) do
-                if getVisualFolderName(instance) then watchFolder(instance) end
-            end
-        end
-    end
+local function enqueue(instance, walk)
+    local existing = pending[instance]
+    if existing then existing.walk = existing.walk or walk; return end
+    last += 1
+    local item = {instance=instance, walk=walk}
+    pending[instance], queue[last] = item, item
 end
 
--- Đổi trạng thái sương theo toggle tối ưu.
-local function setFogHidden(hidden)
-    if hidden then
-        if not fogOriginals then
-            fogOriginals = {
-                FogStart = lighting.FogStart,
-                FogEnd = lighting.FogEnd,
-            }
-        end
-        lighting.FogStart = 0
-        lighting.FogEnd = 1000000
-    elseif fogOriginals then
-        lighting.FogStart = fogOriginals.FogStart
-        lighting.FogEnd = fogOriginals.FogEnd
-        fogOriginals = nil
-    end
-end
-
--- Đồng bộ hiển thị của các instance đang tải.
-local function refreshVisuals()
-    scanFolders()
-    for folder in pairs(watchedFolders) do
-        applyTree(folder)
-    end
-    for _, instance in ipairs(workspace:GetDescendants()) do
-        if states.objects and instance:IsA("BasePart") then
-            local object = getZoneObject(instance)
-            if object then ensureObjectBox(object) end
-        end
-        if getHiddenProperties(instance) or originals[instance] then
-            setLocalHidden(instance, shouldHide(instance))
-        end
-    end
-    for _, instance in ipairs(lighting:GetDescendants()) do
-        if isWorldEffect(instance) then setLocalHidden(instance, shouldHide(instance)) end
-    end
-    for _, instance in ipairs(playerGui:GetDescendants()) do
-        if isWorldEffect(instance) then setLocalHidden(instance, shouldHide(instance)) end
-    end
-    setFogHidden(states.lootBoxes or states.super)
-end
-
--- Áp dụng bộ lọc tối ưu cho object mới trong Workspace.
-workspace.DescendantAdded:Connect(function(instance)
-    if states.objects and instance:IsA("BasePart") then
+local function processOne(instance)
+    -- Lighting có bộ thuộc tính toàn cục riêng, không phục hồi trong lượt quét cảnh.
+    if instance == lighting then return end
+    if states.objects and not states.super and instance:IsA("BasePart") then
         local object = getZoneObject(instance)
         if object then ensureObjectBox(object) end
     end
-    if getVisualFolderName(instance) then
-        watchFolder(instance)
-    elseif getHiddenProperties(instance) then
-        setLocalHidden(instance, shouldHide(instance))
-    end
-end)
+    setLocalHidden(instance, shouldHide(instance))
+end
 
--- Dọn khối xám khi vật thể gốc rời Workspace.
-workspace.DescendantRemoving:Connect(function(instance)
-    if objectBoxes[instance] then removeObjectBox(instance) end
-end)
+local function refreshEventVisuals()
+    local shared = controller.shared
+    local feature = shared and shared.EventOptimize
+    if feature and type(feature.refresh) == "function" then feature.refresh() end
+end
 
--- Áp dụng bộ lọc tối ưu cho hiệu ứng Lighting mới.
-lighting.DescendantAdded:Connect(function(instance)
-    if getHiddenProperties(instance) then
-        setLocalHidden(instance, shouldHide(instance))
-    end
-end)
+local function startProcessing()
+    if processing then return end
+    processing = true
+    task.defer(function()
+        local lastError
+        while controller.active and first <= last do
+            local deadline = os.clock()+0.002
+            for _=1,120 do
+                if first>last or os.clock()>=deadline then break end
+                local entry=queue[first]
+                queue[first]=nil
+                first+=1
+                pending[entry.instance]=nil
+                local object=entry.instance
+                local ok, problem=pcall(function()
+                    if object.Parent then
+                        processOne(object)
+                        if entry.walk then
+                            for _,child in ipairs(object:GetChildren()) do enqueue(child,true) end
+                        end
+                    elseif originals[object] then
+                        applyProperties(object,{})
+                    end
+                end)
+                if not ok and tostring(problem)~=lastError then
+                    lastError=tostring(problem)
+                    warn("[Optimize] " .. lastError)
+                end
+            end
+            if first<=last then runService.Heartbeat:Wait() end
+        end
+        table.clear(queue);table.clear(pending)
+        first,last,processing=1,0,false
+        if controller.active and controller.refreshEvent and not states.super then
+            controller.refreshEvent = false
+            refreshEventVisuals()
+        end
+    end)
+end
 
--- Áp dụng bộ lọc tối ưu cho hiệu ứng UI mới.
-playerGui.DescendantAdded:Connect(function(instance)
-    if getHiddenProperties(instance) then
-        setLocalHidden(instance, shouldHide(instance))
+local function disconnectWatches()
+    for _, connection in ipairs(connections) do connection:Disconnect() end
+    table.clear(connections)
+end
+
+local function watchRoots()
+    if #connections>0 or not anyVisual() then return end
+    for _, root in ipairs({workspace, lighting, playerGui}) do
+        connections[#connections+1]=root.DescendantAdded:Connect(function(instance)
+            if not controller.active or not anyVisual() then return end
+            enqueue(instance,true)
+            startProcessing()
+        end)
     end
-end)
+    connections[#connections+1]=workspace.DescendantRemoving:Connect(function(instance)
+        if objectBoxes[instance] then removeObjectBox(instance) end
+        if originals[instance] then
+            -- Trả thuộc tính ngay khi object rời scope, không giữ object đã bị game dọn.
+            applyProperties(instance,{})
+        end
+    end)
+end
+
+-- Chỉ quét khi đổi trạng thái; xử lý theo lô, không quét lại toàn map mỗi frame.
+local function refreshVisuals()
+    if anyVisual() then
+        watchRoots()
+        for _,root in ipairs({workspace,lighting,playerGui}) do enqueue(root,true) end
+    else
+        disconnectWatches()
+        for instance in pairs(originals) do enqueue(instance,false) end
+    end
+    applyGlobalSettings()
+    startProcessing()
+end
 
 -- Đồng bộ tùy chọn Item Popups theo Super Optimize.
-local function syncItemPopups()
-    if itemPopupJobRunning then return end
-    itemPopupJobRunning = true
+syncItemPopups = function()
+    if session.popupBusy then return end
+    if not states.super and session.itemPopupOriginal == nil then return end
+    session.popupBusy = true
     task.defer(function()
         local ok, err = pcall(function()
             local library = game:GetService("ReplicatedStorage").Library
@@ -404,10 +493,12 @@ local function syncItemPopups()
             local attempts = 0
             local lastTarget
             while true do
-                if states.super and itemPopupOriginal == nil then itemPopupOriginal = current end
-                local target = states.super and off or itemPopupOriginal
+                local owner=environment.RobloxHubOptimize
+                local on=owner and owner.active and owner.states.super
+                if on and session.itemPopupOriginal == nil then session.itemPopupOriginal = current end
+                local target = on and off or session.itemPopupOriginal
                 if not target or current == target then
-                    if not states.super then itemPopupOriginal = nil end
+                    if not on then session.itemPopupOriginal = nil end
                     return
                 end
                 if target ~= lastTarget then
@@ -424,23 +515,30 @@ local function syncItemPopups()
                 if current ~= target then task.wait(0.2) end
             end
         end)
-        itemPopupJobRunning = false
+        session.popupBusy = false
         if not ok then warn("[Super Optimize] Item Popups: " .. tostring(err)) end
     end)
 end
 
 -- Áp dụng thay đổi trạng thái của một toggle Optimize.
 local function updateState(key, enabled)
+    if not controller.active then return end
+    enabled = enabled == true
+    if states[key] == enabled then return end
     states[key] = enabled
-    if key == "objects" then
-        if enabled then
+    if key == "objects" or key == "super" then
+        if states.objects and not states.super then
             task.defer(connectObjectDamage)
         else
             if damageConnection then damageConnection:Disconnect(); damageConnection = nil end
             for object in pairs(objectBoxes) do removeObjectBox(object) end
         end
     end
-    if key == "super" then syncItemPopups() end
+    if key == "super" then
+        controller.refreshEvent = not enabled
+        requestRendering("super", enabled)
+        syncItemPopups()
+    end
     refreshVisuals()
 end
 
@@ -460,7 +558,9 @@ features.OptimizeDisableObjects = {
 
 -- Xuất toggle tối ưu hiển thị tổng hợp.
 features.OptimizeSuper = {
-    duy = function(enabled)
+    requestRendering = requestRendering,
+    duy = function(enabled, shared)
+        if shared then controller.shared = shared end
         updateState("super", enabled)
     end,
 }
@@ -485,6 +585,7 @@ end
 
 features.OptimizeFpsLimit = {
     setTarget = function(value)
+        if not controller.active then return false end
         local fps = tonumber(value)
         if not fps or fps < 1 or fps > 2000 or fps % 1 ~= 0 then
             warn("[FPS Limit] Nhập số nguyên từ 1 đến 2000")
@@ -495,7 +596,7 @@ features.OptimizeFpsLimit = {
         return true
     end,
     duy = function(enabled)
-        if enabled == fpsEnabled then return end
+        if not controller.active or enabled == fpsEnabled then return end
         if enabled then
             local saved = 0
             if type(getFpsCap) == "function" then
@@ -512,5 +613,23 @@ features.OptimizeFpsLimit = {
         end
     end,
 }
+
+controller.states=states
+controller.stop=function()
+    if not controller.active then return end
+    states.super,states.objects,states.lootBoxes=false,false,false
+    disconnectWatches()
+    if damageConnection then damageConnection:Disconnect();damageConnection=nil end
+    for object in pairs(objectBoxes) do removeObjectBox(object) end
+    for instance in pairs(originals) do applyProperties(instance,{}) end
+    refreshEventVisuals()
+    table.clear(queue);table.clear(pending)
+    first,last=1,0
+    requestRendering("super",false)
+    syncItemPopups()
+    features.OptimizeFpsLimit.duy(false)
+    controller.active=false
+end
+environment.RobloxHubOptimize=controller
 
 return features
