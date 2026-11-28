@@ -54,10 +54,19 @@ local veilrootPosition = Vector3.new(-14887.7763671875, 17.05313491821289, 2226.
 local questTiers = { "Easy", "Medium", "Hard", "Extreme" }
 local questActions = {}
 local questJob
+local independentQuestJob
+local startIndependentQuests
 local activeQuest
 local rankQuestWorld
 -- Khai báo tính năng Farm dùng để đi tới world và area mục tiêu.
 local travelFeatures = { "FarmTeleToBestArea", "FarmTeleToBestWorld" }
+
+-- Nhóm không di chuyển: được xử lý ngay, không chiếm luồng quest chính.
+-- Cùng loại nguyên liệu vẫn chạy tuần tự và chờ inventory xác nhận thay đổi.
+local independentQuestKinds = {
+    usePotion = "Potion", collectPotion = "Potion", upgradePotion = "Potion",
+    collectEnchant = "Enchant", upgradeEnchant = "Enchant",
+}
 
 -- Thứ tự trong bảng là priority: 1 được ưu tiên cao nhất.
 local questPriority = {
@@ -183,13 +192,14 @@ local function selectQuest(goals)
     local list = rankQuestList(goals)
     if #list == requiredCount then
         for _, quest in ipairs(list) do
-            if quest.priority and quest.current < quest.target then return quest, false end
+            if quest.priority and not independentQuestKinds[quest.kind]
+                and quest.current < quest.target then return quest, false end
         end
     end
     return nil, true
 end
 
--- Vòng điều phối. Chỉ một quest được chạy tại một thời điểm.
+-- Vòng quest cần di chuyển/hatch/đánh; nhóm thuốc/sách có worker riêng.
 local function runQuest(quest, action)
     local repeatCollect = quest.kind == "collectPotion" or quest.kind == "collectEnchant"
     local repeatSummon = quest.kind == "coinJar" or quest.kind == "comet"
@@ -241,28 +251,55 @@ local function runQuest(quest, action)
     end
 end
 
--- Xuất vòng tự chọn và thực hiện quest rank.
+-- Lifecycle Auto Rank: dọn cả hai luồng khi tắt hoặc exec bản mới.
+local rankEnvironment = type(getgenv) == "function" and getgenv() or _G
+local previousRankRun = rankEnvironment.RobloxHubRankQuest
+if type(previousRankRun) == "table" and type(previousRankRun.Stop) == "function" then
+    previousRankRun.Stop()
+end
+local independentState = type(previousRankRun) == "table" and previousRankRun.session
+    or { states = {}, pending = {} }
+if type(independentState) ~= "table" then independentState = { states = {}, pending = {} } end
+independentState.active = false
+independentState.states = independentState.states or {}
+independentState.pending = independentState.pending or {}
+local rankController = { active = true, session = independentState }
+local sharedQuestFeatures
+local function stopRankQuests()
+    independentState.active = false
+    if independentQuestJob then pcall(task.cancel, independentQuestJob); independentQuestJob = nil end
+    if questJob then pcall(task.cancel, questJob); questJob = nil end
+    activeQuest, rankQuestWorld = nil, nil
+    if sharedQuestFeatures then requestTravel(sharedQuestFeatures, false) end
+end
+rankController.Stop = function()
+    rankController.active = false
+    stopRankQuests()
+end
+rankEnvironment.RobloxHubRankQuest = rankController
+
+-- Xuất toggle chung; không cần bật thêm nút cho nhóm thuốc/sách.
 features.RankAutoQuest = {
     duy = function(on, allFeatures)
-        if questJob then
-            task.cancel(questJob)
-            questJob = nil
-        end
-        activeQuest = nil
-        rankQuestWorld = nil
-        requestTravel(allFeatures, false)
+        if not rankController.active then return end
+        stopRankQuests()
+        sharedQuestFeatures = allFeatures or sharedQuestFeatures
+        if sharedQuestFeatures then requestTravel(sharedQuestFeatures, false) end
         if not on then return end
 
+        assert(type(sharedQuestFeatures)=="table","Auto Rank requires shared travel features")
+        independentState.active = true
+        independentQuestJob = task.defer(function() startIndependentQuests(independentState) end)
         questJob = task.defer(function()
-            while true do
+            while rankController.active do
                 local ready, canTravel, bestWorld = rankTravelState()
                 if not ready then
                     rankQuestWorld = nil
-                    requestTravel(allFeatures, canTravel)
+                    requestTravel(sharedQuestFeatures, canTravel)
                     task.wait(3)
                 else
                     rankQuestWorld = bestWorld
-                    requestTravel(allFeatures, false)
+                    requestTravel(sharedQuestFeatures, false)
                     local quest, shouldWaitAtArea = selectQuest(readGoals())
                     local action = quest and questActions[quest.kind]
                     if action then
@@ -458,6 +495,109 @@ end
 function questActions.collectEnchant(quest)
     return collectByUpgrading(quest, "Enchant")
 end
+
+
+-- ============================================================================
+-- [RANK-INDEPENDENT] Quest dùng/upgrade/collect thuốc-sách không phải chờ quest chính.
+-- Snapshot chỉ được tạo lúc gửi yêu cầu; kiểm tra lại để không dùng UID cũ hai lần.
+local function materialSnapshot(category)
+    local snapshot = {}
+    for uid,item in pairs(inventory(category)) do
+        snapshot[uid] = {id=item.id,tier=item.tn,amount=item._am or 1,locked=item._lk}
+    end
+    return snapshot
+end
+local function materialChanged(category, snapshot)
+    local current = inventory(category)
+    for uid,entry in pairs(snapshot) do
+        local item = current[uid]
+        if not item or item.id~=entry.id or item.tn~=entry.tier
+            or (item._am or 1)~=entry.amount or item._lk~=entry.locked then return true end
+    end
+    for uid in pairs(current) do if not snapshot[uid] then return true end end
+    return false
+end
+
+local function independentQuestStep(session)
+    local goals = readGoals()
+    local list = rankQuestList(goals)
+    local live = {}
+    for _,quest in ipairs(list) do
+        if independentQuestKinds[quest.kind] and quest.current<quest.target then live[quest.uid]=quest end
+    end
+    for uid in pairs(session.states) do if not live[uid] then session.states[uid]=nil end end
+    local now = os.clock()
+    for category,pending in pairs(session.pending) do
+        if not live[pending.uid] or materialChanged(category,pending.snapshot) then
+            session.pending[category] = nil
+        elseif now-pending.at>=10 then
+            -- Không có inventory/goal xác nhận: cho thử lại có giới hạn, không spam.
+            local state = session.states[pending.uid]
+            if state then state.sentAtProgress=nil end
+            session.pending[category] = nil
+        end
+    end
+
+    for _,quest in ipairs(list) do
+        if not rankController.active or not session.active then return end
+        local category = independentQuestKinds[quest.kind]
+        local action = category and questActions[quest.kind]
+        local goal = category and readGoals()[quest.stars]
+        if not action or not goal or goal.UID~=quest.uid or goal.Progress>=goal.Amount then continue end
+        local state = session.states[quest.uid]
+        if not state or state.kind~=quest.kind then
+            state = {kind=quest.kind,nextAt=0}
+            session.states[quest.uid] = state
+        end
+        now = os.clock()
+        if session.pending[category] or now<state.nextAt or state.sentAtProgress==goal.Progress then continue end
+        quest.current,quest.target,quest.potionTier = goal.Progress,goal.Amount,goal.PotionTier
+        quest.potionId,quest.enchantId,quest.enchantTier = goal.PotionID,goal.EnchantID,goal.EnchantTier
+        -- Đặt pending trước Invoke để off/on hoặc reload giữa request vẫn giữ khóa nguyên liệu.
+        local pending = {uid=quest.uid,snapshot=materialSnapshot(category),at=now}
+        session.pending[category] = pending
+        state.sentAtProgress = goal.Progress
+        local ok, waitForProgress, message, retryDelay = pcall(action,quest)
+        if not rankController.active or not session.active then return end
+        if not ok then
+            message = tostring(waitForProgress)
+            waitForProgress = true -- kết quả request chưa rõ: chờ snapshot/timeout thay vì gửi lại ngay.
+        end
+        if not waitForProgress then
+            session.pending[category] = nil
+            state.sentAtProgress = nil
+        else
+            pending.at = os.clock()
+        end
+        local delay = math.max(3,tonumber(retryDelay) or 0)
+        if message then
+            local reason = tostring(message):lower()
+            if reason:find("too quickly",1,true) or reason:find("cooldown",1,true)
+                or reason:find("too many requests",1,true) or reason:match("wait%s+[%d.]+%s*second") then
+                state.backoff = math.min(30,math.max(3,state.backoff or 1)*2)
+                delay = math.max(delay,state.backoff,tonumber(reason:match("([%d.]+)%s*second")) or 0)
+            end
+            if message~=state.lastMessage then
+                warn("[Rank quest / parallel] "..quest.title..": "..tostring(message))
+            end
+        else state.backoff=nil end
+        state.lastMessage = message
+        state.nextAt = os.clock()+delay
+    end
+end
+
+startIndependentQuests = function(session)
+    local lastError
+    while rankController.active and session.active do
+        local ok, problem = pcall(independentQuestStep,session)
+        if not ok and tostring(problem)~=lastError then
+            lastError = tostring(problem)
+            warn("[Rank quest / parallel] "..lastError)
+        elseif ok then lastError=nil end
+        task.wait(ok and 0.5 or 2)
+    end
+end
+-- [RANK-INDEPENDENT] END
 
 -- Mở trứng ở đúng điểm. Legendary có thể cần nhiều lượt trước khi tăng tiến độ.
 local function hatch(eggId, position, fastHatch)
