@@ -1,6 +1,6 @@
 -- Mystery Store / duyvip342. UI và cấu hình nằm trong UI.lua.
 -- MS-CORE | MS-MOVE | MS-ACTION | MS-REGISTER | MS-LEVEL | MS-DECOR
--- MS-COMBINE | MS-STOCK | MS-MERCHANT | MS-GIFT | MS-FARM | MS-WORKERS.
+-- MS-COMBINE | MS-STOCK | MS-MERCHANT | MS-GIFT | MS-BOOST | MS-FARM | MS-OPTIMIZE | MS-WORKERS.
 local features = {}
 local environment = type(getgenv)=="function" and getgenv() or _G
 local previous = environment.RobloxHubMysteryStore
@@ -11,6 +11,8 @@ environment.RobloxHubMysteryStore = controller
 local dependencies
 local lease
 local assigned = {}
+local movement={mode="teleport",timeout=45,version=0}
+local boxKeep: {[string]:number} = {["MysteryStore Box 3"]=0,["MysteryStore Box 4"]=0}
 
 -- ============================================================================
 -- [MS-CORE] API chỉ nạp khi bật tính năng; load module không khởi tạo worker.
@@ -35,6 +37,8 @@ local function api()
         decor=require(library.Util.MysteryStoreDecor),
         merchant=require(library.Util.MysteryStoreMerchant),
         items=require(library.Items),lootbox=require(client.LootboxCmds),
+        consumables=require(client.ConsumableCmds),
+        boostDefs=require(library.Util.MysteryStoreBoosts),
         playerPet=require(client.PlayerPet),pets=require(client.PetCmds),
         breaks=require(client.BreakableFrontend),
         instanceParent=require(library.Types.Breakables).ParentType.Instance,
@@ -102,31 +106,71 @@ end
 
 -- ============================================================================
 -- [MS-MOVE] Một chủ vị trí; không trả nhân vật đã chết/đổi plot hoặc tự đi nơi khác.
+local travel
 local function releaseLease(owned)
     if owned and lease~=owned then return end
     local old=lease
-    lease=nil
     if not old then return end
     local c=old.context
     local humanoid=c.character:FindFirstChildOfClass("Humanoid")
     if c.api.instancing.GetInstanceID()=="MysteryStore" and c.api.player.Character==c.character
         and humanoid and humanoid.Health>0
         and not c.plot:IsDestroyed() and c.api.base.Plot()==c.plot and c.plot:GetModel()==c.model
-        and c.root.Parent==c.character and (c.root.Position-old.destination.Position).Magnitude<9 then
-        c.character:PivotTo(old.back)
+        and c.root.Parent==c.character and (c.root.Position-old.destination.Position).Magnitude<9
+        and old.version==movement.version then
+        if old.mode=="walk" then
+            if valid(c,old.flag) then travel(c,old.flag,old.back,old) end
+        else c.character:PivotTo(old.back) end
     end
+    if old.mode=="walk" and humanoid and c.root.Parent==c.character then humanoid:MoveTo(c.root.Position) end
+    if lease==old then lease=nil end
+end
+travel=function(c,flag,spot,owned)
+    if not valid(c,flag) or lease~=owned or owned.version~=movement.version then return false end
+    if owned.mode=="teleport" then
+        if (c.root.Position-spot.Position).Magnitude>2 then
+            c.root.AssemblyLinearVelocity=Vector3.zero
+            c.character:PivotTo(spot)
+            task.wait(0.2)
+        end
+        return valid(c,flag) and lease==owned and owned.version==movement.version
+    end
+    local humanoid=c.character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return false end
+    local service=c.api.pathfinding or game:GetService("PathfindingService")
+    local path=service:CreatePath({AgentCanJump=true,WaypointSpacing=5})
+    local ok=pcall(path.ComputeAsync,path,c.root.Position,spot.Position)
+    if not valid(c,flag) or lease~=owned or owned.version~=movement.version then return false end
+    if not ok or path.Status~=Enum.PathStatus.Success then
+        report("movement","Không tìm được đường chạy bộ; chưa gửi thao tác.")
+        return false
+    end
+    local deadline=os.clock()+movement.timeout
+    for _,waypoint in ipairs(path:GetWaypoints()) do
+        if not valid(c,flag) or lease~=owned or owned.version~=movement.version then return false end
+        if waypoint.Action==Enum.PathWaypointAction.Jump then humanoid.Jump=true end
+        humanoid:MoveTo(waypoint.Position)
+        local segmentDeadline=math.min(deadline,os.clock()+8)
+        while (c.root.Position-waypoint.Position).Magnitude>3 do
+            if not valid(c,flag) or lease~=owned or owned.version~=movement.version then return false end
+            if os.clock()>=segmentDeadline then
+                humanoid:MoveTo(c.root.Position)
+                report("movement","Chạy bộ bị kẹt hoặc hết thời gian; chưa gửi thao tác.")
+                return false
+            end
+            task.wait(0.1)
+        end
+    end
+    report("movement",nil)
+    return valid(c,flag) and lease==owned and owned.version==movement.version
+        and (c.root.Position-spot.Position).Magnitude<=5
 end
 local function approach(c,flag,spot)
     if not spot or lease or not valid(c,flag) then return false end
     local back=c.character:GetPivot()
     if enabled("EventStoreAutoCombine") and c.api.pad.OnPad() then back=c.api.base.ZoneLanding(c.plot) or back end
-    lease={context=c,flag=flag,back=back,destination=spot}
-    if (c.root.Position-spot.Position).Magnitude>2 then
-        c.root.AssemblyLinearVelocity=Vector3.zero
-        c.character:PivotTo(spot)
-        task.wait(0.2)
-    end
-    return valid(c,flag)
+    lease={context=c,flag=flag,back=back,destination=spot,mode=movement.mode,version=movement.version}
+    return travel(c,flag,spot,lease)
 end
 
 -- ============================================================================
@@ -139,8 +183,11 @@ local function confirmed(p,c)
         local placed=c.plot:Save("Plinths") or {}
         return (placed[tostring(p.slot)] or placed[p.slot])==p.id
     end
-    if p.kind=="unlock" then return (c.own.BoxLocks or {})[tostring(p.rung)]==false end
+    if p.kind=="unlock" then
+        return c.api.definitions.BoxLocked(c.own.BoxLocks,p.rung)==(p.locked==true)
+    end
     if p.kind=="combine" or p.kind=="gift" then return amount(c.data,"Lootbox",p.id,p.uid)<p.before end
+    if p.kind=="boost" then return amount(c.data,"Consumable",p.id,p.uid)<p.before end
     if p.kind=="merchant" then
         if amount(c.data,"Misc",p.id)>p.before then return true end
         local shelf=controller.offers and controller.offers.MysteryStoreDecorMerchant
@@ -169,7 +216,8 @@ local function distanceError(message)
 end
 local function dispatch(c,flag,p,send,check,spot,forceNear,channel)
     channel=channel or "main"
-    if lease or not valid(c,flag) or waiting(channel,c) or os.clock()<(session.nextAt[p.key] or 0) then return false end
+    if (lease and channel~="boost") or not valid(c,flag) or waiting(channel,c)
+        or os.clock()<(session.nextAt[p.key] or 0) then return false end
     local owned
     if forceNear or controller.near[p.kind] then
         local ok=approach(c,flag,spot)
@@ -310,12 +358,17 @@ local function combineChoice(c)
     for rung=c.api.boxes.Count()-1,1,-1 do
         local box=c.api.boxes.Box(rung)
         local ratio=c.api.combine.Ratio(rung)
-        if ratio>0 then
+        local available=0
+        for _,item in pairs(inventory(c.data,"Lootbox")) do
+            if item.id==box.Id and not item._lk then available+=item._am or 1 end
+        end
+        local surplus=available-(boxKeep[box.Id] or 0)
+        if ratio>0 and surplus>=ratio then
             for uid,item in pairs(inventory(c.data,"Lootbox")) do
                 local count=item._am or 1
                 if item.id==box.Id and not item._lk and count>=ratio then
                     return {uid=uid,id=item.id,before=count,rung=rung,
-                        sets=math.min(math.floor(count/ratio),c.api.combine.MAX_SETS)}
+                        sets=math.min(math.floor(math.min(count,surplus)/ratio),c.api.combine.MAX_SETS)}
                 end
             end
         end
@@ -334,27 +387,35 @@ local function combineStep(c)
         function(f)return f.plot:Invoke(f.api.definitions.NET.CombineBoxes,choice.uid,choice.sets)end,
         function(f)
             local item=inventory(f.data,"Lootbox")[choice.uid]
+            local available=0
+            for _,entry in pairs(inventory(f.data,"Lootbox")) do
+                if entry.id==choice.id and not entry._lk then available+=entry._am or 1 end
+            end
+            local required=choice.sets*f.api.combine.Ratio(choice.rung)
             return item and item.id==choice.id and not item._lk
-                and (item._am or 1)>=choice.sets*f.api.combine.Ratio(choice.rung)
+                and (item._am or 1)>=required and available-(boxKeep[choice.id] or 0)>=required
         end,spot,onPad)
 end
 
 -- ============================================================================
--- [MS-STOCK] Unlock cấp hộp, đứng StockPad thật; không ghi CanStock phía client.
+-- [MS-STOCK] Giữ khóa bán loại có reserve; còn lại unlock. Không sửa CanStock.
 local function stockStep(c)
     local flag="EventStoreAutoStock"
     if not enabled(flag) then return false end
     if enabled("EventStoreAutoCombine") and combineChoice(c) then return false end
     for rung=c.api.definitions.LOCKABLE_FROM,c.api.boxes.Count() do
-        if c.api.definitions.BoxLocked(c.own.BoxLocks,rung) then
-            return dispatch(c,flag,{kind="unlock",key="unlock:"..rung,rung=rung},
-                function(f)return f.plot:Invoke(f.api.definitions.NET.LockBox,rung,false)end,nil)
+        local box=c.api.boxes.Box(rung)
+        local locked=(boxKeep[box.Id] or 0)>0
+        if c.api.definitions.BoxLocked(c.own.BoxLocks,rung)~=locked then
+            return dispatch(c,flag,{kind="unlock",key="boxlock:"..rung..":"..tostring(locked),rung=rung,locked=locked},
+                function(f)return f.plot:Invoke(f.api.definitions.NET.LockBox,rung,locked)end,
+                function()return ((boxKeep[box.Id] or 0)>0)==locked end)
         end
     end
     if c.api.pad.BoothFull() or os.clock()<(controller.nextStock or 0) then return false end
     local count=0
     for _,item in pairs(inventory(c.data,"Lootbox")) do
-        if not item._lk and c.api.boxes.Index(item.id) then count+=item._am or 1 end
+        if not item._lk and c.api.boxes.Index(item.id) and (boxKeep[item.id] or 0)==0 then count+=item._am or 1 end
     end
     if count==0 then return false end
     local pad=c.model:FindFirstChild("StockPad")
@@ -374,20 +435,33 @@ local function stockStep(c)
 end
 
 -- ============================================================================
--- [MS-MERCHANT] Mua theo slot/seed server; giữ tiền nhà trước khi mua decor.
+-- [MS-MERCHANT] Chỉ mua loại decor chưa có trên kệ lẫn trong kho, giữ tiền nhà.
+local function ownedDecor(c)
+    local owned={}
+    -- Đồ khóa cũng đã thuộc người chơi: không mua trùng chỉ vì chưa được đặt.
+    for _,item in pairs(inventory(c.data,"Misc")) do
+        if item.id and (item._am or 1)>0 then owned[item.id]=true end
+    end
+    for _,id in pairs(c.plot:Save("Plinths") or {}) do
+        if type(id)=="string" then owned[id]=true end
+    end
+    return owned
+end
 local function merchantChoice(c,shelf)
     if type(shelf)~="table" or type(shelf.Offers)~="table" or type(shelf.Seed)~="number" then return end
     local reserve=0
     if enabled("EventStoreAutoLevel") and c.level<#c.api.definitions.LEVELS then
         reserve=c.api.buttons.Price(c.level+1) or 0
     end
+    local owned=ownedDecor(c)
     local best
     for slot,offer in pairs(shelf.Offers) do
         local item,price=offer.ItemData,offer.PriceData
         local id=item and item.data and item.data.id
         local money=price and price.data
         if tonumber(slot) and offer.Stock and offer.Stock>0 and item and item.class=="Misc"
-            and c.api.decorDefs.Piece(id) and price and price.class=="Currency" and money and money.id=="MysteryStoreCoins" then
+            and c.api.decorDefs.Piece(id) and not owned[id]
+            and price and price.class=="Currency" and money and money.id=="MysteryStoreCoins" then
             local cost=money._am or 1
             local value=c.api.decor.Value(id) or 0
             if cost>0 and cost<=math.max(0,c.coins-reserve) and (not best or value>best.value) then
@@ -418,7 +492,7 @@ local function merchantStep(c)
         local moved=approach(c,flag,machineSpot(c,"MysteryStoreDecorMerchant"))
         local owned=lease
         if moved then task.wait(0.5) end
-        if owned then releaseLease(owned) end
+        if owned and owned.flag==flag then releaseLease(owned) end
         controller.nextOffers=os.clock()+15
         report("merchant","Đang chờ danh sách hàng và seed do game gửi.")
         return moved
@@ -432,7 +506,10 @@ local function merchantStep(c)
         local offer=current and current.Offers and current.Offers[tostring(choice.slot)]
         local reserve=enabled("EventStoreAutoLevel") and f.level<#f.api.definitions.LEVELS
             and (f.api.buttons.Price(f.level+1) or 0) or 0
-        return current and current.Seed==choice.seed and offer and offer.Stock>0 and f.coins-reserve>=choice.cost
+        local item=offer and offer.ItemData
+        return current and current.Seed==choice.seed and offer and offer.Stock>0
+            and item and item.class=="Misc" and item.data and item.data.id==choice.id
+            and not ownedDecor(f)[choice.id] and f.coins-reserve>=choice.cost
     end,machineSpot(c,"MysteryStoreDecorMerchant"))
 end
 
@@ -455,6 +532,49 @@ local function giftStep(c)
                 return current and current.id==p.id and not current._lk and (current._am or 1)>=count
             end,c.api.base.ZoneLanding(c.plot),false,"gift")
         end
+    end
+end
+
+-- ============================================================================
+-- [MS-BOOST] Dùng hết mọi cấp boost event, không đọc thời gian hiệu ứng đang có.
+local function boostStep(c)
+    local flag="EventStoreAutoBoost"
+    if not enabled(flag) or waiting("boost",c) then return end
+    local allowed={}
+    for _,id in pairs(c.api.boostDefs.ITEMS) do allowed[id]=true end
+    local candidates={}
+    for uid,item in pairs(inventory(c.data,"Consumable")) do
+        if allowed[item.id] and not item._lk and (item._am or 1)>0 then
+            candidates[#candidates+1]={uid=uid,id=item.id,before=item._am or 1,tier=item.tn or 1}
+        end
+    end
+    table.sort(candidates,function(a,b)
+        if a.tier~=b.tier then return a.tier>b.tier end
+        return tostring(a.uid)<tostring(b.uid)
+    end)
+    session.boostBatch=session.boostBatch or {}
+    for _,p in ipairs(candidates) do
+        if not valid(c,flag) then return end
+        p.kind="boost";p.key="boost:"..p.uid
+        if os.clock()<(session.nextAt[p.key] or 0) then continue end
+        local count=math.min(p.before,session.boostBatch[p.uid] or p.before)
+        local sent=dispatch(c,flag,p,function(f)
+            for _,item in pairs(f.api.items.Consumable(p.id):FindAny() or {}) do
+                if item:GetUID()==p.uid and not item:IsLocked() then
+                    local accepted,message=f.api.consumables.Consume(item,count)
+                    if accepted==false then
+                        -- Server từ chối lô lớn: thử lô nhỏ hơn sau cooldown, vẫn dùng tới hết.
+                        session.boostBatch[p.uid]=math.max(1,math.floor(count/2))
+                    end
+                    return accepted,message
+                end
+            end
+            return false,"Stack boost chưa sẵn sàng."
+        end,function(f)
+            local item=inventory(f.data,"Consumable")[p.uid]
+            return item and item.id==p.id and not item._lk and (item._am or 1)>=count
+        end,nil,false,"boost")
+        if sent then return end
     end
 end
 
@@ -524,17 +644,93 @@ local function farmStep(c)
 end
 
 -- ============================================================================
--- [MS-WORKERS] Main giao dịch tuần tự; farm/gift không bị animation giữ vòng chính.
+-- [MS-OPTIMIZE] Giảm công tạo/animate model và FX, phần Super Optimize chưa chặn.
+-- Không sửa save, mạng, customers metadata, máy/pad, collision hoặc cách tính reward.
+local visualEdits={}
+local visualInstalled=false
+local function restoreVisuals()
+    for index=#visualEdits,1,-1 do
+        local edit=visualEdits[index]
+        -- Không ghi đè patch mới của script khác khi người dùng tắt/reload.
+        if edit.object[edit.key]==edit.applied then
+            local ok,problem=pcall(function()edit.object[edit.key]=edit.original end)
+            if not ok then report("optimize",problem) end
+        end
+    end
+    table.clear(visualEdits)
+    visualInstalled=false
+    controller.optimizeCount=0
+end
+local function installVisuals()
+    if visualInstalled then return end
+    local a=api()
+    local function patch(object,key,value)
+        if type(object)~="table" or object[key]==nil then return end
+        local original=object[key]
+        local ok,problem=pcall(function()object[key]=value end)
+        if ok then visualEdits[#visualEdits+1]={object=object,key=key,original=original,applied=value}
+        else report("optimize",problem) end
+    end
+    local function cosmetic(object,key,zero)
+        local original=object and object[key]
+        if type(original)~="function" then return end
+        patch(object,key,function(...)
+            if enabled("EventStoreOptimize") and a.instancing.GetInstanceID()=="MysteryStore" then
+                if zero then return 0 end
+                return
+            end
+            return original(...)
+        end)
+    end
+    local function feature(name)
+        local ok,value=pcall(a.store.Feature,name)
+        if ok then return value end
+        report("optimize:"..name,value)
+        return nil
+    end
+    local rigs=feature("Rigs")
+    cosmetic(rigs,"OnScreen",true)
+    cosmetic(rigs,"DrawDistance",true)
+    cosmetic(rigs,"AnimDistance",true)
+    patch(rigs,"MAX_PINS",0)
+    local customers=feature("Customers")
+    patch(customers,"PINNED",{})
+    patch(customers,"SELECT_EVERY",1)
+    patch(customers,"SELECT_BACKLOG",1)
+    -- Giữ callback mạng gốc; chỉ bỏ phần tạo mô hình/hoạt ảnh phía client.
+    local swap=feature("Swap")
+    cosmetic(swap,"Play")
+    cosmetic(swap,"PlayChase")
+    patch(feature("BoxDropFx"),"MAX_ALIVE",0)
+    local decor=feature("DecorFx")
+    cosmetic(decor,"Placed")
+    cosmetic(decor,"ChipChanged")
+    cosmetic(feature("LevelFx"),"LevelUp")
+    local boost=feature("BoostFx")
+    for _,key in ipairs({"Pulse","Flash","TierThree","Expired"})do cosmetic(boost,key)end
+    cosmetic(feature("Upgrades"),"FXScale",true)
+    controller.optimizeCount=#visualEdits
+    visualInstalled=true
+end
+
+-- ============================================================================
+-- [MS-WORKERS] Main tuần tự; farm/gift/boost riêng, không bị animation giữ vòng chính.
 local function mainStep(c)
     if waiting("main",c) or lease then return end
     if levelStep(c) or registerStep(c) or decorStep(c) or combineStep(c) or merchantStep(c) or stockStep(c) then return end
     if enabled("EventStoreFastFarm") and not lease and not c.api.pad.OnPad() then
         local landing=c.api.base.ZoneLanding(c.plot)
-        if landing and (c.root.Position-landing.Position).Magnitude>12 then c.character:PivotTo(landing) end
+        if landing and (c.root.Position-landing.Position).Magnitude>12 then
+            local ok=approach(c,"EventStoreFastFarm",landing)
+            local owned=lease
+            if ok and owned then owned.back=landing end
+            if owned then releaseLease(owned) end
+        end
     end
 end
 local function anyEnabled()
-    for _,on in pairs(controller.flags)do if on then return true end end
+    -- Optimize đơn lẻ không tạo 4 worker auto hoặc đọc Save liên tục.
+    for flag,on in pairs(controller.flags)do if flag~="EventStoreOptimize" and on then return true end end
     return false
 end
 local function stopJobs()
@@ -544,7 +740,7 @@ local function stopJobs()
     pcall(releaseLease)
     pcall(clearFarm)
 end
-controller.Stop=function()controller.active=false;stopJobs()end
+controller.Stop=function()controller.active=false;stopJobs();restoreVisuals()end
 local function worker(name,delay,step)
     controller.jobs[name]=task.defer(function()
         while controller.active and anyEnabled() do
@@ -565,6 +761,13 @@ local function setToggle(flag,on,shared)
     if not controller.active then return end
     controller.flags[flag]=on==true
     controller.shared=shared or controller.shared
+    if flag=="EventStoreOptimize" then
+        if on then
+            local ok,problem=pcall(installVisuals)
+            if not ok then restoreVisuals();report("optimize",problem) end
+        else restoreVisuals() end
+        return
+    end
     if not on then
         if flag=="EventStoreFastFarm" then pcall(clearFarm) end
         if lease and lease.flag==flag then pcall(releaseLease) end
@@ -577,19 +780,49 @@ local function setToggle(flag,on,shared)
         worker("main",0.25,mainStep)
         worker("farm",0.12,farmStep)
         worker("gift",1,giftStep)
+        worker("boost",0.5,boostStep)
     end
 end
 controller.Status=function()
     local flags={}
     for flag,on in pairs(controller.flags)do flags[flag]=on end
-    return {active=controller.active,flags=flags,moving=lease and lease.flag,
+    local keep={}
+    for id,count in pairs(boxKeep) do keep[id]=count end
+    return {active=controller.active,flags=flags,movement=movement.mode,keepBoxes=keep,moving=lease and lease.flag,
+        optimizePatches=controller.optimizeCount or 0,
         pending=session.pending,errors=controller.errors}
 end
+local function configure(settings)
+    if not controller.active then return end
+    settings=settings or {}
+    assert(type(settings)=="table","eventStore cần là bảng cấu hình")
+    local mode=settings.movement or movement.mode
+    assert(mode=="teleport" or mode=="walk","eventStore.movement cần là teleport hoặc walk")
+    local timeout=tonumber(settings.walkTimeout) or movement.timeout
+    assert(timeout>=5 and timeout<=180,"eventStore.walkTimeout cần từ5 tới180giây")
+    local keep={}
+    for id,count in pairs(boxKeep) do keep[id]=count end
+    if settings.keepBoxes~=nil then
+        assert(type(settings.keepBoxes)=="table","eventStore.keepBoxes cần là bảng số lượng giữ")
+        for id,value in pairs(settings.keepBoxes) do
+            assert(boxKeep[id]~=nil,"keepBoxes chỉ hỗ trợ MysteryStore Box 3 và MysteryStore Box 4")
+            local count=tonumber(value)
+            assert(count and count>=0 and count<math.huge and count==math.floor(count),"Số hộp giữ cần là số nguyên >=0")
+            keep[id]=count
+        end
+    end
+    movement.version+=1
+    movement.mode, movement.timeout=mode,timeout
+    boxKeep=keep
+    if lease then releaseLease() end
+end
+controller.Configure=configure
+features.EventStoreSettings={configure=configure}
 
 -- ============================================================================
 -- [MS-EXPORT] Callback chung cho UI và launcher; không tự bật khi load.
 for _,flag in ipairs({"EventStoreFastFarm","EventStoreAutoRegister","EventStoreAutoLevel","EventStoreAutoDecor",
-    "EventStoreAutoStock","EventStoreAutoGift","EventStoreAutoMerchant","EventStoreAutoCombine"}) do
+    "EventStoreAutoStock","EventStoreAutoGift","EventStoreAutoMerchant","EventStoreAutoCombine","EventStoreAutoBoost","EventStoreOptimize"}) do
     features[flag]={duy=function(on,shared)setToggle(flag,on,shared)end}
 end
 return features
