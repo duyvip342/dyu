@@ -1,828 +1,802 @@
--- Mystery Store / duyvip342. UI và cấu hình nằm trong UI.lua.
--- MS-CORE | MS-MOVE | MS-ACTION | MS-REGISTER | MS-LEVEL | MS-DECOR
--- MS-COMBINE | MS-STOCK | MS-MERCHANT | MS-GIFT | MS-BOOST | MS-FARM | MS-OPTIMIZE | MS-WORKERS.
-local features = {}
-local environment = type(getgenv)=="function" and getgenv() or _G
-local previous = environment.RobloxHubMysteryStore
-if previous and type(previous.Stop)=="function" then previous.Stop() end
-local session = previous and previous.jobId==game.JobId and previous.session or {pending={},nextAt={}}
-local controller: any = {active=true,jobId=game.JobId,session=session,flags={},jobs={},errors={},near={}}
-environment.RobloxHubMysteryStore = controller
-local dependencies
-local lease
-local assigned = {}
-local movement={mode="teleport",timeout=45,version=0}
-local boxKeep: {[string]:number} = {["MysteryStore Box 3"]=0,["MysteryStore Box 4"]=0}
+-- 1. Cấu hình khởi chạy
+-- Ghi thời điểm khởi động trước khi tải các module.
+local scriptStartedAt = os.clock()
 
--- ============================================================================
--- [MS-CORE] API chỉ nạp khi bật tính năng; load module không khởi tạo worker.
-local function api()
-    if dependencies then return dependencies end
-    local library=game:GetService("ReplicatedStorage"):WaitForChild("Library",10)
-    assert(library,"Mystery Store: Library unavailable")
-    local client=library.Client
-    local store=require(client.MysteryStoreCmds)
-    dependencies={
-        player=game:GetService("Players").LocalPlayer,
-        store=store,base=store.Feature("Base"),pad=store.Feature("Pad"),
-        save=require(client.Save),instancing=require(client.InstancingCmds),
-        currency=require(client.CurrencyCmds),network=require(client.Network),
-        upgrades=require(client.EventUpgradeCmds),
-        upgradeDefs=require(library.Types.MysteryStore.Upgrades),
-        definitions=require(library.Types.MysteryStore),
-        buttons=require(library.Util.MysteryStoreButtons),
-        boxes=require(library.Types.MysteryStore.Boxes),
-        combine=require(library.Util.MysteryStoreCombine),
-        decorDefs=require(library.Types.MysteryStore.Decor),
-        decor=require(library.Util.MysteryStoreDecor),
-        merchant=require(library.Util.MysteryStoreMerchant),
-        items=require(library.Items),lootbox=require(client.LootboxCmds),
-        consumables=require(client.ConsumableCmds),
-        boostDefs=require(library.Util.MysteryStoreBoosts),
-        playerPet=require(client.PlayerPet),pets=require(client.PetCmds),
-        breaks=require(client.BreakableFrontend),
-        instanceParent=require(library.Types.Breakables).ParentType.Instance,
-    }
-    return dependencies
-end
-local function report(key,message)
-    message=message and tostring(message)
-    if message and controller.errors[key]~=message then warn("[Mystery Store / "..key.."] "..message) end
-    controller.errors[key]=message
-end
-local function enabled(flag)
-    return controller.active and controller.flags[flag]==true
-end
-local function inventory(data,class)
-    return data and ((data.Inventory and data.Inventory[class]) or data[class]) or {}
-end
-local function amount(data,class,id,uid)
-    local total=0
-    for key,item in pairs(inventory(data,class)) do
-        if (not uid or uid==key) and item.id==id then total+=item._am or 1 end
-    end
-    return total
-end
-local function context()
-    local a=api()
-    if a.instancing.GetInstanceID()~="MysteryStore" then return end
-    local p=a.base.Plot()
-    if not p or p:IsDestroyed() or p:GetOwner()~=a.player then return end
-    local model=p:GetModel()
-    local character=a.player.Character
-    local root=character and character:FindFirstChild("HumanoidRootPart")
-    local humanoid=character and character:FindFirstChildOfClass("Humanoid")
-    local data=a.save.Get()
-    if not model or not model.Parent or not root or not humanoid or humanoid.Health<=0 or not data then return end
-    return {api=a,plot=p,model=model,character=character,root=root,data=data,
-        scope=tostring(p.Id),level=a.buttons.Level(p:Save("Level")),
-        coins=a.currency.Get("MysteryStoreCoins") or 0,
-        own=(data.InstanceVars and data.InstanceVars.MysteryStore) or {}}
-end
-local function valid(c,flag)
-    if not enabled(flag) then return false end
-    local a=c.api
-    local humanoid=c.character:FindFirstChildOfClass("Humanoid")
-    return a.instancing.GetInstanceID()=="MysteryStore" and a.player.Character==c.character
-        and humanoid and humanoid.Health>0 and c.root.Parent==c.character
-        and c.plot==a.base.Plot() and not c.plot:IsDestroyed()
-        and c.plot:GetModel()==c.model and c.model.Parent~=nil
-end
-local function tier(c,track)
-    return c.api.upgrades.GetTier(c.api.upgradeDefs.Id(track)) or 0
-end
-local function partSpot(part)
-    if part and part:IsA("BasePart") then return part.CFrame*CFrame.new(0,part.Size.Y/2+3,0) end
-    if part and part:IsA("Model") then return part:GetPivot()*CFrame.new(0,3,0) end
-    return nil
-end
-local function machineSpot(c,name)
-    local machines=c.model:FindFirstChild("Interactable")
-    machines=machines and machines:FindFirstChild("Machines")
-    local machine=machines and machines:FindFirstChild(name)
-    if not machine then return end
-    return partSpot(machine:FindFirstChild("Pad",true)) or machine:GetPivot()*CFrame.new(0,3,0)
-end
-
--- ============================================================================
--- [MS-MOVE] Một chủ vị trí; không trả nhân vật đã chết/đổi plot hoặc tự đi nơi khác.
-local travel
-local function releaseLease(owned)
-    if owned and lease~=owned then return end
-    local old=lease
-    if not old then return end
-    local c=old.context
-    local humanoid=c.character:FindFirstChildOfClass("Humanoid")
-    if c.api.instancing.GetInstanceID()=="MysteryStore" and c.api.player.Character==c.character
-        and humanoid and humanoid.Health>0
-        and not c.plot:IsDestroyed() and c.api.base.Plot()==c.plot and c.plot:GetModel()==c.model
-        and c.root.Parent==c.character and (c.root.Position-old.destination.Position).Magnitude<9
-        and old.version==movement.version then
-        if old.mode=="walk" then
-            if valid(c,old.flag) then travel(c,old.flag,old.back,old) end
-        else c.character:PivotTo(old.back) end
-    end
-    if old.mode=="walk" and humanoid and c.root.Parent==c.character then humanoid:MoveTo(c.root.Position) end
-    if lease==old then lease=nil end
-end
-travel=function(c,flag,spot,owned)
-    if not valid(c,flag) or lease~=owned or owned.version~=movement.version then return false end
-    if owned.mode=="teleport" then
-        if (c.root.Position-spot.Position).Magnitude>2 then
-            c.root.AssemblyLinearVelocity=Vector3.zero
-            c.character:PivotTo(spot)
-            task.wait(0.2)
-        end
-        return valid(c,flag) and lease==owned and owned.version==movement.version
-    end
-    local humanoid=c.character:FindFirstChildOfClass("Humanoid")
-    if not humanoid then return false end
-    local service=c.api.pathfinding or game:GetService("PathfindingService")
-    local path=service:CreatePath({AgentCanJump=true,WaypointSpacing=5})
-    local ok=pcall(path.ComputeAsync,path,c.root.Position,spot.Position)
-    if not valid(c,flag) or lease~=owned or owned.version~=movement.version then return false end
-    if not ok or path.Status~=Enum.PathStatus.Success then
-        report("movement","Không tìm được đường chạy bộ; chưa gửi thao tác.")
-        return false
-    end
-    local deadline=os.clock()+movement.timeout
-    for _,waypoint in ipairs(path:GetWaypoints()) do
-        if not valid(c,flag) or lease~=owned or owned.version~=movement.version then return false end
-        if waypoint.Action==Enum.PathWaypointAction.Jump then humanoid.Jump=true end
-        humanoid:MoveTo(waypoint.Position)
-        local segmentDeadline=math.min(deadline,os.clock()+8)
-        while (c.root.Position-waypoint.Position).Magnitude>3 do
-            if not valid(c,flag) or lease~=owned or owned.version~=movement.version then return false end
-            if os.clock()>=segmentDeadline then
-                humanoid:MoveTo(c.root.Position)
-                report("movement","Chạy bộ bị kẹt hoặc hết thời gian; chưa gửi thao tác.")
-                return false
-            end
-            task.wait(0.1)
+-- Launcher có thể truyền cấu hình riêng cho lần chạy này.
+local environment = type(getgenv) == "function" and getgenv() or _G
+local launchConfig = environment.RobloxHubConfig
+environment.RobloxHubConfig = nil
+if type(launchConfig) ~= "table" then launchConfig = nil end
+-- Flag Pumpkin Tycoon đã nghỉ: bỏ qua riêng cấu hình cũ, không gán sang event mới.
+local retiredEventControls = {
+    EventAutoOpenMap = true,
+    EventAutoRebirth = true,
+    EventAutoHuntPet = true,
+    EventAutoTurkey = true,
+    EventAutoPumpkin = true,
+    EventAutoBuyPumpkin = true,
+    EventAutoHotCoca = true,
+    EventAutoFlannelGift = true,
+    EventAutoGiftHuge = true,
+    EventOptimize = true,
+    EventFastFarm = true,
+    EventStatsGui = true,
+    EventAutoPumpkinUpgrade = true,
+    EventAutoEquipBoost = true,
+    EventHugeGiftRecipient = true,
+    EventPumpkinUpgradeSelection = true,
+    EventBoostSelection = true,
+}
+if launchConfig then
+    local cleaned = {}
+    for key, value in pairs(launchConfig) do cleaned[key] = value end
+    if type(launchConfig.controls) == "table" then
+        cleaned.controls = {}
+        for flag, value in pairs(launchConfig.controls) do
+            if not retiredEventControls[flag] then cleaned.controls[flag] = value end
         end
     end
-    report("movement",nil)
-    return valid(c,flag) and lease==owned and owned.version==movement.version
-        and (c.root.Position-spot.Position).Magnitude<=5
-end
-local function approach(c,flag,spot)
-    if not spot or lease or not valid(c,flag) then return false end
-    local back=c.character:GetPivot()
-    if enabled("EventStoreAutoCombine") and c.api.pad.OnPad() then back=c.api.base.ZoneLanding(c.plot) or back end
-    lease={context=c,flag=flag,back=back,destination=spot,mode=movement.mode,version=movement.version}
-    return travel(c,flag,spot,lease)
+    if type(launchConfig.actions) == "table" then
+        cleaned.actions = {}
+        for _, action in ipairs(launchConfig.actions) do
+            local flag = type(action) == "table" and (action.set or action.press)
+            if not retiredEventControls[flag] then table.insert(cleaned.actions, action) end
+        end
+    end
+    launchConfig = cleaned
 end
 
--- ============================================================================
--- [MS-ACTION] Khóa request trước Invoke; xác nhận bằng dữ liệu server, không UI giả.
-local function confirmed(p,c)
-    if p.scope~=c.scope then return true end
-    if p.kind=="level" then return c.level>=p.want end
-    if p.kind=="register" then return tier(c,p.track)>=p.want end
-    if p.kind=="decor" then
-        local placed=c.plot:Save("Plinths") or {}
-        return (placed[tostring(p.slot)] or placed[p.slot])==p.id
-    end
-    if p.kind=="unlock" then
-        return c.api.definitions.BoxLocked(c.own.BoxLocks,p.rung)==(p.locked==true)
-    end
-    if p.kind=="combine" or p.kind=="gift" then return amount(c.data,"Lootbox",p.id,p.uid)<p.before end
-    if p.kind=="boost" then return amount(c.data,"Consumable",p.id,p.uid)<p.before end
-    if p.kind=="merchant" then
-        if amount(c.data,"Misc",p.id)>p.before then return true end
-        local shelf=controller.offers and controller.offers.MysteryStoreDecorMerchant
-        local offer=shelf and shelf.Seed==p.seed and shelf.Offers and shelf.Offers[tostring(p.slot)]
-        return offer and offer.Stock<p.stock or false
-    end
-    return false
-end
-local function waiting(channel,c)
-    local p=session.pending[channel]
-    if not p then return false end
-    if confirmed(p,c) then session.pending[channel]=nil;return false end
-    if os.clock()-p.at<12 then return true end
-    session.pending[channel]=nil
-    session.nextAt[p.key]=os.clock()+5
-    report(p.kind,"Chưa thấy dữ liệu xác nhận; giãn nhịp trước khi thử lại.")
-    return false
-end
-local function distanceError(message)
-    local s=tostring(message or ""):lower()
-    return s:find("distance",1,true) or s:find("too far",1,true) or s:find("closer",1,true)
-        or s:find("near the",1,true) or s:find("stand on",1,true) or s:find("nearby",1,true)
-        or s:find("not enough space",1,true)
-        or s:find("near ",1,true) or s:find("inside your",1,true)
-        or s:find("your own store",1,true) or s:find("step on",1,true)
-end
-local function dispatch(c,flag,p,send,check,spot,forceNear,channel)
-    channel=channel or "main"
-    if (lease and channel~="boost") or not valid(c,flag) or waiting(channel,c)
-        or os.clock()<(session.nextAt[p.key] or 0) then return false end
-    local owned
-    if forceNear or controller.near[p.kind] then
-        local ok=approach(c,flag,spot)
-        owned=lease
-        if not ok then releaseLease(owned);return false end
-    end
-    local fresh=context()
-    if not fresh or fresh.plot~=c.plot or not valid(c,flag) or (check and not check(fresh)) then
-        if owned then releaseLease(owned) end
-        return false
-    end
-    p.scope=c.scope;p.at=os.clock()
-    session.pending[channel]=p
-    local ok,accepted,message=pcall(send,fresh)
-    if not controller.active then return true end
-    session.nextAt[p.key]=os.clock()+0.5
-    if ok and accepted==true then report(p.kind,nil)
-    elseif ok then
-        session.pending[channel]=nil
-        local seconds=tonumber(tostring(message):match("([%d.]+)%s*second")) or 0
-        session.nextAt[p.key]=os.clock()+math.max(3,math.min(30,seconds))
-        if distanceError(message) and spot then controller.near[p.kind]=true end
-        report(p.kind,message or "Game chưa chấp nhận thao tác.")
-    else report(p.kind,accepted) end
-    if owned then releaseLease(owned) end
-    return true
-end
+local launchToggles = launchConfig and type(launchConfig.toggles) == "table" and launchConfig.toggles or {}
+local startupActions = {}
 
--- ============================================================================
--- [MS-REGISTER] Tier2 là tổng cấp đã mua, không mua thêm 2 lần mỗi khi exec lại.
-local otherTracks={"BoothSlots","PadSpeed","BoxDrops","CustomerFlow"}
-local function foundationDone(c)
-    for _,track in ipairs(otherTracks) do
-        if tier(c,track)<math.min(2,c.api.upgradeDefs.MaxTier(track)) then return false end
+-- Anti-AFK / Gửi phím Space mỗi phút.
+do
+    -- Dừng vòng nhảy từ bản cũ.
+    if environment.RobloxHubAntiAfkJob then
+        pcall(task.cancel, environment.RobloxHubAntiAfkJob)
+        environment.RobloxHubAntiAfkJob = nil
     end
-    return true
-end
-local function registerTrack(c)
-    local defs=c.api.upgradeDefs
-    if c.level<3 then
-        if tier(c,"CoinYield")<defs.MaxTier("CoinYield") then return "CoinYield" end
-    elseif c.level<5 then
-        for _,track in ipairs(otherTracks) do
-            local current=tier(c,track)
-            local cost=defs.Price(track,current+1)
-            if current<math.min(2,defs.MaxTier(track)) and cost and cost<=c.coins then return track end
+
+    -- Gỡ kết nối anti-AFK của lần chạy trước.
+    if environment.RobloxHubAntiAfkConnection then
+        environment.RobloxHubAntiAfkConnection:Disconnect()
+        environment.RobloxHubAntiAfkConnection = nil
+    end
+
+    -- Gỡ kết nối theo dõi idle của lần chạy trước.
+    if environment.RobloxHubAntiAfkIdleConnection then
+        environment.RobloxHubAntiAfkIdleConnection:Disconnect()
+        environment.RobloxHubAntiAfkIdleConnection = nil
+    end
+
+    -- Dừng đoạn exec thử nếu nó vẫn đang gửi phím.
+    if type(environment.StopAfkTest) == "function" then
+        environment.StopAfkTest()
+        environment.StopAfkTest = nil
+    end
+
+    local input = game:GetService("UserInputService")
+    local useNativeInput = type(keypress) == "function" and type(keyrelease) == "function"
+    local setSpace
+    if useNativeInput then
+        setSpace = function(down)
+            if down then keypress(0x20) else keyrelease(0x20) end
         end
     else
-        local order={"CoinYield","BoothSlots","PadSpeed","BoxDrops","CustomerFlow"}
-        for offset=0,#order-1 do
-            local index=((controller.upgradeIndex or 1)+offset-1)%#order+1
-            local track=order[index]
-            local current=tier(c,track)
-            local cost=defs.Price(track,current+1)
-            if current<defs.MaxTier(track) and cost and cost<=c.coins then return track,index end
-        end
-    end
-end
-local function registerStep(c)
-    local flag="EventStoreAutoRegister"
-    if not enabled(flag) then return false end
-    local track,index=registerTrack(c)
-    if not track then return false end
-    local want=tier(c,track)+1
-    local cost=c.api.upgradeDefs.Price(track,want)
-    if not cost or cost>c.coins then return false end
-    local sent=dispatch(c,flag,{kind="register",key="register:"..track,track=track,want=want},
-        function(f)return f.api.upgrades.Purchase(f.api.upgradeDefs.Id(track))end,
-        function(f)return tier(f,track)==want-1 and f.coins>=(f.api.upgradeDefs.Price(track,want) or math.huge)
-            and registerTrack(f)==track end,machineSpot(c,"MysteryStoreUpgradeMachine"))
-    if sent and index then controller.upgradeIndex=index%5+1 end
-    return sent
-end
-
--- ============================================================================
--- [MS-LEVEL] Đủ tiền mua tầng tiếp; nếu bật Register thì hoàn thành nền tier2 trước.
-local function levelStep(c)
-    local flag="EventStoreAutoLevel"
-    if not enabled(flag) or c.level>=#c.api.definitions.LEVELS then return false end
-    if c.level>=3 and enabled("EventStoreAutoRegister") and not foundationDone(c) then return false end
-    local want=c.level+1
-    local can,_,_,cost=c.api.buttons.CanBuy(c.level,want)
-    if not can or not cost or c.coins<cost then return false end
-    local spot=c.api.buttons.ResolvedSpot(c.model,want)
-    if spot then spot=spot*CFrame.new(0,3,0) end
-    return dispatch(c,flag,{kind="level",key="level:"..want,want=want},
-        function(f)return f.plot:Invoke(f.api.definitions.NET.BuyLevel,want)end,
-        function(f)return f.level==want-1 and f.coins>=(f.api.buttons.Price(want) or math.huge)
-            and (f.level<3 or not enabled("EventStoreAutoRegister") or foundationDone(f))end,spot)
-end
-
--- ============================================================================
--- [MS-DECOR] Lấp chỗ trống rồi thay món có % thấp nhất; cùng % không thay qua lại.
-local function decorChoice(c)
-    local best,bestValue
-    for _,id in ipairs(c.api.decorDefs.IDS) do
-        local available=0
-        for _,item in pairs(inventory(c.data,"Misc")) do
-            if item.id==id and not item._lk then available+=item._am or 1 end
-        end
-        local value=c.api.decor.Value(id) or 0
-        if available>0 and (not best or value>bestValue) then best,bestValue=id,value end
-    end
-    if not best then return end
-    local placed=c.plot:Save("Plinths") or {}
-    local worstSlot,worstValue
-    for slot=1,c.api.decorDefs.PlinthCount(c.level) do
-        local id=placed[tostring(slot)] or placed[slot]
-        if not id then return slot,best,bestValue end
-        local value=c.api.decor.Value(id) or 0
-        if not worstSlot or value<worstValue then worstSlot,worstValue=slot,value end
-    end
-    if worstSlot and bestValue>worstValue then return worstSlot,best,bestValue end
-end
-local function decorStep(c)
-    local flag="EventStoreAutoDecor"
-    if not enabled(flag) then return false end
-    local slot,id=decorChoice(c)
-    if not slot then return false end
-    local plinths=c.model:FindFirstChild("Plinths")
-    local marker=plinths and plinths:FindFirstChild(c.api.decorDefs.Marker(slot))
-    local placed=c.plot:Save("Plinths") or {}
-    local old=placed[tostring(slot)] or placed[slot]
-    if old then
-        -- Tháo món thấp nhất, chờ server xác nhận rồi mới đặt món tốt hơn.
-        return dispatch(c,flag,{kind="decor",key="decor:"..slot,slot=slot},
-            function(f)return f.plot:Invoke(f.api.definitions.NET.PlaceDecor,slot,nil)end,
-            function(f)local s,i=decorChoice(f);return s==slot and i==id end,partSpot(marker))
-    end
-    return dispatch(c,flag,{kind="decor",key="decor:"..slot,slot=slot,id=id},
-        function(f)return f.plot:Invoke(f.api.definitions.NET.PlaceDecor,slot,id)end,
-        function(f)local s,i=decorChoice(f);return s==slot and i==id end,partSpot(marker))
-end
-
--- ============================================================================
--- [MS-COMBINE] Cấp cao trước, dùng số bộ theo Ratio game; không ghép vật phẩm khóa.
-local function combineChoice(c)
-    for rung=c.api.boxes.Count()-1,1,-1 do
-        local box=c.api.boxes.Box(rung)
-        local ratio=c.api.combine.Ratio(rung)
-        local available=0
-        for _,item in pairs(inventory(c.data,"Lootbox")) do
-            if item.id==box.Id and not item._lk then available+=item._am or 1 end
-        end
-        local surplus=available-(boxKeep[box.Id] or 0)
-        if ratio>0 and surplus>=ratio then
-            for uid,item in pairs(inventory(c.data,"Lootbox")) do
-                local count=item._am or 1
-                if item.id==box.Id and not item._lk and count>=ratio then
-                    return {uid=uid,id=item.id,before=count,rung=rung,
-                        sets=math.min(math.floor(math.min(count,surplus)/ratio),c.api.combine.MAX_SETS)}
-                end
+        local ok, virtualInput = pcall(function() return input:CreateVirtualInput() end)
+        if ok and virtualInput then
+            setSpace = function(down)
+                virtualInput:SendKey(down, Enum.KeyCode.Space, false)
             end
         end
     end
-end
-local function combineStep(c)
-    local flag="EventStoreAutoCombine"
-    if not enabled(flag) then return false end
-    local choice=combineChoice(c)
-    if not choice then return false end
-    choice.kind="combine";choice.key="combine:"..choice.uid
-    local onPad=c.api.pad.OnPad()
-    local spot=onPad and c.api.base.ZoneLanding(c.plot) or machineSpot(c,"MysteryStoreCombineMachine")
-    if controller.near.combine then spot=machineSpot(c,"MysteryStoreCombineMachine") end
-    return dispatch(c,flag,choice,
-        function(f)return f.plot:Invoke(f.api.definitions.NET.CombineBoxes,choice.uid,choice.sets)end,
-        function(f)
-            local item=inventory(f.data,"Lootbox")[choice.uid]
-            local available=0
-            for _,entry in pairs(inventory(f.data,"Lootbox")) do
-                if entry.id==choice.id and not entry._lk then available+=entry._am or 1 end
-            end
-            local required=choice.sets*f.api.combine.Ratio(choice.rung)
-            return item and item.id==choice.id and not item._lk
-                and (item._am or 1)>=required and available-(boxKeep[choice.id] or 0)>=required
-        end,spot,onPad)
-end
 
--- ============================================================================
--- [MS-STOCK] Giữ khóa bán loại có reserve; còn lại unlock. Không sửa CanStock.
-local function stockStep(c)
-    local flag="EventStoreAutoStock"
-    if not enabled(flag) then return false end
-    if enabled("EventStoreAutoCombine") and combineChoice(c) then return false end
-    for rung=c.api.definitions.LOCKABLE_FROM,c.api.boxes.Count() do
-        local box=c.api.boxes.Box(rung)
-        local locked=(boxKeep[box.Id] or 0)>0
-        if c.api.definitions.BoxLocked(c.own.BoxLocks,rung)~=locked then
-            return dispatch(c,flag,{kind="unlock",key="boxlock:"..rung..":"..tostring(locked),rung=rung,locked=locked},
-                function(f)return f.plot:Invoke(f.api.definitions.NET.LockBox,rung,locked)end,
-                function()return ((boxKeep[box.Id] or 0)>0)==locked end)
-        end
-    end
-    if c.api.pad.BoothFull() or os.clock()<(controller.nextStock or 0) then return false end
-    local count=0
-    for _,item in pairs(inventory(c.data,"Lootbox")) do
-        if not item._lk and c.api.boxes.Index(item.id) and (boxKeep[item.id] or 0)==0 then count+=item._am or 1 end
-    end
-    if count==0 then return false end
-    local pad=c.model:FindFirstChild("StockPad")
-    local ok=approach(c,flag,partSpot(pad))
-    local owned=lease
-    if not ok then if owned and owned.flag==flag then releaseLease(owned)end;return false end
-    local deadline=os.clock()+3
-    while valid(c,flag) and os.clock()<deadline and not c.api.pad.BoothFull() do
-        local fresh=context()
-        if not fresh or fresh.plot~=c.plot then break end
-        if enabled("EventStoreAutoCombine") and combineChoice(fresh) then break end
-        task.wait(0.2)
-    end
-    releaseLease(owned)
-    controller.nextStock=os.clock()+2
-    return true
-end
-
--- ============================================================================
--- [MS-MERCHANT] Chỉ mua loại decor chưa có trên kệ lẫn trong kho, giữ tiền nhà.
-local function ownedDecor(c)
-    local owned={}
-    -- Đồ khóa cũng đã thuộc người chơi: không mua trùng chỉ vì chưa được đặt.
-    for _,item in pairs(inventory(c.data,"Misc")) do
-        if item.id and (item._am or 1)>0 then owned[item.id]=true end
-    end
-    for _,id in pairs(c.plot:Save("Plinths") or {}) do
-        if type(id)=="string" then owned[id]=true end
-    end
-    return owned
-end
-local function merchantChoice(c,shelf)
-    if type(shelf)~="table" or type(shelf.Offers)~="table" or type(shelf.Seed)~="number" then return end
-    local reserve=0
-    if enabled("EventStoreAutoLevel") and c.level<#c.api.definitions.LEVELS then
-        reserve=c.api.buttons.Price(c.level+1) or 0
-    end
-    local owned=ownedDecor(c)
-    local best
-    for slot,offer in pairs(shelf.Offers) do
-        local item,price=offer.ItemData,offer.PriceData
-        local id=item and item.data and item.data.id
-        local money=price and price.data
-        if tonumber(slot) and offer.Stock and offer.Stock>0 and item and item.class=="Misc"
-            and c.api.decorDefs.Piece(id) and not owned[id]
-            and price and price.class=="Currency" and money and money.id=="MysteryStoreCoins" then
-            local cost=money._am or 1
-            local value=c.api.decor.Value(id) or 0
-            if cost>0 and cost<=math.max(0,c.coins-reserve) and (not best or value>best.value) then
-                best={kind="merchant",key="merchant:"..shelf.Seed..":"..slot,slot=tonumber(slot),
-                    seed=shelf.Seed,id=id,stock=offer.Stock,before=amount(c.data,"Misc",id),cost=cost,value=value}
-            end
-        end
-    end
-    return best
-end
-local function merchantStep(c)
-    local flag="EventStoreAutoMerchant"
-    if not enabled(flag) or lease or os.clock()<(controller.nextOffers or 0) then return false end
-    if not controller.merchantConnection then
-        controller.merchantConnection=c.api.network.Fired("Merchant_Updated"):Connect(function(offers)
-            if controller.active and type(offers)=="table" then controller.offers=offers;controller.nextOffers=0 end
+    if setSpace and (not launchConfig or launchConfig.antiAfk ~= false) then
+        local player = game:GetService("Players").LocalPlayer
+        -- Báo số giây Roblox vẫn tính là idle.
+        environment.RobloxHubAntiAfkIdleConnection = player.Idled:Connect(function(seconds)
+            warn(("[Anti-AFK] Roblox ghi nhận idle %ds."):format(math.floor(seconds)))
         end)
-    end
-    if os.clock()>=(controller.fetchOffersAt or 0) then
-        controller.fetchOffersAt=os.clock()+15
-        local ok,result=pcall(c.api.network.Invoke,"Merchant_GetOffers")
-        if not valid(c,flag) then return false end
-        if ok and type(result)=="table" then controller.offers=result end
-    end
-    local shelf=controller.offers and controller.offers.MysteryStoreDecorMerchant
-    if not shelf then
-        -- Một số server chỉ gửi offers sau khi quầy ở gần được đăng ký.
-        local moved=approach(c,flag,machineSpot(c,"MysteryStoreDecorMerchant"))
-        local owned=lease
-        if moved then task.wait(0.5) end
-        if owned and owned.flag==flag then releaseLease(owned) end
-        controller.nextOffers=os.clock()+15
-        report("merchant","Đang chờ danh sách hàng và seed do game gửi.")
-        return moved
-    end
-    local choice=merchantChoice(c,shelf)
-    if not choice then controller.nextOffers=os.clock()+3;return false end
-    return dispatch(c,flag,choice,function(f)
-        return f.api.network.Invoke("Merchant_RequestPurchase","MysteryStoreDecorMerchant",choice.slot,false,choice.seed)
-    end,function(f)
-        local current=controller.offers and controller.offers.MysteryStoreDecorMerchant
-        local offer=current and current.Offers and current.Offers[tostring(choice.slot)]
-        local reserve=enabled("EventStoreAutoLevel") and f.level<#f.api.definitions.LEVELS
-            and (f.api.buttons.Price(f.level+1) or 0) or 0
-        local item=offer and offer.ItemData
-        return current and current.Seed==choice.seed and offer and offer.Stock>0
-            and item and item.class=="Misc" and item.data and item.data.id==choice.id
-            and not ownedDecor(f)[choice.id] and f.coins-reserve>=choice.cost
-    end,machineSpot(c,"MysteryStoreDecorMerchant"))
-end
 
--- ============================================================================
--- [MS-GIFT] Worker riêng; giữ animation gốc, chỉ mở Squishy Gift trong Lootbox.
-local function giftStep(c)
-    local flag="EventStoreAutoGift"
-    if not enabled(flag) or waiting("gift",c) then return end
-    for uid,item in pairs(inventory(c.data,"Lootbox")) do
-        if item.id=="Squishy Gift" and not item._lk then
-            local p={kind="gift",key="gift:"..uid,uid=uid,id=item.id,before=item._am or 1}
-            local count=math.min(8,p.before)
-            return dispatch(c,flag,p,function(f)
-                for _,candidate in pairs(f.api.items.Lootbox("Squishy Gift"):FindAny() or {}) do
-                    if candidate:GetUID()==uid and not candidate:IsLocked() then return f.api.lootbox.Open(candidate,count) end
-                end
-                return false,"Stack quà chưa sẵn sàng."
-            end,function(f)
-                local current=inventory(f.data,"Lootbox")[uid]
-                return current and current.id==p.id and not current._lk and (current._am or 1)>=count
-            end,c.api.base.ZoneLanding(c.plot),false,"gift")
-        end
-    end
-end
+        local nextInputAt = os.clock() + 60
+        local runService = game:GetService("RunService")
+        -- Bỏ qua lượt gửi khi input đang được dùng ở nơi khác.
+        environment.RobloxHubAntiAfkConnection = runService.Heartbeat:Connect(function()
+            local now = os.clock()
+            if now < nextInputAt then return end
+            nextInputAt = now + 60
 
--- ============================================================================
--- [MS-BOOST] Dùng hết mọi cấp boost event, không đọc thời gian hiệu ứng đang có.
-local function boostStep(c)
-    local flag="EventStoreAutoBoost"
-    if not enabled(flag) or waiting("boost",c) then return end
-    local allowed={}
-    for _,id in pairs(c.api.boostDefs.ITEMS) do allowed[id]=true end
-    local candidates={}
-    for uid,item in pairs(inventory(c.data,"Consumable")) do
-        if allowed[item.id] and not item._lk and (item._am or 1)>0 then
-            candidates[#candidates+1]={uid=uid,id=item.id,before=item._am or 1,tier=item.tn or 1}
-        end
-    end
-    table.sort(candidates,function(a,b)
-        if a.tier~=b.tier then return a.tier>b.tier end
-        return tostring(a.uid)<tostring(b.uid)
-    end)
-    session.boostBatch=session.boostBatch or {}
-    for _,p in ipairs(candidates) do
-        if not valid(c,flag) then return end
-        p.kind="boost";p.key="boost:"..p.uid
-        if os.clock()<(session.nextAt[p.key] or 0) then continue end
-        local count=math.min(p.before,session.boostBatch[p.uid] or p.before)
-        local sent=dispatch(c,flag,p,function(f)
-            for _,item in pairs(f.api.items.Consumable(p.id):FindAny() or {}) do
-                if item:GetUID()==p.uid and not item:IsLocked() then
-                    local accepted,message=f.api.consumables.Consume(item,count)
-                    if accepted==false then
-                        -- Server từ chối lô lớn: thử lô nhỏ hơn sau cooldown, vẫn dùng tới hết.
-                        session.boostBatch[p.uid]=math.max(1,math.floor(count/2))
-                    end
-                    return accepted,message
-                end
-            end
-            return false,"Stack boost chưa sẵn sàng."
-        end,function(f)
-            local item=inventory(f.data,"Consumable")[p.uid]
-            return item and item.id==p.id and not item._lk and (item._am or 1)>=count
-        end,nil,false,"boost")
-        if sent then return end
-    end
-end
-
--- ============================================================================
--- [MS-FARM] Giữ mục tiêu sống, chia pet/bulk; chỉ AreaID thuộc plot của mình.
-local function clearFarm()
-    if dependencies then
-        for _,pet in pairs(dependencies.playerPet.GetByPlayer(dependencies.player) or {}) do
-            local uid=pet.euid and assigned[pet.euid]
-            if uid and pet:GetTargetType()=="Breakable" and pet:GetTargetValue()==uid then pet:ClearTarget() end
-        end
-    end
-    table.clear(assigned)
-end
-local function farmTargets(c)
-    local things=workspace:FindFirstChild("__THINGS")
-    local folder=things and things:FindFirstChild("Breakables")
-    local result={}
-    if not folder then return result end
-    for _,model in ipairs(folder:GetChildren()) do
-        if model:GetAttribute("ParentType")==c.api.instanceParent and model:GetAttribute("ParentID")=="MysteryStore"
-            and model:GetAttribute("AreaID")=="MysteryStoreZone_"..c.scope then
-            local uid=model:GetAttribute("BreakableUID")
-            local data=uid and c.api.breaks.Get(uid)
-            if data and data.health>0 and not data.disableDamage then result[#result+1]={uid=uid,health=data.health} end
-        end
-    end
-    table.sort(result,function(a,b)
-        if a.health~=b.health then return a.health<b.health end
-        return tostring(a.uid)<tostring(b.uid)
-    end)
-    return result
-end
-local function farmStep(c)
-    if not enabled("EventStoreFastFarm") then return end
-    if controller.farmScope~=c.scope then clearFarm();controller.farmScope=c.scope end
-    local now=os.clock()
-    if now<(controller.nextTargets or 0) then return end
-    controller.nextTargets=now+0.12
-    if now>=(controller.nextEquip or 0) then c.api.pets.EquipBest();controller.nextEquip=now+15 end
-    if not valid(c,"EventStoreFastFarm") then return end
-    local targets=farmTargets(c)
-    if #targets==0 then clearFarm();return end
-    local counts,eligible,new={},{},{}
-    for _,target in ipairs(targets)do eligible[target.uid]=true end
-    local idle={}
-    for _,pet in pairs(c.api.playerPet.GetByPlayer(c.api.player) or {})do
-        local id=pet.euid
-        if id then
-            local uid=assigned[id]
-            if uid and eligible[uid] then new[id]=uid;counts[uid]=(counts[uid] or 0)+1 else idle[#idle+1]=id end
-        end
-    end
-    for _,id in ipairs(idle)do
-        local best=targets[1].uid
-        for _,target in ipairs(targets)do if (counts[target.uid] or 0)<(counts[best] or 0)then best=target.uid end end
-        new[id]=best;counts[best]=(counts[best] or 0)+1
-    end
-    local changed=false
-    for id,uid in pairs(new)do if assigned[id]~=uid then changed=true;break end end
-    assigned=new
-    if not valid(c,"EventStoreFastFarm") then return end
-    if next(new) and (changed or now>=(controller.nextBulk or 0))then
-        c.api.network.Fire("Breakables_JoinPetBulk",new);controller.nextBulk=now+1
-    end
-    c.api.network.UnreliableFire("Breakables_PlayerDealDamage",targets[1].uid)
-end
-
--- ============================================================================
--- [MS-OPTIMIZE] Giảm công tạo/animate model và FX, phần Super Optimize chưa chặn.
--- Không sửa save, mạng, customers metadata, máy/pad, collision hoặc cách tính reward.
-local visualEdits={}
-local visualInstalled=false
-local function restoreVisuals()
-    for index=#visualEdits,1,-1 do
-        local edit=visualEdits[index]
-        -- Không ghi đè patch mới của script khác khi người dùng tắt/reload.
-        if edit.object[edit.key]==edit.applied then
-            local ok,problem=pcall(function()edit.object[edit.key]=edit.original end)
-            if not ok then report("optimize",problem) end
-        end
-    end
-    table.clear(visualEdits)
-    visualInstalled=false
-    controller.optimizeCount=0
-end
-local function installVisuals()
-    if visualInstalled then return end
-    local a=api()
-    local function patch(object,key,value)
-        if type(object)~="table" or object[key]==nil then return end
-        local original=object[key]
-        local ok,problem=pcall(function()object[key]=value end)
-        if ok then visualEdits[#visualEdits+1]={object=object,key=key,original=original,applied=value}
-        else report("optimize",problem) end
-    end
-    local function cosmetic(object,key,zero)
-        local original=object and object[key]
-        if type(original)~="function" then return end
-        patch(object,key,function(...)
-            if enabled("EventStoreOptimize") and a.instancing.GetInstanceID()=="MysteryStore" then
-                if zero then return 0 end
+            if input:GetFocusedTextBox() or (useNativeInput and type(isrbxactive) == "function" and not isrbxactive()) then
                 return
             end
-            return original(...)
-        end)
-    end
-    local function feature(name)
-        local ok,value=pcall(a.store.Feature,name)
-        if ok then return value end
-        report("optimize:"..name,value)
-        return nil
-    end
-    local rigs=feature("Rigs")
-    cosmetic(rigs,"OnScreen",true)
-    cosmetic(rigs,"DrawDistance",true)
-    cosmetic(rigs,"AnimDistance",true)
-    patch(rigs,"MAX_PINS",0)
-    local customers=feature("Customers")
-    patch(customers,"PINNED",{})
-    patch(customers,"SELECT_EVERY",1)
-    patch(customers,"SELECT_BACKLOG",1)
-    -- Giữ callback mạng gốc; chỉ bỏ phần tạo mô hình/hoạt ảnh phía client.
-    local swap=feature("Swap")
-    cosmetic(swap,"Play")
-    cosmetic(swap,"PlayChase")
-    patch(feature("BoxDropFx"),"MAX_ALIVE",0)
-    local decor=feature("DecorFx")
-    cosmetic(decor,"Placed")
-    cosmetic(decor,"ChipChanged")
-    cosmetic(feature("LevelFx"),"LevelUp")
-    local boost=feature("BoostFx")
-    for _,key in ipairs({"Pulse","Flash","TierThree","Expired"})do cosmetic(boost,key)end
-    cosmetic(feature("Upgrades"),"FXScale",true)
-    controller.optimizeCount=#visualEdits
-    visualInstalled=true
-end
 
--- ============================================================================
--- [MS-WORKERS] Main tuần tự; farm/gift/boost riêng, không bị animation giữ vòng chính.
-local function mainStep(c)
-    if waiting("main",c) or lease then return end
-    if levelStep(c) or registerStep(c) or decorStep(c) or combineStep(c) or merchantStep(c) or stockStep(c) then return end
-    if enabled("EventStoreFastFarm") and not lease and not c.api.pad.OnPad() then
-        local landing=c.api.base.ZoneLanding(c.plot)
-        if landing and (c.root.Position-landing.Position).Magnitude>12 then
-            local ok=approach(c,"EventStoreFastFarm",landing)
-            local owned=lease
-            if ok and owned then owned.back=landing end
-            if owned then releaseLease(owned) end
-        end
-    end
-end
-local function anyEnabled()
-    -- Optimize đơn lẻ không tạo 4 worker auto hoặc đọc Save liên tục.
-    for flag,on in pairs(controller.flags)do if flag~="EventStoreOptimize" and on then return true end end
-    return false
-end
-local function stopJobs()
-    for _,job in pairs(controller.jobs)do pcall(task.cancel,job)end
-    table.clear(controller.jobs)
-    if controller.merchantConnection then controller.merchantConnection:Disconnect();controller.merchantConnection=nil end
-    pcall(releaseLease)
-    pcall(clearFarm)
-end
-controller.Stop=function()controller.active=false;stopJobs();restoreVisuals()end
-local function worker(name,delay,step)
-    controller.jobs[name]=task.defer(function()
-        while controller.active and anyEnabled() do
-            local ok,problem=pcall(function()
-                local c=context()
-                if c then step(c) elseif name=="farm" then clearFarm() end
+            local ok, err = pcall(function()
+                setSpace(true)
+                task.wait(0.08)
+                setSpace(false)
             end)
-            if not ok then
-                if lease and lease.flag~="EventStoreAutoGift" and name=="main"
-                    or lease and lease.flag=="EventStoreAutoGift" and name=="gift" then pcall(releaseLease) end
-                report(name,problem)
-            else report(name,nil) end
-            task.wait(ok and delay or 2)
+            if not ok then warn("[Anti-AFK] Gửi Space lỗi: " .. tostring(err)) end
+        end)
+    elseif not setSpace and (not launchConfig or launchConfig.antiAfk ~= false) then
+        warn("[Anti-AFK] Executor không có API gửi phím dùng được.")
+    end
+end
+
+-- 2. Tải các module tính năng
+-- Thêm một URL Raw vào danh sách cho mỗi file xử lý mới.
+local urls = {
+    "https://raw.githubusercontent.com/duyvip342/dyu/refs/heads/main/farm.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/refs/heads/main/rank.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/main/automatic.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/refs/heads/main/optimize.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/refs/heads/main/mail.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/main/webhook.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/main/event.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/main/trading.lua",
+    "https://raw.githubusercontent.com/duyvip342/dyu/main/setting.lua",
+}
+
+-- Gộp tính năng từ các module theo tên flag.
+local features = {}
+
+-- Tải lại module nếu CDN trả trang lỗi thay vì mã Lua.
+local function loadRemoteModule(url, filename)
+    local lastError
+    for attempt = 1, 3 do
+        local target = url
+        if attempt > 1 then
+            if url:find("/refs/heads/main/", 1, true) then
+                target = url:gsub("/refs/heads/main/", "/main/")
+            else
+                target = url:gsub("/main/", "/refs/heads/main/")
+            end
+            target ..= "?reload=" .. tostring(os.time()) .. "-" .. tostring(attempt)
         end
-    end)
-end
-local function setToggle(flag,on,shared)
-    if not controller.active then return end
-    controller.flags[flag]=on==true
-    controller.shared=shared or controller.shared
-    if flag=="EventStoreOptimize" then
-        if on then
-            local ok,problem=pcall(installVisuals)
-            if not ok then restoreVisuals();report("optimize",problem) end
-        else restoreVisuals() end
-        return
+        local ok, source = pcall(game.HttpGet, game, target)
+        if ok and type(source) == "string" then
+            if filename == "webhook.lua" and not source:find("%S") then return nil end
+            if source:match("^%s*<") then
+                lastError = "Máy chủ tải file trả HTML/XML thay vì Lua."
+            else
+                local chunk, problem = loadstring(source, "@" .. filename)
+                if chunk then return chunk end
+                lastError = problem
+            end
+        else
+            lastError = "Không tải được file từ GitHub."
+        end
+        if attempt < 3 then task.wait(1) end
     end
-    if not on then
-        if flag=="EventStoreFastFarm" then pcall(clearFarm) end
-        if lease and lease.flag==flag then pcall(releaseLease) end
-        if flag=="EventStoreAutoMerchant" and controller.merchantConnection then
-            controller.merchantConnection:Disconnect();controller.merchantConnection=nil
+    error(filename .. ": " .. tostring(lastError), 0)
+end
+
+for _, url in ipairs(urls) do
+    local filename = url:match("[^/]+$")
+    local loadTab = loadRemoteModule(url, filename)
+    if not loadTab then continue end
+    local moduleFeatures
+    if filename == "rank.lua" or filename == "event.lua" then
+        moduleFeatures = loadTab(scriptStartedAt)
+    else
+        moduleFeatures = loadTab()
+    end
+    assert(type(moduleFeatures) == "table", filename .. " phải trả về bảng features")
+    for flag, feature in pairs(moduleFeatures) do
+        features[flag] = feature
+    end
+end
+
+-- Danh sách do launcher quản lý; không chạy worker khi thiết lập catalog.
+if features.EventStoreSettings then
+    features.EventStoreSettings.configure(launchConfig and launchConfig.eventStore)
+elseif launchConfig and launchConfig.eventStore then
+    error("Cần cập nhật event.lua để hỗ trợ cấu hình di chuyển eventStore")
+end
+if launchConfig and type(launchConfig.lists) == "table" then
+    local lists = launchConfig.lists
+    local resolve = loadRemoteModule("https://raw.githubusercontent.com/duyvip342/dyu/main/item_catalog.lua", "item_catalog.lua")()
+    local targets = {
+        {"mail", "MailAutoGift"}, {"enchants", "AutoEquipEnchant"},
+        {"gifts", "AutoOpenGifts"},
+    }
+    for _, entry in ipairs(targets) do
+        local feature = features[entry[2]]
+        if lists[entry[1]] ~= nil then
+            assert(feature and type(feature.configureCatalog) == "function",
+                "Module chưa hỗ trợ lists." .. entry[1] .. "; cần cập nhật module cùng UI")
+            feature.configureCatalog(lists[entry[1]], resolve)
         end
     end
-    if not anyEnabled() then stopJobs();return end
-    if not next(controller.jobs) then
-        worker("main",0.25,mainStep)
-        worker("farm",0.12,farmStep)
-        worker("gift",1,giftStep)
-        worker("boost",0.5,boostStep)
+end
+
+-- 3. Tạo cửa sổ và các tab
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+
+local window = Rayfield:CreateWindow({
+    name = "Menu Roblox",
+    sidebarLayout = true,
+    configuration = {
+        autoSave = launchConfig == nil,
+        autoLoad = launchConfig == nil,
+        fileName = "RobloxHubUI",
+    },
+})
+
+-- Khai báo các tab theo thứ tự xuất hiện trên menu.
+-- Nạp registry cùng bản sửa thứ tự section (cần cập nhật cả hai file lên GitHub).
+-- Không dùng commit registry cũ vì commit đó còn tự chuyển toggle sang nhóm khác.
+local controlFactory = loadRemoteModule("https://raw.githubusercontent.com/duyvip342/dyu/main/ui_controls.lua?layout=source-order-20261121", "ui_controls.lua")()
+local ui = controlFactory(window)
+environment.RobloxHubUI = ui
+local function createTab(name)
+    return ui:WrapTab(window:CreateTab({ name = name }), name)
+end
+window:CreateTab({ name = "Stats" })
+local farm = createTab("farm")
+local optimize = createTab("optimize")
+local event = createTab("Event")
+local mail = createTab("mail")
+local trading = createTab("trading")
+local rank = createTab("rank")
+local automatic = createTab("automatic")
+local webhook = createTab("webhook")
+local setting = createTab("setting")
+local runtimeToggles = {}
+
+-- 4. Hàm tạo toggle dùng chung
+-- Launcher bật toggle qua RobloxHubConfig.toggles[flag] = true.
+-- Nối toggle Rayfield với tính năng cùng flag.
+local function createToggle(tab, name, flag)
+    local initial = launchToggles[flag] == true
+    if launchConfig and type(launchConfig.controls) == "table" and launchConfig.controls[flag] ~= nil then
+        initial = launchConfig.controls[flag] == true
     end
-end
-controller.Status=function()
-    local flags={}
-    for flag,on in pairs(controller.flags)do flags[flag]=on end
-    local keep={}
-    for id,count in pairs(boxKeep) do keep[id]=count end
-    return {active=controller.active,flags=flags,movement=movement.mode,keepBoxes=keep,moving=lease and lease.flag,
-        optimizePatches=controller.optimizeCount or 0,
-        pending=session.pending,errors=controller.errors}
-end
-local function configure(settings)
-    if not controller.active then return end
-    settings=settings or {}
-    assert(type(settings)=="table","eventStore cần là bảng cấu hình")
-    local mode=settings.movement or movement.mode
-    assert(mode=="teleport" or mode=="walk","eventStore.movement cần là teleport hoặc walk")
-    local timeout=tonumber(settings.walkTimeout) or movement.timeout
-    assert(timeout>=5 and timeout<=180,"eventStore.walkTimeout cần từ5 tới180giây")
-    local keep={}
-    for id,count in pairs(boxKeep) do keep[id]=count end
-    if settings.keepBoxes~=nil then
-        assert(type(settings.keepBoxes)=="table","eventStore.keepBoxes cần là bảng số lượng giữ")
-        for id,value in pairs(settings.keepBoxes) do
-            assert(boxKeep[id]~=nil,"keepBoxes chỉ hỗ trợ MysteryStore Box 3 và MysteryStore Box 4")
-            local count=tonumber(value)
-            assert(count and count>=0 and count<math.huge and count==math.floor(count),"Số hộp giữ cần là số nguyên >=0")
-            keep[id]=count
+    local applied = false
+    -- Áp dụng trạng thái bật tắt từ giao diện hoặc launcher.
+    local function apply(enabled)
+        runtimeToggles[flag] = enabled
+        local feature = features[flag]
+        if feature and (not launchConfig or applied ~= enabled) then
+            applied = enabled
+            feature.duy(enabled, features)
         end
     end
-    movement.version+=1
-    movement.mode, movement.timeout=mode,timeout
-    boxKeep=keep
-    if lease then releaseLease() end
+
+    local control = tab:CreateToggle({
+        name = name,
+        flag = flag,
+        value = initial,
+        callback = apply,
+    })
+    if initial then table.insert(startupActions, function() apply(true) end) end
+    return control
 end
-controller.Configure=configure
-features.EventStoreSettings={configure=configure}
+
+-- 5. Hàm xử lý và dữ liệu dùng cho giao diện
+-- Phần này không khai báo control. Các lệnh Create... nằm ở mục 6 cuối file.
+
+local function selectedOptions(options, preset)
+    local selected = {}
+    if type(preset) == "table" then
+        for _, name in ipairs(options) do
+            if table.find(preset, name) then table.insert(selected, name) end
+        end
+    end
+    return selected
+end
+
+local function setHopMinutes(value)
+    if not features.SettingsTimedHop.setMinutes(value) then
+        warn("[Timed Hop] Time phải lớn hơn 0 và không quá 10080 phút.")
+    end
+end
+
+local function resumeConfig()
+    if not launchConfig then return nil end
+    local timedHop = features.SettingsTimedHop
+    local httpService = game:GetService("HttpService")
+    local config = httpService:JSONDecode(httpService:JSONEncode(launchConfig))
+    config.toggles = type(config.toggles) == "table" and config.toggles or {}
+    for flag, value in pairs(runtimeToggles) do config.toggles[flag] = value end
+    config.controls = ui:Snapshot()
+    config.actions = nil -- Nút chỉ chạy khi được yêu cầu, không bấm lại sau hop.
+    config.settings = { time = timedHop.getMinutes(), visited = timedHop.getVisited() }
+    return config
+end
+
+-- Các callback giữ chung trạng thái với control được gắn ở phần TAB: mail.
+local function mailHandlers(gift)
+    local state = {}
+    function state.selectClass(class)
+        local changed = state.selectedClass ~= nil and state.selectedClass ~= class
+        state.selectedClass = class
+        if state.itemDropdown then
+            if changed then state.itemDropdown:Set("", true) end
+            state.itemDropdown:Refresh(gift.getNames(class))
+        end
+    end
+    function state.updateText()
+        local lines = {}
+        for _, rule in ipairs(gift.getList()) do
+            lines[#lines + 1] = ("%s, %s, %s, %s"):format(rule.class, rule.name, rule.amount, rule.keep)
+        end
+        state.text:Set(#lines > 0 and table.concat(lines, "\n") or "Danh sách gift: (trống)")
+    end
+    function state.add()
+        local added, reason = gift.add(state.selectedClass, state.itemDropdown.value[1], state.amount.value, state.keep.value)
+        if added then state.updateText() else warn("[Auto Gift] " .. reason) end
+    end
+    function state.removeLast()
+        gift.removeLast()
+        state.updateText()
+    end
+    function state.restore(preset, recipient)
+        if type(preset) ~= "table" then return end
+        gift.setRecipient(recipient)
+        for _, rule in ipairs(type(preset.items) == "table" and preset.items or {}) do
+            if type(rule) == "table" then
+                local added, reason = gift.add(rule.class, rule.name, tostring(rule.amount), tostring(rule.keep))
+                if not added then warn("[Auto Gift] " .. reason) end
+            end
+        end
+        state.updateText()
+    end
+    return state
+end
+
+-- Đọc kho ở luồng riêng để giữ quyền tạo UI của Rayfield.
+local function runInventoryAction(action, ...)
+    local result
+    task.spawn(function(...)
+        result = table.pack(pcall(action, ...))
+    end, ...)
+    while not result do task.wait() end
+    return table.unpack(result, 1, result.n)
+end
+
+local function enchantHandlers(feature)
+    local state = {}
+    local path = "RobloxHubEnchantList_" .. game:GetService("Players").LocalPlayer.UserId .. ".json"
+    local httpService = game:GetService("HttpService")
+    local function loadList()
+        if launchConfig then return type(launchConfig.enchants) == "table" and launchConfig.enchants or {} end
+        if type(readfile) ~= "function" then return {} end
+        if type(isfile) == "function" and not isfile(path) then return {} end
+        local ok, list = pcall(function() return httpService:JSONDecode(readfile(path)) end)
+        return ok and type(list) == "table" and list or {}
+    end
+    local function saveList()
+        if launchConfig then return end
+        local ok = pcall(function() writefile(path, httpService:JSONEncode(feature.getList())) end)
+        if not ok then warn("[Enchant UI] Không lưu được danh sách enchant vào config") end
+    end
+    function state.select(value) state.selected = value end
+    function state.updateText()
+        local list = feature.getList()
+        state.text:Set("enchant : " .. (#list > 0 and table.concat(list, ", ") or "(trống)"))
+    end
+    function state.restore()
+        local list = loadList()
+        if #list == 0 then return end
+        local ok, err = runInventoryAction(function()
+            for _, name in ipairs(list) do
+                if type(name) == "string" or type(name) == "table" then feature.add(name) end
+            end
+        end)
+        if not ok then warn("[Enchant UI] " .. tostring(err)) end
+        state.updateText()
+    end
+    function state.add()
+        local name = state.selected or state.dropdown.value[1]
+        if name then
+            local ok, err = runInventoryAction(feature.add, name)
+            if not ok then warn("[Enchant UI] " .. tostring(err)) end
+            if ok and err then saveList() end
+        end
+        state.updateText()
+    end
+    function state.clear()
+        feature.clear()
+        saveList()
+        state.updateText()
+    end
+    return state
+end
+
+local function setGiftSelection(values)
+    local feature = features.AutoOpenGifts
+    if feature then feature.setSelection(values) end
+end
 
 -- ============================================================================
--- [MS-EXPORT] Callback chung cho UI và launcher; không tự bật khi load.
-for _,flag in ipairs({"EventStoreFastFarm","EventStoreAutoRegister","EventStoreAutoLevel","EventStoreAutoDecor",
-    "EventStoreAutoStock","EventStoreAutoGift","EventStoreAutoMerchant","EventStoreAutoCombine","EventStoreAutoBoost","EventStoreOptimize"}) do
-    features[flag]={duy=function(on,shared)setToggle(flag,on,shared)end}
+-- 6. KHU VỰC TẠO CONTROL — THÊM NÚT MỚI TẠI TAB TƯƠNG ỨNG BÊN DƯỚI
+-- ============================================================================
+-- Toggle: createToggle(tab, "Tên hiển thị", "FlagTinhNang")
+--         Module phải có features.FlagTinhNang.duy(on, shared).
+-- Input / dropdown / button: tab:CreateInput / CreateDropdown / CreateButton.
+-- Luôn đặt flag riêng; tab đã wrap sẽ tự đăng ký vào RobloxHubUI.
+-- Giữ Class trước Item. Hàm xử lý dài đặt ở mục 5, callback gọi hàm đó.
+-- Thêm control trước mục 7 để controls/actions từ launcher tìm được nó.
+
+
+-- ============================================================================
+-- TAB: setting
+-- ============================================================================
+do
+    local timedHop = features.SettingsTimedHop
+    if timedHop then
+        local preset = launchConfig and launchConfig.settings
+        preset = type(preset) == "table" and preset or {}
+        timedHop.setMinutes(preset.time or 30)
+        timedHop.setVisited(preset.visited)
+        setting:CreateInput({
+            name = "Time (phút)",
+            flag = "SettingsHopTime",
+            value = tostring(timedHop.getMinutes()),
+            callback = setHopMinutes,
+        })
+        timedHop.setResumeConfig(resumeConfig)
+        createToggle(setting, "Hop server đông người", "SettingsTimedHop")
+        if timedHop.hopNow then
+            setting:CreateButton({
+                name = "Hop Server ngay",
+                flag = "SettingsHopNow",
+                callback = timedHop.hopNow,
+            })
+        end
+    end
 end
-return features
+
+-- ============================================================================
+-- TAB: Event
+-- ============================================================================
+do
+    event:CreateSection({name="Mystery Store"})
+    createToggle(event,"Fast Farm Event","EventStoreFastFarm")
+    createToggle(event,"Optimize Event Effects","EventStoreOptimize")
+    createToggle(event,"Auto Upgrade Register","EventStoreAutoRegister")
+    createToggle(event,"Auto Upgrade House","EventStoreAutoLevel")
+    createToggle(event,"Auto Place Best Decor","EventStoreAutoDecor")
+    createToggle(event,"Auto Stock Booth + Box Locks","EventStoreAutoStock")
+    createToggle(event,"Auto Open Squishy Gift","EventStoreAutoGift")
+    createToggle(event,"Auto Use All Event Boosts","EventStoreAutoBoost")
+    createToggle(event,"Auto Buy Decor Merchant","EventStoreAutoMerchant")
+    createToggle(event,"Auto Upgrade Boxes","EventStoreAutoCombine")
+end
+-- ============================================================================
+-- TAB: farm
+-- ============================================================================
+do
+    -- Farm và di chuyển
+    farm:CreateSection({ name = "farm" })
+    createToggle(farm, "inf pet speed", "FarmInfinityPetSpeed")
+    createToggle(farm, "fast farm", "FarmFastFarm")
+    createToggle(farm, "auto tap", "FarmAutoTap")
+    createToggle(farm, "Tự nhặt orb", "FarmAutoCollectOrb")
+    createToggle(farm, "tele to best area", "FarmTeleToBestArea")
+
+    farm:CreateSection({ name = "map" })
+    createToggle(farm, "tele to best world", "FarmTeleToBestWorld")
+    createToggle(farm, "auto buy next area", "FarmAutoBuyNextArea")
+
+    farm:CreateSection({ name = "Nâng cấp slot" })
+    createToggle(farm, "auto upd pet slot", "FarmAutoPetSlot")
+    createToggle(farm, "auto upd egg slot", "FarmAutoEggSlot")
+end
+
+-- ============================================================================
+-- TAB: optimize
+-- ============================================================================
+do
+    optimize:CreateSection({ name = "optimize" })
+    createToggle(optimize, "disable loot boxes", "OptimizeDisableLootBoxes")
+    createToggle(optimize, "disable objects", "OptimizeDisableObjects")
+    createToggle(optimize, "super optimize", "OptimizeSuper")
+
+    -- Cấu hình giới hạn FPS của client.
+    local fpsLimit = features.OptimizeFpsLimit
+    local initialFps = "30"
+    if fpsLimit and launchConfig and launchConfig.fpsTarget ~= nil then
+        if fpsLimit.setTarget(launchConfig.fpsTarget) then
+            initialFps = tostring(tonumber(launchConfig.fpsTarget))
+        end
+    end
+    optimize:CreateSection({ name = "FPS" })
+    optimize:CreateInput({
+        name = "Target FPS",
+        flag = "OptimizeFpsTarget",
+        numeric = true,
+        value = initialFps,
+        placeholder = "FPS",
+        callback = function(value)
+            if fpsLimit then fpsLimit.setTarget(value) end
+        end,
+    })
+    createToggle(optimize, "Limit FPS", "OptimizeFpsLimit")
+end
+
+-- ============================================================================
+-- TAB: mail
+-- ============================================================================
+do
+    mail:CreateSection({ name = "auto claim mail" })
+    createToggle(mail, "Tự nhận thư", "MailAutoClaim")
+     mail:CreateSection({ name = "auto gift" })
+    local gift = features.MailAutoGift
+    if not gift then return end
+    local handlers = mailHandlers(gift)
+    local preset = launchConfig and launchConfig.mailGift
+    local recipient = type(preset) == "table" and type(preset.recipient) == "string" and preset.recipient or ""
+    mail:CreateInput({
+        name = "User Name",
+        flag = "MailUserName",
+        value = recipient,
+        placeholder = "...",
+        callback = gift.setRecipient,
+    })
+
+    mail:CreateDropdown({
+        name = "Item Class",
+        flag = "MailGiftClass",
+        options = gift.getClasses(),
+        multiSelect = false,
+        callback = handlers.selectClass,
+    })
+    handlers.itemDropdown = mail:CreateDropdown({
+        name = "Item ID",
+        flag = "MailGiftItem",
+        options = {},
+        multiSelect = false,
+    })
+    if handlers.selectedClass then handlers.selectClass(handlers.selectedClass) end
+
+    handlers.amount = mail:CreateInput({
+        name = "Amount",
+        flag = "MailGiftAmount",
+        value = "",
+        placeholder = "Ví dụ: 100k",
+    })
+    handlers.keep = mail:CreateInput({
+        name = "Keep",
+        flag = "MailGiftKeep",
+        value = "",
+        placeholder = "Ví dụ: 10k hoặc 0",
+    })
+    handlers.text = mail:CreateText({ text = "Danh sách gift: (trống)" })
+    mail:CreateButton({
+        name = "Add Item",
+        flag = "MailGiftAddItem",
+        callback = handlers.add,
+    })
+    mail:CreateButton({
+        name = "Clear 1 Item",
+        flag = "MailGiftRemoveLast",
+        callback = handlers.removeLast,
+    })
+    handlers.restore(preset, recipient)
+    createToggle(mail, "auto gift", "MailAutoGift")
+end
+
+-- ============================================================================
+-- TAB: trading
+-- ============================================================================
+do
+    local boothSnipe = trading:CreateGroup({ direction = "column" })
+    boothSnipe:CreateSection({ name = "Săn món ở gian hàng" })
+    local sniper = features.TradingSniperBooth
+    if sniper then
+        local config = launchConfig and launchConfig.trading
+        trading:CreateText({ text = sniper.configure(config) })
+        if sniper.setStatusCallback then
+            local status = trading:CreateText({ text = "Đang khởi tạo Trading..." })
+            sniper.setStatusCallback(function(message) status:Set(message) end)
+        end
+        if sniper.setHop then
+            trading:CreateToggle({
+                name = "Hop qua Trading Terminal",
+                flag = "TradingTerminalHop",
+                value = type(config) ~= "table" or config.hop ~= false,
+                callback = sniper.setHop,
+            })
+        end
+        createToggle(trading, "Sniper Booth", "TradingSniperBooth")
+        local report = features.TradingWebhook
+        if report then
+            config = type(config) == "table" and config or {}
+            -- Nhập URL và số dư cảnh báo cho webhook giao dịch.
+            trading:CreateInput({
+                name = "Trading Webhook URL",
+                flag = "TradingWebhookUrl",
+                value = type(config.webhookUrl) == "string" and config.webhookUrl or "",
+                callback = report.setUrl,
+            })
+            trading:CreateInput({
+                name = "Min Diamonds",
+                flag = "TradingMinDiamond",
+                value = tostring(config.minDiamond or 0),
+                callback = report.setMinimum,
+            })
+            createToggle(trading, "Webhook Trading", "TradingWebhook")
+        end
+    end
+
+    local boothSeller = trading:CreateGroup({ direction = "column" })
+    boothSeller:CreateSection({ name = "Bán ở gian hàng" })
+    if features.TradingAutoSell then createToggle(trading, "Auto Sell", "TradingAutoSell") end
+end
+
+-- ============================================================================
+-- TAB: rank
+-- ============================================================================
+do
+    createToggle(rank, "auto claim rank reward", "RankAutoClaimReward")
+    rank:CreateSection({ name = "auto quest" })
+    createToggle(rank, "auto rank quest", "RankAutoQuest")
+    createToggle(rank, "stats gui", "RankStatsGui")
+end
+
+-- ============================================================================
+-- TAB: webhook
+-- ============================================================================
+do
+    -- Webhook chung: URL, loại thông báo và nút điều khiển.
+    local petWebhook = features.WebhookEnabled
+    local petPreset = launchConfig and type(launchConfig.petWebhook) == "table" and launchConfig.petWebhook or {}
+    local initialPetUrl = type(petPreset.url) == "string" and petPreset.url or ""
+    local petOptions = petWebhook and petWebhook.getOptions() or {}
+    local initialPetEvents = selectedOptions(petOptions, petPreset.events)
+    webhook:CreateSection({ name = "webhook" })
+    webhook:CreateInput({
+        name = "Webhook URL",
+        flag = "WebhookUrl",
+        value = initialPetUrl,
+        placeholder = "Dán link webhook",
+        callback = function(value)
+            if petWebhook then petWebhook.setUrl(value) end
+        end,
+    })
+    webhook:CreateDropdown({
+        name = "Webhook Events",
+        flag = "WebhookEvents",
+        options = petOptions,
+        multiSelect = true,
+        value = initialPetEvents,
+        placeholder = "Chọn loại pet muốn báo",
+        callback = function(values)
+            if petWebhook then petWebhook.setSelection(values) end
+        end,
+    })
+    -- Nạp URL và loại pet trước khi launcher bật webhook.
+    if petWebhook and launchConfig then
+        petWebhook.setUrl(initialPetUrl)
+        petWebhook.setSelection(initialPetEvents)
+    end
+    createToggle(webhook, "Start Webhook", "WebhookEnabled")
+    webhook:CreateButton({
+        name = "Test Webhook",
+        flag = "WebhookTest",
+        callback = function()
+            if petWebhook then petWebhook.test() end
+        end,
+    })
+
+    -- Webhook Rank dùng URL và cấu hình riêng.
+    local rankWebhook = features.RankWebhookEnabled
+    local rankPreset = launchConfig and type(launchConfig.rankWebhook) == "table" and launchConfig.rankWebhook or {}
+    local initialRankUrl = type(rankPreset.url) == "string" and rankPreset.url or ""
+    local initialRankTarget = rankPreset.target ~= nil and tostring(rankPreset.target) or ""
+    webhook:CreateSection({ name = "webhook rank" })
+    webhook:CreateInput({
+        name = "Rank Webhook URL",
+        flag = "RankWebhookUrl",
+        value = initialRankUrl,
+        placeholder = "Dán link webhook rank",
+        callback = function(value)
+            if rankWebhook then rankWebhook.setUrl(value) end
+        end,
+    })
+    webhook:CreateInput({
+        name = "Target Rank",
+        flag = "RankWebhookTarget",
+        numeric = true,
+        value = initialRankTarget,
+        placeholder = "Nhập rank để kích hoạt",
+        callback = function(value)
+            if rankWebhook then rankWebhook.setTarget(value) end
+        end,
+    })
+    if rankWebhook and launchConfig then
+        rankWebhook.setUrl(initialRankUrl)
+        rankWebhook.setTarget(initialRankTarget)
+    end
+    createToggle(webhook, "Start Rank Webhook", "RankWebhookEnabled")
+    webhook:CreateButton({
+        name = "Test Rank Webhook",
+        flag = "RankWebhookTest",
+        callback = function()
+            if rankWebhook then rankWebhook.test() end
+        end,
+    })
+end
+
+-- ============================================================================
+-- TAB: automatic
+-- ============================================================================
+do
+    -- Nhận quà online
+    createToggle(automatic, "auto claim free gift", "AutoClaimFreeGift")
+
+    -- Trang bị enchant
+    automatic:CreateSection({ name = "Enchant" })
+    local enchantFeature = features.AutoEquipEnchant
+    local handlers = enchantHandlers(enchantFeature)
+
+    local hasEnchantNames, enchantNames = runInventoryAction(enchantFeature.getNames)
+    if not hasEnchantNames then
+        warn("[Enchant UI] " .. tostring(enchantNames))
+        enchantNames = {}
+    end
+    handlers.dropdown = automatic:CreateDropdown({
+        name = "Enchant",
+        flag = "AutoEnchantSelection",
+        multiSelect = false,
+        options = enchantNames,
+        callback = handlers.select,
+    })
+    handlers.text = automatic:CreateText({ text = "enchant : (trống)" })
+    handlers.restore()
+    automatic:CreateButton({
+        name = "add enchant",
+        flag = "AutoEnchantAdd",
+        callback = handlers.add,
+    })
+    automatic:CreateButton({
+        name = "clear enchant",
+        flag = "AutoEnchantClear",
+        callback = handlers.clear,
+    })
+    createToggle(automatic, "auto equip enchant", "AutoEquipEnchant")
+
+    -- Dọn vòng làm mới inventory còn chạy từ bản UI cũ.
+    if environment.RobloxHubEnchantUiJob then
+        pcall(task.cancel, environment.RobloxHubEnchantUiJob)
+        environment.RobloxHubEnchantUiJob = nil
+    end
+
+    -- Chọn loại và tự mở quà
+    local giftFeature = features.AutoOpenGifts
+    local giftOptions = giftFeature and giftFeature.getOptions and giftFeature.getOptions()
+        or { "Gift Bag", "Large Gift Bag", "Mini Chest" }
+    local initialGifts = {}
+    if launchConfig then
+        local giftPreset = launchConfig.gifts
+        for _, id in ipairs(giftOptions) do
+            if type(id) == "string" and id:find("%S")
+                and (giftPreset == "all" or (type(giftPreset) == "table" and table.find(giftPreset, id))) then
+                table.insert(initialGifts, id)
+            end
+        end
+    end
+    automatic:CreateDropdown({
+        name = "Gifts",
+        flag = "AutoOpenGiftTypes",
+        options = giftOptions,
+        multiSelect = true,
+        value = initialGifts,
+        callback = setGiftSelection,
+    })
+    if launchConfig then setGiftSelection(initialGifts) end
+    createToggle(automatic, "auto open gifts", "AutoOpenGifts")
+end
+
+-- ============================================================================
+-- 7. Áp dụng cấu hình sau khi tất cả control đã đăng ký
+-- ============================================================================
+-- Áp dụng các toggle được launcher đặt sẵn.
+if launchConfig then ui:Apply(launchConfig.controls, "values") end
+for _, start in ipairs(startupActions) do start() end
+if launchConfig then
+    ui:Apply(launchConfig.controls, "toggles")
+    ui:Run(launchConfig.actions)
+end
+ui.ready = true
