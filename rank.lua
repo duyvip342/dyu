@@ -45,6 +45,7 @@ local zones = require(lib.Client.ZoneCmds)
 local eggs = require(lib.Client.EggCmds)
 local questCmds = require(lib.Client.QuestCmds)
 local balancing = require(lib.Balancing)
+local worlds = require(lib.Util.WorldsUtil)
 local targetArea = 279
 local waitPosition = Vector3.new(-15044.994140625, 16.23734474182129, 2202.712646484375)
 local hollowPosition = Vector3.new(-15044.8525390625, 16.23734474182129, 2145.985595703125)
@@ -54,6 +55,7 @@ local questTiers = { "Easy", "Medium", "Hard", "Extreme" }
 local questActions = {}
 local questJob
 local activeQuest
+local rankQuestWorld
 -- Khai báo tính năng Farm dùng để đi tới world và area mục tiêu.
 local travelFeatures = { "FarmTeleToBestArea", "FarmTeleToBestWorld" }
 
@@ -93,16 +95,28 @@ local function classifyQuest(title)
     end
 end
 
--- Tìm area có số lớn nhất đã được mở.
+-- Tìm area cao nhất đã mở VÀ world chứa area đó; quyền sở hữu không phải vị trí.
 local function getBestArea()
     if not save.Get() then return nil end
     local best = 0
+    local bestWorld
     for id, zone in pairs(dir.Zones) do
         if zone.ZoneNumber > best and zones.Owns(id) then
             best = zone.ZoneNumber
+            bestWorld = zone.WorldNumber
         end
     end
-    return best
+    if best == 0 then return nil end
+    return best, bestWorld
+end
+
+-- Không bắt đầu quest ở world cũ chỉ vì đã sở hữu area279 ở world khác.
+local function rankTravelState()
+    local bestArea, bestWorld = getBestArea()
+    local canTravel = type(bestWorld) == "number"
+    local ready = bestArea ~= nil and bestArea >= targetArea and canTravel
+        and worlds.GetWorldNumber() == bestWorld
+    return ready, canTravel, bestWorld
 end
 
 -- Bật hoặc nhả yêu cầu teleport của Auto Rank Quest.
@@ -187,6 +201,8 @@ local function runQuest(quest, action)
     local lastMessage
 
     while true do
+        -- Đổi world giữa chừng: nhả quest để vòng ngoài xin teleport lại.
+        if rankQuestWorld and worlds.GetWorldNumber() ~= rankQuestWorld then return end
         local goal = readGoals()[quest.stars]
         if goal then
             if goal.UID ~= quest.uid or goal.Progress >= goal.Amount then return end
@@ -233,29 +249,31 @@ features.RankAutoQuest = {
             questJob = nil
         end
         activeQuest = nil
+        rankQuestWorld = nil
         requestTravel(allFeatures, false)
         if not on then return end
 
         questJob = task.defer(function()
-            local bestArea = getBestArea()
-            while bestArea ~= targetArea do
-                if bestArea then requestTravel(allFeatures, true) end
-                task.wait(10)
-                bestArea = getBestArea()
-            end
-            requestTravel(allFeatures, false)
-
             while true do
-                local quest, shouldWaitAtArea = selectQuest(readGoals())
-                local action = quest and questActions[quest.kind]
-                if action then
-                    activeQuest = quest
-                    runQuest(quest, action)
-                    activeQuest = nil
-                    task.wait(1)
+                local ready, canTravel, bestWorld = rankTravelState()
+                if not ready then
+                    rankQuestWorld = nil
+                    requestTravel(allFeatures, canTravel)
+                    task.wait(3)
                 else
-                    if shouldWaitAtArea then goToPosition(waitPosition) end
-                    task.wait(1)
+                    rankQuestWorld = bestWorld
+                    requestTravel(allFeatures, false)
+                    local quest, shouldWaitAtArea = selectQuest(readGoals())
+                    local action = quest and questActions[quest.kind]
+                    if action then
+                        activeQuest = quest
+                        runQuest(quest, action)
+                        activeQuest = nil
+                        task.wait(1)
+                    else
+                        if shouldWaitAtArea then goToPosition(waitPosition) end
+                        task.wait(1)
+                    end
                 end
             end
         end)
