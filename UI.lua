@@ -187,6 +187,11 @@ for _, url in ipairs(urls) do
 end
 
 -- Danh sách do launcher quản lý; không chạy worker khi thiết lập catalog.
+if features.EventStoreSettings then
+    features.EventStoreSettings.configure(launchConfig and launchConfig.eventStore)
+elseif launchConfig and launchConfig.eventStore then
+    error("Cần cập nhật event.lua để hỗ trợ cấu hình di chuyển eventStore")
+end
 if launchConfig and type(launchConfig.lists) == "table" then
     local lists = launchConfig.lists
     local resolve = loadRemoteModule("https://raw.githubusercontent.com/duyvip342/dyu/main/item_catalog.lua", "item_catalog.lua")()
@@ -451,8 +456,9 @@ do
     createToggle(event,"Auto Upgrade Register","EventStoreAutoRegister")
     createToggle(event,"Auto Upgrade House","EventStoreAutoLevel")
     createToggle(event,"Auto Place Best Decor","EventStoreAutoDecor")
-    createToggle(event,"Auto Stock Booth + Unlock Boxes","EventStoreAutoStock")
+    createToggle(event,"Auto Stock Booth + Box Locks","EventStoreAutoStock")
     createToggle(event,"Auto Open Squishy Gift","EventStoreAutoGift")
+    createToggle(event,"Auto Use All Event Boosts","EventStoreAutoBoost")
     createToggle(event,"Auto Buy Decor Merchant","EventStoreAutoMerchant")
     createToggle(event,"Auto Upgrade Boxes","EventStoreAutoCombine")
 end
