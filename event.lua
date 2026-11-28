@@ -1,2723 +1,595 @@
--- Khai báo các tính năng Event theo flag của UI.
+-- Mystery Store / duyvip342. UI và cấu hình nằm trong UI.lua.
+-- MS-CORE | MS-MOVE | MS-ACTION | MS-REGISTER | MS-LEVEL | MS-DECOR
+-- MS-COMBINE | MS-STOCK | MS-MERCHANT | MS-GIFT | MS-FARM | MS-WORKERS.
 local features = {}
-local startedAt = ...
-local scriptStartedAt = type(startedAt) == "number" and startedAt or os.clock()
+local environment = type(getgenv)=="function" and getgenv() or _G
+local previous = environment.RobloxHubMysteryStore
+if previous and type(previous.Stop)=="function" then previous.Stop() end
+local session = previous and previous.jobId==game.JobId and previous.session or {pending={},nextAt={}}
+local controller: any = {active=true,jobId=game.JobId,session=session,flags={},jobs={},errors={},near={}}
+environment.RobloxHubMysteryStore = controller
+local dependencies
+local lease
+local assigned = {}
 
-local player = game:GetService("Players").LocalPlayer
-local library = game:GetService("ReplicatedStorage").Library
-local client = library.Client
-local instancing = require(client.InstancingCmds)
-local tycoon = require(client.PumpkinTycoonCmds)
-local tycoonTypes = require(library.Types.PumpkinTycoon)
-local buttons = require(library.Util.PumpkinTycoonButtons)
-local customEggs = require(client.CustomEggsCmds)
-local eggs = require(client.EggCmds)
-local currency = require(client.CurrencyCmds)
-local eggPrice = require(library.Balancing.CalcEggPricePlayer)
-local network = require(client.Network)
-local playerPet = require(client.PlayerPet)
-local breakables = require(client.BreakableFrontend)
-local petCmds = require(client.PetCmds)
-
--- Cấu hình mở map Pumpkin Tycoon.
-local instanceId = "PumpkinTycoon"
-local entryRetryDelay = 10
-local scanInterval = 0.5
-local fastFarmInterval = 0.2
-local pressTimeout = 2
-local retryDelay = 5
-local yellowRetryDelay = 15
--- Lấy giới hạn từ game mỗi lượt, không khóa ở Part 1.
-local bestAreaEnabled = false
-local hatchGoal = 15
-local hatchInterval = 1
-local hatchCounts = {}
-local enabled = false
-local pumpkinEnabled = false
-local fastFarmEnabled = false
-local rebirthEnabled = false
-local rebirthWaiting = false
--- Dừng quyền auto rebirth của module cũ khi exec lại; giữ request đang chờ xác nhận.
-local rebirthEnvironment = type(getgenv) == "function" and getgenv() or _G
-local previousRebirth = rebirthEnvironment.RobloxHubEventRebirth
-if type(previousRebirth) == "table" and type(previousRebirth.stop) == "function" then previousRebirth.stop() end
-local rebirthState = type(previousRebirth) == "table" and previousRebirth.state or {}
-local rebirthController = {active = true, state = rebirthState}
-rebirthController.stop = function()
-    rebirthController.active = false
-    rebirthEnabled, rebirthWaiting = false, false
+-- ============================================================================
+-- [MS-CORE] API chỉ nạp khi bật tính năng; load module không khởi tạo worker.
+local function api()
+    if dependencies then return dependencies end
+    local library=game:GetService("ReplicatedStorage"):WaitForChild("Library",10)
+    assert(library,"Mystery Store: Library unavailable")
+    local client=library.Client
+    local store=require(client.MysteryStoreCmds)
+    dependencies={
+        player=game:GetService("Players").LocalPlayer,
+        store=store,base=store.Feature("Base"),pad=store.Feature("Pad"),
+        save=require(client.Save),instancing=require(client.InstancingCmds),
+        currency=require(client.CurrencyCmds),network=require(client.Network),
+        upgrades=require(client.EventUpgradeCmds),
+        upgradeDefs=require(library.Types.MysteryStore.Upgrades),
+        definitions=require(library.Types.MysteryStore),
+        buttons=require(library.Util.MysteryStoreButtons),
+        boxes=require(library.Types.MysteryStore.Boxes),
+        combine=require(library.Util.MysteryStoreCombine),
+        decorDefs=require(library.Types.MysteryStore.Decor),
+        decor=require(library.Util.MysteryStoreDecor),
+        merchant=require(library.Util.MysteryStoreMerchant),
+        items=require(library.Items),lootbox=require(client.LootboxCmds),
+        playerPet=require(client.PlayerPet),pets=require(client.PetCmds),
+        breaks=require(client.BreakableFrontend),
+        instanceParent=require(library.Types.Breakables).ParentType.Instance,
+    }
+    return dependencies
 end
-rebirthEnvironment.RobloxHubEventRebirth = rebirthController
-local workerRunning = false
-local cocoaTick
-local huntTick
-local buyTick
-local turkeyTick, turkeyPending
-local turkeyEnabled = false
-local generation = 0
-
--- Giới hạn khu đang hoạt động; quyền sở hữu từng khu vẫn do Buttons quyết định.
-local function lastEventZone()
-    if type(tycoon.Part2) == "function" and not tycoon.Part2() then
-        return math.min(tycoonTypes.PART1_ZONES, #tycoonTypes.ZONES)
+local function report(key,message)
+    message=message and tostring(message)
+    if message and controller.errors[key]~=message then warn("[Mystery Store / "..key.."] "..message) end
+    controller.errors[key]=message
+end
+local function enabled(flag)
+    return controller.active and controller.flags[flag]==true
+end
+local function inventory(data,class)
+    return data and ((data.Inventory and data.Inventory[class]) or data[class]) or {}
+end
+local function amount(data,class,id,uid)
+    local total=0
+    for key,item in pairs(inventory(data,class)) do
+        if (not uid or uid==key) and item.id==id then total+=item._am or 1 end
     end
-    return #tycoonTypes.ZONES
+    return total
 end
-
--- Vào map sự kiện.
-
--- Kiểm tra trạng thái instance của người chơi.
-local function isInEvent()
-    return instancing.GetInstanceID() == instanceId
+local function context()
+    local a=api()
+    if a.instancing.GetInstanceID()~="MysteryStore" then return end
+    local p=a.base.Plot()
+    if not p or p:IsDestroyed() or p:GetOwner()~=a.player then return end
+    local model=p:GetModel()
+    local character=a.player.Character
+    local root=character and character:FindFirstChild("HumanoidRootPart")
+    local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+    local data=a.save.Get()
+    if not model or not model.Parent or not root or not humanoid or humanoid.Health<=0 or not data then return end
+    return {api=a,plot=p,model=model,character=character,root=root,data=data,
+        scope=tostring(p.Id),level=a.buttons.Level(p:Save("Level")),
+        coins=a.currency.Get("MysteryStoreCoins") or 0,
+        own=(data.InstanceVars and data.InstanceVars.MysteryStore) or {}}
 end
-
--- Dùng luồng dịch chuyển của game để vào Pumpkin Tycoon.
-local function enterEvent()
-    if not instancing.DoesMeetRequirement(instanceId) then return end
-    local ok, err = pcall(instancing.Enter, instanceId)
-    if not ok then warn("[Auto Open Map Event] Vào map: " .. tostring(err)) end
+local function valid(c,flag)
+    if not enabled(flag) then return false end
+    local a=c.api
+    local humanoid=c.character:FindFirstChildOfClass("Humanoid")
+    return a.instancing.GetInstanceID()=="MysteryStore" and a.player.Character==c.character
+        and humanoid and humanoid.Health>0 and c.root.Parent==c.character
+        and c.plot==a.base.Plot() and not c.plot:IsDestroyed()
+        and c.plot:GetModel()==c.model and c.model.Parent~=nil
 end
-
--- Nhận diện pad mở được.
-
--- Chỉ chọn mặt Press màu vàng, xanh lá hoặc xanh dương.
-local function getPress(pad)
-    if string.find(string.lower(pad.Name), "completionreward", 1, true) then return end
-    local press = pad:FindFirstChild("Press")
-    if not press or not press:IsA("BasePart") or press.Transparency >= 1 then return end
-    local touch = press:FindFirstChild("Touch")
-    if not touch or not touch:IsA("BasePart") or not touch.CanTouch then return end
-
-    local color = press.Color
-    local hue, saturation, brightness = color:ToHSV()
-    -- Nhận cả xanh dương đã bị game pha tối khi render pad đặc biệt.
-    if hue >= 0.49 and hue <= 0.75 and color.B > color.R * 1.2 and color.B >= color.G then
-        return press, touch, false
-    end
-    if hue >= 0.11 and hue <= 0.73 and saturation >= 0.35 and brightness >= 0.25 then
-        return press, touch, hue < 0.25
-    end
+local function tier(c,track)
+    return c.api.upgrades.GetTier(c.api.upgradeDefs.Id(track)) or 0
 end
-
--- Chọn pad hợp lệ gần nhân vật nhất.
-local function findPad(folder, origin, retryAt)
-    local now = os.clock()
-    local bestPad, bestDistance
-    local starter = folder:FindFirstChild(tycoonTypes.ZONES[1].Section .. "_Zone")
-    if starter and now >= (retryAt[starter] or 0) and getPress(starter) then return starter end
-    for _, pad in ipairs(folder:GetChildren()) do
-        if now < (retryAt[pad] or 0) then continue end
-        local press = getPress(pad)
-        if press then
-            local distance = (press.Position - origin).Magnitude
-            if not bestDistance or distance < bestDistance then
-                bestPad, bestDistance = pad, distance
-            end
-        end
-    end
-    return bestPad
+local function partSpot(part)
+    if part and part:IsA("BasePart") then return part.CFrame*CFrame.new(0,part.Size.Y/2+3,0) end
+    if part and part:IsA("Model") then return part:GetPivot()*CFrame.new(0,3,0) end
+    return nil
+end
+local function machineSpot(c,name)
+    local machines=c.model:FindFirstChild("Interactable")
+    machines=machines and machines:FindFirstChild("Machines")
+    local machine=machines and machines:FindFirstChild(name)
+    if not machine then return end
+    return partSpot(machine:FindFirstChild("Pad",true)) or machine:GetPivot()*CFrame.new(0,3,0)
 end
 
--- Kích hoạt pad bằng cách tiếp đất.
-
--- Đặt bàn chân cao hơn mặt pad 1,5 stud để tiếp đất tự nhiên.
-local function pressPad(folder, pad, character, humanoid, root, runGeneration)
-    if pad.Parent ~= folder then return end
-    local press, touch, isYellow = getPress(pad)
-    if not press then return end
-
-    local original = character:GetPivot()
-    local rootOffset = original:ToObjectSpace(root.CFrame)
-    local surface = math.abs(press.CFrame.RightVector.Y) * press.Size.X / 2
-        + math.abs(press.CFrame.UpVector.Y) * press.Size.Y / 2
-        + math.abs(press.CFrame.LookVector.Y) * press.Size.Z / 2
-    local leg = character:FindFirstChild("Left Leg")
-    local footOffset = root.Size.Y / 2 + humanoid.HipHeight
-    if humanoid.RigType == Enum.HumanoidRigType.R6 and leg then
-        footOffset += leg.Size.Y
+-- ============================================================================
+-- [MS-MOVE] Một chủ vị trí; không trả nhân vật đã chết/đổi plot hoặc tự đi nơi khác.
+local function releaseLease(owned)
+    if owned and lease~=owned then return end
+    local old=lease
+    lease=nil
+    if not old then return end
+    local c=old.context
+    local humanoid=c.character:FindFirstChildOfClass("Humanoid")
+    if c.api.instancing.GetInstanceID()=="MysteryStore" and c.api.player.Character==c.character
+        and humanoid and humanoid.Health>0
+        and not c.plot:IsDestroyed() and c.api.base.Plot()==c.plot and c.plot:GetModel()==c.model
+        and c.root.Parent==c.character and (c.root.Position-old.destination.Position).Magnitude<9 then
+        c.character:PivotTo(old.back)
     end
-    local position = Vector3.new(touch.Position.X, press.Position.Y + surface + footOffset + 1.5, touch.Position.Z)
-
-    -- Chờ pad biến mất để xác nhận lần mở.
-    local ok, err = pcall(function()
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-        character:PivotTo(CFrame.new(position) * root.CFrame.Rotation * rootOffset:Inverse())
-        local deadline = os.clock() + pressTimeout
-        repeat
-            task.wait(0.05)
-        until pad.Parent ~= folder or press.Parent ~= pad or os.clock() >= deadline
-            or generation ~= runGeneration or player.Character ~= character or humanoid.Health <= 0
-            or not isInEvent()
-    end)
-
-    -- Trả nhân vật hiện tại về vị trí đã lưu.
-    if isInEvent() and player.Character == character and humanoid.Health > 0 and root.Parent == character then
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-        character:PivotTo(original)
+end
+local function approach(c,flag,spot)
+    if not spot or lease or not valid(c,flag) then return false end
+    local back=c.character:GetPivot()
+    if enabled("EventStoreAutoCombine") and c.api.pad.OnPad() then back=c.api.base.ZoneLanding(c.plot) or back end
+    lease={context=c,flag=flag,back=back,destination=spot}
+    if (c.root.Position-spot.Position).Magnitude>2 then
+        c.root.AssemblyLinearVelocity=Vector3.zero
+        c.character:PivotTo(spot)
+        task.wait(0.2)
     end
-    if not ok then warn("[Auto Open Map Event] " .. tostring(err)) end
-    return isYellow and yellowRetryDelay or retryDelay, ok and pad.Parent ~= folder
+    return valid(c,flag)
 end
 
--- Xác định zone cao nhất trên đảo của người chơi.
-local function getFarmZone(position)
-    local owned = tycoon.Feature("Buttons").State()
-    local plot = tycoon.Feature("Island").Plot()
-    local model = plot and plot:GetModel()
-    if not owned or not model then return end
-    local limit = lastEventZone()
-    if position then
-        -- Fast Farm chỉ chọn khu hiện đang đứng trên đảo của mình.
-        for zone = limit, 1, -1 do
-            if buttons.Owned(owned, tycoonTypes.ZONES[zone].Section .. "_Zone") then
-                local slab = buttons.ZoneSlab(model, zone)
-                if slab then
-                    local point = slab.CFrame:PointToObjectSpace(position)
-                    if math.abs(point.X) <= slab.Size.X / 2
-                        and math.abs(point.Z) <= slab.Size.Z / 2
-                        and point.Y >= -slab.Size.Y / 2 - 3 and point.Y <= slab.Size.Y / 2 + 12 then
-                        return zone, slab, plot.ModelId, owned
-                    end
-                end
-            end
-        end
-        return nil, nil, plot.ModelId, owned
+-- ============================================================================
+-- [MS-ACTION] Khóa request trước Invoke; xác nhận bằng dữ liệu server, không UI giả.
+local function confirmed(p,c)
+    if p.scope~=c.scope then return true end
+    if p.kind=="level" then return c.level>=p.want end
+    if p.kind=="register" then return tier(c,p.track)>=p.want end
+    if p.kind=="decor" then
+        local placed=c.plot:Save("Plinths") or {}
+        return (placed[tostring(p.slot)] or placed[p.slot])==p.id
     end
-    local zone = buttons.FarmZone(owned, limit)
-    local slab = zone and buttons.ZoneSlab(model, zone)
-    return zone, slab, plot.ModelId, owned
+    if p.kind=="unlock" then return (c.own.BoxLocks or {})[tostring(p.rung)]==false end
+    if p.kind=="combine" or p.kind=="gift" then return amount(c.data,"Lootbox",p.id,p.uid)<p.before end
+    if p.kind=="merchant" then
+        if amount(c.data,"Misc",p.id)>p.before then return true end
+        local shelf=controller.offers and controller.offers.MysteryStoreDecorMerchant
+        local offer=shelf and shelf.Seed==p.seed and shelf.Offers and shelf.Offers[tostring(p.slot)]
+        return offer and offer.Stock<p.stock or false
+    end
+    return false
 end
-
--- Đưa nhân vật vào phần sát trứng nhất vẫn nằm trong zone farm.
-local function standInZone(character, humanoid, root, slab, eggPosition)
-    local point = slab.CFrame:PointToObjectSpace(eggPosition or slab.Position)
-    local x = math.max(0, slab.Size.X / 2 - 1)
-    local z = math.max(0, slab.Size.Z / 2 - 1)
-    local floor = slab.CFrame:PointToWorldSpace(Vector3.new(
-        math.clamp(point.X, -x, x), slab.Size.Y / 2, math.clamp(point.Z, -z, z)))
-    local current = slab.CFrame:PointToObjectSpace(root.Position)
-    if math.abs(current.X) <= x + 0.25 and math.abs(current.Z) <= z + 0.25 and math.abs(current.Y) < 12
-        and (not eggPosition or (Vector3.new(root.Position.X, 0, root.Position.Z) - Vector3.new(floor.X, 0, floor.Z)).Magnitude < 3) then
-        return
+local function waiting(channel,c)
+    local p=session.pending[channel]
+    if not p then return false end
+    if confirmed(p,c) then session.pending[channel]=nil;return false end
+    if os.clock()-p.at<12 then return true end
+    session.pending[channel]=nil
+    session.nextAt[p.key]=os.clock()+5
+    report(p.kind,"Chưa thấy dữ liệu xác nhận; giãn nhịp trước khi thử lại.")
+    return false
+end
+local function distanceError(message)
+    local s=tostring(message or ""):lower()
+    return s:find("distance",1,true) or s:find("too far",1,true) or s:find("closer",1,true)
+        or s:find("near the",1,true) or s:find("stand on",1,true) or s:find("nearby",1,true)
+        or s:find("not enough space",1,true)
+        or s:find("near ",1,true) or s:find("inside your",1,true)
+        or s:find("your own store",1,true) or s:find("step on",1,true)
+end
+local function dispatch(c,flag,p,send,check,spot,forceNear,channel)
+    channel=channel or "main"
+    if lease or not valid(c,flag) or waiting(channel,c) or os.clock()<(session.nextAt[p.key] or 0) then return false end
+    local owned
+    if forceNear or controller.near[p.kind] then
+        local ok=approach(c,flag,spot)
+        owned=lease
+        if not ok then releaseLease(owned);return false end
     end
-    local height = root.Size.Y / 2 + humanoid.HipHeight + 0.5
-    local leg = humanoid.RigType == Enum.HumanoidRigType.R6 and character:FindFirstChild("Left Leg")
-    if leg then height += leg.Size.Y end
-    local offset = root.CFrame:ToObjectSpace(character:GetPivot())
-    root.AssemblyLinearVelocity = Vector3.zero
-    character:PivotTo(CFrame.new(floor + Vector3.new(0, height, 0)) * root.CFrame.Rotation * offset)
+    local fresh=context()
+    if not fresh or fresh.plot~=c.plot or not valid(c,flag) or (check and not check(fresh)) then
+        if owned then releaseLease(owned) end
+        return false
+    end
+    p.scope=c.scope;p.at=os.clock()
+    session.pending[channel]=p
+    local ok,accepted,message=pcall(send,fresh)
+    if not controller.active then return true end
+    session.nextAt[p.key]=os.clock()+0.5
+    if ok and accepted==true then report(p.kind,nil)
+    elseif ok then
+        session.pending[channel]=nil
+        local seconds=tonumber(tostring(message):match("([%d.]+)%s*second")) or 0
+        session.nextAt[p.key]=os.clock()+math.max(3,math.min(30,seconds))
+        if distanceError(message) and spot then controller.near[p.kind]=true end
+        report(p.kind,message or "Game chưa chấp nhận thao tác.")
+    else report(p.kind,accepted) end
+    if owned then releaseLease(owned) end
     return true
 end
 
--- Gửi pet đánh breaker thuộc đúng zone và đảo hiện tại.
-local function clearFarmTargets(state)
-    if not next(state.assigned) then return end
-    for _, pet in pairs(playerPet.GetByPlayer(player) or {}) do
-        local target = pet.euid and state.assigned[pet.euid]
-        if target and pet:GetTargetType() == "Breakable" and pet:GetTargetValue() == target then
-            pet:ClearTarget()
+-- ============================================================================
+-- [MS-REGISTER] Tier2 là tổng cấp đã mua, không mua thêm 2 lần mỗi khi exec lại.
+local otherTracks={"BoothSlots","PadSpeed","BoxDrops","CustomerFlow"}
+local function foundationDone(c)
+    for _,track in ipairs(otherTracks) do
+        if tier(c,track)<math.min(2,c.api.upgradeDefs.MaxTier(track)) then return false end
+    end
+    return true
+end
+local function registerTrack(c)
+    local defs=c.api.upgradeDefs
+    if c.level<3 then
+        if tier(c,"CoinYield")<defs.MaxTier("CoinYield") then return "CoinYield" end
+    elseif c.level<5 then
+        for _,track in ipairs(otherTracks) do
+            local current=tier(c,track)
+            local cost=defs.Price(track,current+1)
+            if current<math.min(2,defs.MaxTier(track)) and cost and cost<=c.coins then return track end
+        end
+    else
+        local order={"CoinYield","BoothSlots","PadSpeed","BoxDrops","CustomerFlow"}
+        for offset=0,#order-1 do
+            local index=((controller.upgradeIndex or 1)+offset-1)%#order+1
+            local track=order[index]
+            local current=tier(c,track)
+            local cost=defs.Price(track,current+1)
+            if current<defs.MaxTier(track) and cost and cost<=c.coins then return track,index end
         end
     end
-    table.clear(state.assigned)
-    state.nextSend = 0
+end
+local function registerStep(c)
+    local flag="EventStoreAutoRegister"
+    if not enabled(flag) then return false end
+    local track,index=registerTrack(c)
+    if not track then return false end
+    local want=tier(c,track)+1
+    local cost=c.api.upgradeDefs.Price(track,want)
+    if not cost or cost>c.coins then return false end
+    local sent=dispatch(c,flag,{kind="register",key="register:"..track,track=track,want=want},
+        function(f)return f.api.upgrades.Purchase(f.api.upgradeDefs.Id(track))end,
+        function(f)return tier(f,track)==want-1 and f.coins>=(f.api.upgradeDefs.Price(track,want) or math.huge)
+            and registerTrack(f)==track end,machineSpot(c,"MysteryStoreUpgradeMachine"))
+    if sent and index then controller.upgradeIndex=index%5+1 end
+    return sent
 end
 
--- Chia pet theo lô cho breaker trong zone hiện tại.
-local function farmZone(state, zone, plotId)
-    local now = os.clock()
-    if now < state.nextFarm then return end
-    state.nextFarm = now + (fastFarmEnabled and fastFarmInterval or 1)
-    if now >= state.nextEquip then
-        petCmds.EquipBest()
-        state.nextEquip = now + 15
-    end
-
-    local things = workspace:FindFirstChild("__THINGS")
-    local folder = things and things:FindFirstChild("Breakables")
-    if not folder then return end
-    local area = tycoonTypes.ZONES[zone].Section .. "_Zone_" .. tostring(plotId)
-    local targets = {}
-    for _, model in ipairs(folder:GetChildren()) do
-        if model:GetAttribute("ParentID") == instanceId and model:GetAttribute("AreaID") == area then
-            local uid = model:GetAttribute("BreakableUID")
-            local data = uid and breakables.Get(uid)
-            local owner = data and data.modifier and data.modifier.Owner
-            if data and data.health > 0 and not data.disableDamage and (not owner or owner == player.Name) then
-                table.insert(targets, data)
-            end
-        end
-    end
-    if #targets == 0 then
-        clearFarmTargets(state)
-        return
-    end
-    -- Ưu tiên chest và giữ pet trên breaker còn sống.
-    table.sort(targets, function(a, b)
-        if (a.class == "Chest") ~= (b.class == "Chest") then return a.class == "Chest" end
-        if a.health ~= b.health then return a.health < b.health end
-        return tostring(a.uid) < tostring(b.uid)
-    end)
-    local assigned, eligible, counts, idle = {}, {}, {}, {}
-    for _, target in ipairs(targets) do eligible[target.uid] = true end
-    for _, pet in pairs(playerPet.GetByPlayer(player) or {}) do
-        local id = pet.euid
-        if id then
-            local uid = state.assigned[id]
-            if uid and eligible[uid] then
-                assigned[id] = uid
-                counts[uid] = (counts[uid] or 0) + 1
-            else
-                table.insert(idle, id)
-            end
-        end
-    end
-    for _, id in ipairs(idle) do
-        local best = targets[1].uid
-        for _, target in ipairs(targets) do
-            if (counts[target.uid] or 0) < (counts[best] or 0) then best = target.uid end
-            if not counts[best] then break end
-        end
-        assigned[id] = best
-        counts[best] = (counts[best] or 0) + 1
-    end
-    if next(assigned) and (#idle > 0 or now >= state.nextSend) then
-        network.Fire("Breakables_JoinPetBulk", assigned)
-        state.nextSend = now + 1
-    end
-    state.assigned = assigned
-    network.UnreliableFire("Breakables_PlayerDealDamage", targets[1].uid)
+-- ============================================================================
+-- [MS-LEVEL] Đủ tiền mua tầng tiếp; nếu bật Register thì hoàn thành nền tier2 trước.
+local function levelStep(c)
+    local flag="EventStoreAutoLevel"
+    if not enabled(flag) or c.level>=#c.api.definitions.LEVELS then return false end
+    if c.level>=3 and enabled("EventStoreAutoRegister") and not foundationDone(c) then return false end
+    local want=c.level+1
+    local can,_,_,cost=c.api.buttons.CanBuy(c.level,want)
+    if not can or not cost or c.coins<cost then return false end
+    local spot=c.api.buttons.ResolvedSpot(c.model,want)
+    if spot then spot=spot*CFrame.new(0,3,0) end
+    return dispatch(c,flag,{kind="level",key="level:"..want,want=want},
+        function(f)return f.plot:Invoke(f.api.definitions.NET.BuyLevel,want)end,
+        function(f)return f.level==want-1 and f.coins>=(f.api.buttons.Price(want) or math.huge)
+            and (f.level<3 or not enabled("EventStoreAutoRegister") or foundationDone(f))end,spot)
 end
 
--- Tìm trứng theo zone và tên cấu hình của game.
-local function findZoneEgg(zone, nearPosition)
-    local things = workspace:FindFirstChild("__THINGS")
-    local folder = things and things:FindFirstChild("CustomEggs")
-    if not folder then return end
-    local eggName = tycoonTypes.ZONES[zone].Egg
-    local closest, closestDistance
-    for _, model in ipairs(folder:GetChildren()) do
-        if model:GetAttribute("ZoneNumber") == zone then
-            local egg = customEggs.Get(model.Name)
-            if egg and egg._id == eggName and egg:IsHatchable() then
-                if not nearPosition then return egg end
-                local distance = (egg:GetPosition() - nearPosition).Magnitude
-                if not closestDistance or distance < closestDistance then
-                    closest, closestDistance = egg, distance
+-- ============================================================================
+-- [MS-DECOR] Lấp chỗ trống rồi thay món có % thấp nhất; cùng % không thay qua lại.
+local function decorChoice(c)
+    local best,bestValue
+    for _,id in ipairs(c.api.decorDefs.IDS) do
+        local available=0
+        for _,item in pairs(inventory(c.data,"Misc")) do
+            if item.id==id and not item._lk then available+=item._am or 1 end
+        end
+        local value=c.api.decor.Value(id) or 0
+        if available>0 and (not best or value>bestValue) then best,bestValue=id,value end
+    end
+    if not best then return end
+    local placed=c.plot:Save("Plinths") or {}
+    local worstSlot,worstValue
+    for slot=1,c.api.decorDefs.PlinthCount(c.level) do
+        local id=placed[tostring(slot)] or placed[slot]
+        if not id then return slot,best,bestValue end
+        local value=c.api.decor.Value(id) or 0
+        if not worstSlot or value<worstValue then worstSlot,worstValue=slot,value end
+    end
+    if worstSlot and bestValue>worstValue then return worstSlot,best,bestValue end
+end
+local function decorStep(c)
+    local flag="EventStoreAutoDecor"
+    if not enabled(flag) then return false end
+    local slot,id=decorChoice(c)
+    if not slot then return false end
+    local plinths=c.model:FindFirstChild("Plinths")
+    local marker=plinths and plinths:FindFirstChild(c.api.decorDefs.Marker(slot))
+    local placed=c.plot:Save("Plinths") or {}
+    local old=placed[tostring(slot)] or placed[slot]
+    if old then
+        -- Tháo món thấp nhất, chờ server xác nhận rồi mới đặt món tốt hơn.
+        return dispatch(c,flag,{kind="decor",key="decor:"..slot,slot=slot},
+            function(f)return f.plot:Invoke(f.api.definitions.NET.PlaceDecor,slot,nil)end,
+            function(f)local s,i=decorChoice(f);return s==slot and i==id end,partSpot(marker))
+    end
+    return dispatch(c,flag,{kind="decor",key="decor:"..slot,slot=slot,id=id},
+        function(f)return f.plot:Invoke(f.api.definitions.NET.PlaceDecor,slot,id)end,
+        function(f)local s,i=decorChoice(f);return s==slot and i==id end,partSpot(marker))
+end
+
+-- ============================================================================
+-- [MS-COMBINE] Cấp cao trước, dùng số bộ theo Ratio game; không ghép vật phẩm khóa.
+local function combineChoice(c)
+    for rung=c.api.boxes.Count()-1,1,-1 do
+        local box=c.api.boxes.Box(rung)
+        local ratio=c.api.combine.Ratio(rung)
+        if ratio>0 then
+            for uid,item in pairs(inventory(c.data,"Lootbox")) do
+                local count=item._am or 1
+                if item.id==box.Id and not item._lk and count>=ratio then
+                    return {uid=uid,id=item.id,before=count,rung=rung,
+                        sets=math.min(math.floor(count/ratio),c.api.combine.MAX_SETS)}
                 end
             end
         end
     end
-    return closest
+end
+local function combineStep(c)
+    local flag="EventStoreAutoCombine"
+    if not enabled(flag) then return false end
+    local choice=combineChoice(c)
+    if not choice then return false end
+    choice.kind="combine";choice.key="combine:"..choice.uid
+    local onPad=c.api.pad.OnPad()
+    local spot=onPad and c.api.base.ZoneLanding(c.plot) or machineSpot(c,"MysteryStoreCombineMachine")
+    if controller.near.combine then spot=machineSpot(c,"MysteryStoreCombineMachine") end
+    return dispatch(c,flag,choice,
+        function(f)return f.plot:Invoke(f.api.definitions.NET.CombineBoxes,choice.uid,choice.sets)end,
+        function(f)
+            local item=inventory(f.data,"Lootbox")[choice.uid]
+            return item and item.id==choice.id and not item._lk
+                and (item._am or 1)>=choice.sets*f.api.combine.Ratio(choice.rung)
+        end,spot,onPad)
 end
 
--- Mở tối đa mỗi lượt; đếm số quả được server chấp nhận, cho phép vượt mốc 15.
-local function hatchProgressEgg(state, zone, egg)
-    local now = os.clock()
-    if now < state.nextHatch then return end
-    state.nextHatch = now + hatchInterval
-    local directory = egg:Directory()
-    local count = egg:GetMaxEggCount() or eggs.GetMaxHatch(directory)
-    if type(count) ~= "number" or count < 1 or count % 1 ~= 0 then return end
-    local price = eggPrice(directory, nil, not egg._allowChargedAndGolden)
-    if not currency.CanAfford(directory.currency, price * count) then return end
-    local success = network.Invoke("CustomEggs_Hatch", egg._uid, count)
-    if success == true then hatchCounts[zone] = (hatchCounts[zone] or 0) + count end
-end
-
--- Mở trứng zone cuối theo giới hạn hiện tại của game.
-local function hatchFinalEgg(state, egg)
-    local now = os.clock()
-    if now < state.nextHatch then return end
-    state.nextHatch = now + hatchInterval
-
-    local directory = egg:Directory()
-    local count = egg:GetMaxEggCount() or eggs.GetMaxHatch(directory)
-    if type(count) ~= "number" or count < 1 then return end
-    local price = eggPrice(directory, nil, not egg._allowChargedAndGolden)
-    if currency.CanAfford(directory.currency, price * count) then
-        network.Invoke("CustomEggs_Hatch", egg._uid, count)
-    end
-end
-
--- Tele Best Area ở event: đứng cạnh trứng của khu cao nhất đã mở rồi hatch.
-local function teleBestEvent(state, character, humanoid, root)
-    local zone, slab = getFarmZone()
-    if not zone or not slab then return end
-    local egg = findZoneEgg(zone, slab.Position)
-    if standInZone(character, humanoid, root, slab, egg and egg:GetPosition()) then
-        state.nextHatch = os.clock() + scanInterval
-        return
-    end
-    if bestAreaEnabled and egg then hatchFinalEgg(state, egg) end
-end
-
-local function farmCurrentEventZone(state, root)
-    local zone, slab, plotId = getFarmZone(root.Position)
-    if state.farmZone ~= zone or state.farmPlot ~= plotId then
-        clearFarmTargets(state)
-        state.farmZone, state.farmPlot = zone, plotId
-    end
-    if zone and slab then farmZone(state, zone, plotId) else clearFarmTargets(state) end
-end
-
--- Đợi đạt/vượt 15 quả trước khi mở pad tiếp; Fast Farm không dịch chuyển/hatch.
-local function updateEvent(state, character, humanoid, root)
-    if not enabled then
-        if bestAreaEnabled then teleBestEvent(state, character, humanoid, root) end
-        if fastFarmEnabled then farmCurrentEventZone(state, root) end
-        return
-    end
-    local lastZone = lastEventZone()
-    local zone, slab, plotId, owned = getFarmZone()
-    local finalEgg = zone == lastZone and slab and findZoneEgg(zone, slab.Position)
-    if finalEgg then
-        if standInZone(character, humanoid, root, slab, finalEgg:GetPosition()) then
-            state.nextHatch = os.clock() + scanInterval
-            return
-        end
-        farmZone(state, zone, plotId)
-        hatchFinalEgg(state, finalEgg)
-        if not enabled or player.Character ~= character or not isInEvent() then return end
-    elseif zone and slab then
-        local egg
-        local waitingForEgg = false
-        if zone < lastZone and (hatchCounts[zone] or 0) < hatchGoal then
-            egg = findZoneEgg(zone)
-            waitingForEgg = egg ~= nil or buttons.Owned(owned, tycoonTypes.ZONES[zone].Section .. "_Egg")
-        end
-        standInZone(character, humanoid, root, slab, egg and egg:GetPosition())
-        farmZone(state, zone, plotId)
-        if waitingForEgg then
-            if egg then hatchProgressEgg(state, zone, egg) end
-            return
-        end
-    elseif zone and zone < lastZone and (hatchCounts[zone] or 0) < hatchGoal
-        and buttons.Owned(owned, tycoonTypes.ZONES[zone].Section .. "_Egg") then
-        return
-    end
-
-    local folder = workspace:FindFirstChild("PumpkinTycoonPads")
-    local pad = folder and findPad(folder, root.Position, state.retryAt)
-    if pad then
-        local delay, opened = pressPad(folder, pad, character, humanoid, root, generation)
-        if delay and pad.Parent == folder then state.retryAt[pad] = os.clock() + delay end
-        if opened then task.wait(0.5) end
-    end
-end
-
--- Cùng điều kiện với nút Rebirth của game, không dùng phần trăm UI đã làm tròn.
-local function readyRebirthPlot()
-    if not rebirthController.active or not rebirthEnabled or not isInEvent() or not tycoon.Part2() or not tycoon.OwnPlotPart2() then return end
-    local flags = require(library.Universal.FFlags)
-    if flags.Get(flags.Keys.PumpkinTycoon_Rebirth) ~= true then return end
-    local plot = tycoon.Feature("Island").Plot()
-    if not plot or plot:IsDestroyed() or plot:GetOwner() ~= player then return end
-    local owned = plot:Save(tycoonTypes.VAR.Buttons)
-    if type(owned) ~= "table" or not buttons.RebirthReady(owned) then return end
-    local _, total, progress = buttons.RebirthProgress(owned)
-    if total > 0 and progress >= 1 then return plot end
-end
-
--- Một lệnh mỗi chu kỳ; chờ đảo reset trước khi cho phép chu kỳ tiếp theo.
-local function autoRebirthStep(state)
-    if not rebirthController.active then return false end
-    if rebirthState.pending then
-        if rebirthState.pending.inFlight then
-            rebirthWaiting = rebirthController.active and rebirthEnabled
-            return rebirthWaiting
-        end
-        local plot = tycoon.Feature("Island").Plot()
-        local owned = plot and not plot:IsDestroyed() and plot:Save(tycoonTypes.VAR.Buttons)
-        if type(owned) == "table" and (plot ~= rebirthState.pending.plot or not buttons.RebirthReady(owned)) then
-            rebirthState.pending = nil
-            rebirthWaiting = false
-            table.clear(hatchCounts)
-            table.clear(state.retryAt)
-            clearFarmTargets(state)
-            state.nextHatch = os.clock() + scanInterval
-            state.farmZone, state.farmPlot = nil, nil
-        else
-            -- Nếu replication chậm vẫn giữ chốt chống gửi lặp, nhưng không khóa farm mãi.
-            rebirthWaiting = rebirthController.active and rebirthEnabled and os.clock() < rebirthState.pending.deadline
-            return rebirthWaiting
+-- ============================================================================
+-- [MS-STOCK] Unlock cấp hộp, đứng StockPad thật; không ghi CanStock phía client.
+local function stockStep(c)
+    local flag="EventStoreAutoStock"
+    if not enabled(flag) then return false end
+    if enabled("EventStoreAutoCombine") and combineChoice(c) then return false end
+    for rung=c.api.definitions.LOCKABLE_FROM,c.api.boxes.Count() do
+        if c.api.definitions.BoxLocked(c.own.BoxLocks,rung) then
+            return dispatch(c,flag,{kind="unlock",key="unlock:"..rung,rung=rung},
+                function(f)return f.plot:Invoke(f.api.definitions.NET.LockBox,rung,false)end,nil)
         end
     end
-    local plot = readyRebirthPlot()
-    if not plot or os.clock() < (state.nextRebirth or 0) then return false end
-    if not rebirthEnabled or not isInEvent() or tycoon.Feature("Island").Plot() ~= plot then return false end
-    state.nextRebirth = os.clock() + 5
-    clearFarmTargets(state)
-    rebirthWaiting = true
-    rebirthState.pending = {plot = plot, inFlight = true}
-    local ok, accepted, reason = pcall(plot.Invoke, plot, tycoonTypes.NET.Rebirth)
-    if ok and accepted == true then
-        rebirthState.pending = {plot = plot, deadline = os.clock() + 15}
-        generation += 1
-        state.rebirthError = nil
-        return true
+    if c.api.pad.BoothFull() or os.clock()<(controller.nextStock or 0) then return false end
+    local count=0
+    for _,item in pairs(inventory(c.data,"Lootbox")) do
+        if not item._lk and c.api.boxes.Index(item.id) then count+=item._am or 1 end
     end
-    rebirthState.pending = nil
-    rebirthWaiting = false
-    local problem = tostring(ok and (reason or "Game chưa chấp nhận tái sinh.") or accepted)
-    if problem ~= state.rebirthError then warn("[Auto Rebirth Event] " .. problem) end
-    state.rebirthError = problem
+    if count==0 then return false end
+    local pad=c.model:FindFirstChild("StockPad")
+    local ok=approach(c,flag,partSpot(pad))
+    local owned=lease
+    if not ok then if owned and owned.flag==flag then releaseLease(owned)end;return false end
+    local deadline=os.clock()+3
+    while valid(c,flag) and os.clock()<deadline and not c.api.pad.BoothFull() do
+        local fresh=context()
+        if not fresh or fresh.plot~=c.plot then break end
+        if enabled("EventStoreAutoCombine") and combineChoice(fresh) then break end
+        task.wait(0.2)
+    end
+    releaseLease(owned)
+    controller.nextStock=os.clock()+2
+    return true
+end
+
+-- ============================================================================
+-- [MS-MERCHANT] Mua theo slot/seed server; giữ tiền nhà trước khi mua decor.
+local function merchantChoice(c,shelf)
+    if type(shelf)~="table" or type(shelf.Offers)~="table" or type(shelf.Seed)~="number" then return end
+    local reserve=0
+    if enabled("EventStoreAutoLevel") and c.level<#c.api.definitions.LEVELS then
+        reserve=c.api.buttons.Price(c.level+1) or 0
+    end
+    local best
+    for slot,offer in pairs(shelf.Offers) do
+        local item,price=offer.ItemData,offer.PriceData
+        local id=item and item.data and item.data.id
+        local money=price and price.data
+        if tonumber(slot) and offer.Stock and offer.Stock>0 and item and item.class=="Misc"
+            and c.api.decorDefs.Piece(id) and price and price.class=="Currency" and money and money.id=="MysteryStoreCoins" then
+            local cost=money._am or 1
+            local value=c.api.decor.Value(id) or 0
+            if cost>0 and cost<=math.max(0,c.coins-reserve) and (not best or value>best.value) then
+                best={kind="merchant",key="merchant:"..shelf.Seed..":"..slot,slot=tonumber(slot),
+                    seed=shelf.Seed,id=id,stock=offer.Stock,before=amount(c.data,"Misc",id),cost=cost,value=value}
+            end
+        end
+    end
+    return best
+end
+local function merchantStep(c)
+    local flag="EventStoreAutoMerchant"
+    if not enabled(flag) or lease or os.clock()<(controller.nextOffers or 0) then return false end
+    if not controller.merchantConnection then
+        controller.merchantConnection=c.api.network.Fired("Merchant_Updated"):Connect(function(offers)
+            if controller.active and type(offers)=="table" then controller.offers=offers;controller.nextOffers=0 end
+        end)
+    end
+    if os.clock()>=(controller.fetchOffersAt or 0) then
+        controller.fetchOffersAt=os.clock()+15
+        local ok,result=pcall(c.api.network.Invoke,"Merchant_GetOffers")
+        if not valid(c,flag) then return false end
+        if ok and type(result)=="table" then controller.offers=result end
+    end
+    local shelf=controller.offers and controller.offers.MysteryStoreDecorMerchant
+    if not shelf then
+        -- Một số server chỉ gửi offers sau khi quầy ở gần được đăng ký.
+        local moved=approach(c,flag,machineSpot(c,"MysteryStoreDecorMerchant"))
+        local owned=lease
+        if moved then task.wait(0.5) end
+        if owned then releaseLease(owned) end
+        controller.nextOffers=os.clock()+15
+        report("merchant","Đang chờ danh sách hàng và seed do game gửi.")
+        return moved
+    end
+    local choice=merchantChoice(c,shelf)
+    if not choice then controller.nextOffers=os.clock()+3;return false end
+    return dispatch(c,flag,choice,function(f)
+        return f.api.network.Invoke("Merchant_RequestPurchase","MysteryStoreDecorMerchant",choice.slot,false,choice.seed)
+    end,function(f)
+        local current=controller.offers and controller.offers.MysteryStoreDecorMerchant
+        local offer=current and current.Offers and current.Offers[tostring(choice.slot)]
+        local reserve=enabled("EventStoreAutoLevel") and f.level<#f.api.definitions.LEVELS
+            and (f.api.buttons.Price(f.level+1) or 0) or 0
+        return current and current.Seed==choice.seed and offer and offer.Stock>0 and f.coins-reserve>=choice.cost
+    end,machineSpot(c,"MysteryStoreDecorMerchant"))
+end
+
+-- ============================================================================
+-- [MS-GIFT] Worker riêng; giữ animation gốc, chỉ mở Squishy Gift trong Lootbox.
+local function giftStep(c)
+    local flag="EventStoreAutoGift"
+    if not enabled(flag) or waiting("gift",c) then return end
+    for uid,item in pairs(inventory(c.data,"Lootbox")) do
+        if item.id=="Squishy Gift" and not item._lk then
+            local p={kind="gift",key="gift:"..uid,uid=uid,id=item.id,before=item._am or 1}
+            local count=math.min(8,p.before)
+            return dispatch(c,flag,p,function(f)
+                for _,candidate in pairs(f.api.items.Lootbox("Squishy Gift"):FindAny() or {}) do
+                    if candidate:GetUID()==uid and not candidate:IsLocked() then return f.api.lootbox.Open(candidate,count) end
+                end
+                return false,"Stack quà chưa sẵn sàng."
+            end,function(f)
+                local current=inventory(f.data,"Lootbox")[uid]
+                return current and current.id==p.id and not current._lk and (current._am or 1)>=count
+            end,c.api.base.ZoneLanding(c.plot),false,"gift")
+        end
+    end
+end
+
+-- ============================================================================
+-- [MS-FARM] Giữ mục tiêu sống, chia pet/bulk; chỉ AreaID thuộc plot của mình.
+local function clearFarm()
+    if dependencies then
+        for _,pet in pairs(dependencies.playerPet.GetByPlayer(dependencies.player) or {}) do
+            local uid=pet.euid and assigned[pet.euid]
+            if uid and pet:GetTargetType()=="Breakable" and pet:GetTargetValue()==uid then pet:ClearTarget() end
+        end
+    end
+    table.clear(assigned)
+end
+local function farmTargets(c)
+    local things=workspace:FindFirstChild("__THINGS")
+    local folder=things and things:FindFirstChild("Breakables")
+    local result={}
+    if not folder then return result end
+    for _,model in ipairs(folder:GetChildren()) do
+        if model:GetAttribute("ParentType")==c.api.instanceParent and model:GetAttribute("ParentID")=="MysteryStore"
+            and model:GetAttribute("AreaID")=="MysteryStoreZone_"..c.scope then
+            local uid=model:GetAttribute("BreakableUID")
+            local data=uid and c.api.breaks.Get(uid)
+            if data and data.health>0 and not data.disableDamage then result[#result+1]={uid=uid,health=data.health} end
+        end
+    end
+    table.sort(result,function(a,b)
+        if a.health~=b.health then return a.health<b.health end
+        return tostring(a.uid)<tostring(b.uid)
+    end)
+    return result
+end
+local function farmStep(c)
+    if not enabled("EventStoreFastFarm") then return end
+    if controller.farmScope~=c.scope then clearFarm();controller.farmScope=c.scope end
+    local now=os.clock()
+    if now<(controller.nextTargets or 0) then return end
+    controller.nextTargets=now+0.12
+    if now>=(controller.nextEquip or 0) then c.api.pets.EquipBest();controller.nextEquip=now+15 end
+    if not valid(c,"EventStoreFastFarm") then return end
+    local targets=farmTargets(c)
+    if #targets==0 then clearFarm();return end
+    local counts,eligible,new={},{},{}
+    for _,target in ipairs(targets)do eligible[target.uid]=true end
+    local idle={}
+    for _,pet in pairs(c.api.playerPet.GetByPlayer(c.api.player) or {})do
+        local id=pet.euid
+        if id then
+            local uid=assigned[id]
+            if uid and eligible[uid] then new[id]=uid;counts[uid]=(counts[uid] or 0)+1 else idle[#idle+1]=id end
+        end
+    end
+    for _,id in ipairs(idle)do
+        local best=targets[1].uid
+        for _,target in ipairs(targets)do if (counts[target.uid] or 0)<(counts[best] or 0)then best=target.uid end end
+        new[id]=best;counts[best]=(counts[best] or 0)+1
+    end
+    local changed=false
+    for id,uid in pairs(new)do if assigned[id]~=uid then changed=true;break end end
+    assigned=new
+    if not valid(c,"EventStoreFastFarm") then return end
+    if next(new) and (changed or now>=(controller.nextBulk or 0))then
+        c.api.network.Fire("Breakables_JoinPetBulk",new);controller.nextBulk=now+1
+    end
+    c.api.network.UnreliableFire("Breakables_PlayerDealDamage",targets[1].uid)
+end
+
+-- ============================================================================
+-- [MS-WORKERS] Main giao dịch tuần tự; farm/gift không bị animation giữ vòng chính.
+local function mainStep(c)
+    if waiting("main",c) or lease then return end
+    if levelStep(c) or registerStep(c) or decorStep(c) or combineStep(c) or merchantStep(c) or stockStep(c) then return end
+    if enabled("EventStoreFastFarm") and not lease and not c.api.pad.OnPad() then
+        local landing=c.api.base.ZoneLanding(c.plot)
+        if landing and (c.root.Position-landing.Position).Magnitude>12 then c.character:PivotTo(landing) end
+    end
+end
+local function anyEnabled()
+    for _,on in pairs(controller.flags)do if on then return true end end
     return false
 end
-
--- Auto Pumpkin / Chỉ chọn bí ngô còn sống trên đảo của mình.
-local function findPumpkin(position)
-    local plot = tycoon.Feature("Island").Plot()
-    local target, distance
-    for _, breaker in pairs(plot and plot.Breakables or {}) do
-        if breaker.parentID ~= instanceId or not string.match(breaker.areaID or "", "^Pedestal_%d+$")
-            or breaker.health <= 0 or breaker.disableDamage
-            or not breaker.model or not breaker.model.Parent then continue end
-        local nextDistance = (breaker.position - position).Magnitude
-        if not distance or nextDistance < distance then
-            target, distance = breaker, nextDistance
-        end
-    end
-    return target
+local function stopJobs()
+    for _,job in pairs(controller.jobs)do pcall(task.cancel,job)end
+    table.clear(controller.jobs)
+    if controller.merchantConnection then controller.merchantConnection:Disconnect();controller.merchantConnection=nil end
+    pcall(releaseLease)
+    pcall(clearFarm)
 end
-
--- Kiểm tra bảng My Pumpkin và nút Auto đã hiện.
-local function isMyPumpkinOpen(merchant)
-    if not merchant.IsOpen() or merchant.CurrentTab() ~= "Pumpkins" then return false end
-    local gui = merchant.Gui()
-    local frame = gui and gui:FindFirstChild("Frame")
-    local page = frame and frame:FindFirstChild("PumpkinsFrame")
-    return page and page.Visible
-end
-
--- Mở đúng tab My Pumpkin bằng luồng mở merchant của game.
-local function openMyPumpkin(merchant)
-    if not merchant.Enabled() or not merchant.Unlocked() then return end
-    if not merchant.IsOpen() then merchant.OpenRemote() end
-    if pumpkinEnabled and isInEvent() and merchant.IsOpen() and not isMyPumpkinOpen(merchant) then
-        merchant.ShowTab("Pumpkins")
-    end
-end
-
--- Lưu vị trí trước khi đứng cạnh bí ngô.
-local function attackPumpkin(target, character, humanoid, root)
-    local original = character:GetPivot()
-    local assigned = {}
-    local merchant = tycoon.Feature("Merchant")
-    local nextOpenAt = 0
-    local nextAssignAt = 0
-    local ok, err = pcall(function()
-        petCmds.EquipBest()
-        while pumpkinEnabled and isInEvent() and player.Character == character
-            and humanoid.Health > 0 and root.Parent == character and not readyRebirthPlot()
-            and not (turkeyPending and turkeyPending()) do
-            if buyTick then buyTick(character, humanoid, root) end
-            if player.Character ~= character or humanoid.Health <= 0 or not isInEvent() then break end
-            if huntTick then huntTick(character, humanoid, root) end
-            if player.Character ~= character or humanoid.Health <= 0 or not isInEvent()
-                or (turkeyPending and turkeyPending()) then break end
-            local breaker = breakables.Get(target.uid)
-            if not breaker or breaker.health <= 0 or not breaker.model or not breaker.model.Parent then break end
-            if (root.Position - breaker.position).Magnitude > 8 then
-                local direction = root.Position - breaker.position
-                local flat = Vector3.new(direction.X, 0, direction.Z)
-                local offset = flat.Magnitude > 0.01 and flat.Unit * 4 or Vector3.new(4, 0, 0)
-                local height = root.Size.Y / 2 + humanoid.HipHeight + 0.5
-                local leg = humanoid.RigType == Enum.HumanoidRigType.R6 and character:FindFirstChild("Left Leg")
-                if leg then height += leg.Size.Y end
-                local rootOffset = root.CFrame:ToObjectSpace(character:GetPivot())
-                root.AssemblyLinearVelocity = Vector3.zero
-                character:PivotTo(CFrame.new(breaker.position + offset + Vector3.new(0, height, 0))
-                    * root.CFrame.Rotation * rootOffset)
-            end
-            if os.clock() >= nextOpenAt then
-                nextOpenAt = os.clock() + 2
-                local opened, openError = pcall(openMyPumpkin, merchant)
-                if not opened then warn("[Auto Pumpkin] My Pumpkin: " .. tostring(openError)) end
-                if not pumpkinEnabled or not isInEvent() or player.Character ~= character then break end
-            end
-            -- Duy trì lệnh gán pet mỗi giây để các hit không gửi lại cả batch.
-            if os.clock() >= nextAssignAt then
-                nextAssignAt = os.clock() + 1
-                local batch = {}
-                for _, pet in pairs(playerPet.GetByPlayer(player) or {}) do
-                    if pet.euid then
-                        batch[pet.euid] = target.uid
-                        assigned[pet.euid] = true
-                    end
-                end
-                if next(batch) then network.Fire("Breakables_JoinPetBulk", batch) end
-            end
-            network.UnreliableFire("Breakables_PlayerDealDamage", target.uid)
-            task.wait(0.25)
+controller.Stop=function()controller.active=false;stopJobs()end
+local function worker(name,delay,step)
+    controller.jobs[name]=task.defer(function()
+        while controller.active and anyEnabled() do
+            local ok,problem=pcall(function()
+                local c=context()
+                if c then step(c) elseif name=="farm" then clearFarm() end
+            end)
+            if not ok then
+                if lease and lease.flag~="EventStoreAutoGift" and name=="main"
+                    or lease and lease.flag=="EventStoreAutoGift" and name=="gift" then pcall(releaseLease) end
+                report(name,problem)
+            else report(name,nil) end
+            task.wait(ok and delay or 2)
         end
     end)
-
-    -- Quay lại trước khi cho phép các vòng farm chạy tiếp.
-    local restored, restoreError = pcall(function()
-        if isInEvent() and player.Character == character and humanoid.Health > 0 and root.Parent == character then
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-            character:PivotTo(original)
+end
+local function setToggle(flag,on,shared)
+    if not controller.active then return end
+    controller.flags[flag]=on==true
+    controller.shared=shared or controller.shared
+    if not on then
+        if flag=="EventStoreFastFarm" then pcall(clearFarm) end
+        if lease and lease.flag==flag then pcall(releaseLease) end
+        if flag=="EventStoreAutoMerchant" and controller.merchantConnection then
+            controller.merchantConnection:Disconnect();controller.merchantConnection=nil
         end
-        for _, pet in pairs(playerPet.GetByPlayer(player) or {}) do
-            if pet.euid and assigned[pet.euid] and pet:GetTargetType() == "Breakable"
-                and pet:GetTargetValue() == target.uid then
-                pet:ClearTarget()
-            end
-        end
-    end)
-    if not ok or not restored then warn("[Auto Pumpkin] " .. tostring(err or restoreError)) end
+    end
+    if not anyEnabled() then stopJobs();return end
+    if not next(controller.jobs) then
+        worker("main",0.25,mainStep)
+        worker("farm",0.12,farmStep)
+        worker("gift",1,giftStep)
+    end
+end
+controller.Status=function()
+    local flags={}
+    for flag,on in pairs(controller.flags)do flags[flag]=on end
+    return {active=controller.active,flags=flags,moving=lease and lease.flag,
+        pending=session.pending,errors=controller.errors}
 end
 
--- Điều phối chung để bí ngô và mở map không tranh vị trí.
-local function startWorker()
-    if workerRunning then return end
-    workerRunning = true
-
-    task.defer(function()
-        local state = {
-            retryAt = setmetatable({}, { __mode = "k" }),
-            assigned = {},
-            nextFarm = 0,
-            nextSend = 0,
-            nextEquip = 0,
-            nextHatch = 0,
-        }
-        local nextEntryAt = 0
-        while enabled or bestAreaEnabled or pumpkinEnabled or fastFarmEnabled or rebirthEnabled or cocoaTick or huntTick or buyTick or turkeyEnabled do
-            local character = player.Character
-            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-            local root = humanoid and humanoid.RootPart
-            local inEvent = isInEvent()
-            if not inEvent or not (enabled or fastFarmEnabled) then clearFarmTargets(state) end
-            if root and humanoid.Health > 0 then
-                if inEvent then
-                    if turkeyTick then
-                        local ok, handled = pcall(turkeyTick, state, character, humanoid, root)
-                        if not ok then
-                            if handled ~= state.turkeyError then warn("[Auto Turkey] " .. tostring(handled)) end
-                            state.turkeyError = handled
-                        elseif handled then
-                            task.wait(scanInterval)
-                            continue
-                        end
-                    end
-                    local rebirthOk, hold = pcall(autoRebirthStep, state)
-                    if not rebirthOk then
-                        rebirthWaiting = false
-                        state.nextRebirth = os.clock() + 5
-                        if hold ~= state.rebirthError then warn("[Auto Rebirth Event] " .. tostring(hold)) end
-                        state.rebirthError = hold
-                    elseif hold then
-                        task.wait(scanInterval)
-                        continue
-                    end
-                    if buyTick then buyTick(character, humanoid, root) end
-                    if player.Character ~= character or humanoid.Health <= 0 or not isInEvent() then
-                        task.wait(scanInterval)
-                        continue
-                    end
-                    if cocoaTick then
-                        cocoaTick(character, humanoid, root)
-                        if player.Character ~= character or humanoid.Health <= 0 or not isInEvent() then
-                            task.wait(scanInterval)
-                            continue
-                        end
-                    end
-                    if huntTick then huntTick(character, humanoid, root) end
-                    if player.Character ~= character or humanoid.Health <= 0 or not isInEvent()
-                        or (turkeyPending and turkeyPending()) or readyRebirthPlot() then
-                        task.wait(scanInterval)
-                        continue
-                    end
-                    local pumpkin = pumpkinEnabled and findPumpkin(root.Position)
-                    if pumpkin then
-                        clearFarmTargets(state)
-                        attackPumpkin(pumpkin, character, humanoid, root)
-                    elseif enabled or bestAreaEnabled or fastFarmEnabled then
-                        local ok, err = pcall(updateEvent, state, character, humanoid, root)
-                        if not ok then
-                            warn("[Auto Open Map Event] " .. tostring(err))
-                            task.wait(retryDelay)
-                        end
-                    end
-                elseif enabled and os.clock() >= nextEntryAt then
-                    enterEvent()
-                    nextEntryAt = os.clock() + entryRetryDelay
-                end
-            end
-            -- Chạy điều phối nhanh theo đúng chu kỳ đánh của Fast Farm.
-            task.wait(inEvent and fastFarmEnabled and fastFarmInterval or scanInterval)
-        end
-        clearFarmTargets(state)
-        workerRunning = false
-    end)
+-- ============================================================================
+-- [MS-EXPORT] Callback chung cho UI và launcher; không tự bật khi load.
+for _,flag in ipairs({"EventStoreFastFarm","EventStoreAutoRegister","EventStoreAutoLevel","EventStoreAutoDecor",
+    "EventStoreAutoStock","EventStoreAutoGift","EventStoreAutoMerchant","EventStoreAutoCombine"}) do
+    features[flag]={duy=function(on,shared)setToggle(flag,on,shared)end}
 end
-
--- Cầu nối nội bộ cho FarmTeleToBestArea; không thêm toggle/flag UI mới.
-features.EventTeleToBestArea = {
-    duy = function(on)
-        bestAreaEnabled = on == true
-        if bestAreaEnabled then startWorker() end
-    end,
-}
-
--- Toggle riêng; không tự bật mở map/farm và không tự vào event.
-features.EventAutoRebirth = {
-    duy = function(on)
-        if not rebirthController.active then return end
-        rebirthEnabled = on == true
-        if rebirthEnabled then startWorker() else rebirthWaiting = false end
-    end,
-}
-
-
--- Auto Turkey / Độc quyền tác vụ cho tới khi boss chết hoặc biến mất.
-do
-    local turkeyData = require(library.Util.PumpkinTycoonTurkey)
-    local enchantCmds = require(client.EnchantCmds)
-    local env = type(getgenv) == "function" and getgenv() or _G
-    local previous = env.RobloxHubEventTurkey
-    if type(previous) == "table" and type(previous.stop) == "function" then previous.stop(true) end
-    local session = type(previous) == "table" and type(previous.session) == "table" and previous.session or {}
-    local controller = {active = true, busy = false, session = session}
-    local http = game:GetService("HttpService")
-    local players = game:GetService("Players")
-    local sharedFeatures = features
-    local visit
-    local nextTryAt = 0
-
-    local function sharedModel()
-        local things = workspace:FindFirstChild("__THINGS")
-        local instances = things and things:FindFirstChild("Instances")
-        local instance = instances and instances:FindFirstChild(instanceId)
-        return instance and instance:FindFirstChild(tycoon.Feature("Island").SHARED_NAME)
-    end
-
-    local function live(shared)
-        if not shared or not shared.Parent then return false end
-        local health = shared:GetAttribute(turkeyData.ATTR.Health)
-        local endsAt = shared:GetAttribute(turkeyData.ATTR.EndsAt)
-        return shared:GetAttribute(turkeyData.ATTR.Alive) == true
-            and type(health) == "number" and health > 0
-            and (type(endsAt) ~= "number" or endsAt > workspace:GetServerTimeNow())
-    end
-
-    local function encounterKey(shared)
-        local endsAt = shared:GetAttribute(turkeyData.ATTR.EndsAt)
-        local stamp = type(endsAt) == "number" and endsAt
-            or math.floor(workspace:GetServerTimeNow() / turkeyData.Period())
-        return tostring(game.JobId) .. ":" .. tostring(stamp)
-    end
-
-    local function skipped(shared)
-        local skip = session.skipped
-        return skip and skip.shared == shared and skip.key == encounterKey(shared)
-    end
-
-    -- Cùng dữ liệu JSON mà TurkeyBoard.Paint dùng: {username, share, DPS}.
-    local function hasPartner(shared)
-        local raw = shared:GetAttribute(turkeyData.ATTR.Top)
-        if type(raw) ~= "string" then return false end
-        local ok, rows = pcall(http.JSONDecode, http, raw)
-        if not ok or type(rows) ~= "table" then return false end
-        for _, row in pairs(rows) do
-            if type(row) == "table" and type(row[1]) == "string" and row[1] ~= player.Name
-                and type(row[3]) == "number" and row[3] > 0 and row[3] < math.huge
-                and players:FindFirstChild(row[1]) then return true end
-        end
-        return false
-    end
-
-    local function clearTurkeyTargets(record)
-        for _, pet in pairs(playerPet.GetByPlayer(player) or {}) do
-            if pet.euid and pet:GetTargetType() == "Breakable" and record.targets[pet:GetTargetValue()] then
-                pet:ClearTarget()
-            end
-        end
-    end
-
-    turkeyPending = function()
-        if not (controller.active and turkeyEnabled and not rebirthWaiting and isInEvent()
-            and tycoon.Part2() and tycoon.OwnPlotPart2() and turkeyData.Enabled()
-            and tycoon.Feature("Turkey").OwnsCannon() and os.clock() >= nextTryAt) then return false end
-        local shared = sharedModel()
-        return live(shared) and not skipped(shared)
-    end
-
-    local function gameplay(flag)
-        return flag ~= "EventAutoTurkey" and not flag:match("^Optimize")
-            and flag ~= "EventOptimize" and not flag:match("StatsGui$")
-            and not flag:find("Webhook", 1, true)
-    end
-
-    -- UI vẫn giữ lựa chọn của người dùng, worker thực tế tạm dừng.
-    local function pause(record)
-        local ui = env.RobloxHubUI
-        assert(ui and type(ui.Snapshot) == "function", "Chưa có registry UI để tạm dừng các tác vụ.")
-        record.paused = {}
-        controller.busy = true
-        for flag, on in pairs(ui:Snapshot()) do
-            local feature = sharedFeatures[flag]
-            if on == true and gameplay(flag) and feature and type(feature.duy) == "function" then
-                record.paused[flag] = true
-                feature.duy(false, sharedFeatures)
-            end
-        end
-    end
-
-    local function finish(reloading)
-        local record = visit
-        if not record then controller.busy = false; return end
-        visit = nil
-        local cleared, clearError = pcall(function()
-            for _, pet in pairs(playerPet.GetByPlayer(player) or {}) do
-                if pet.euid and pet:GetTargetType() == "Breakable" and record.targets[pet:GetTargetValue()] then
-                    pet:ClearTarget()
-                end
-            end
-        end)
-        if not cleared then warn("[Auto Turkey] Dọn mục tiêu: " .. tostring(clearError)) end
-        local ok, problem = pcall(function()
-            if isInEvent() and player.Character == record.character and record.humanoid.Health > 0
-                and record.root.Parent == record.character and tycoon.Feature("Island").Plot() == record.plot
-                and record.plot:GetModel() == record.model and record.model.Parent then
-                record.root.AssemblyLinearVelocity, record.root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
-                record.character:PivotTo(record.original)
-            end
-        end)
-        controller.busy, controller.waitingForPartner = false, false
-        if not ok then warn("[Auto Turkey] Trở về: " .. tostring(problem)) end
-        if not reloading then
-            for flag, on in pairs(record.paused or {}) do
-                if on and sharedFeatures[flag] then
-                    local resumed, err = pcall(sharedFeatures[flag].duy, true, sharedFeatures)
-                    if not resumed then warn("[Auto Turkey] Khôi phục " .. flag .. ": " .. tostring(err)) end
-                end
-            end
-        end
-    end
-
-    local function target()
-        local things = workspace:FindFirstChild("__THINGS")
-        local folder = things and things:FindFirstChild("Breakables")
-        for _, model in ipairs(folder and folder:GetChildren() or {}) do
-            local uid = model:GetAttribute("BreakableUID")
-            local data = uid and breakables.Get(uid)
-            if data and data.parentID == instanceId and data.clientAttributes
-                and data.clientAttributes.PumpkinTurkey == true
-                and data.health > 0 and not data.disableDamage and data.model and data.model.Parent then
-                return data
-            end
-        end
-    end
-
-    turkeyTick = function(state, character, humanoid, root)
-        if not turkeyPending() then return false end
-        local plot = tycoon.Feature("Island").Plot()
-        local model = plot and plot:GetModel()
-        local shared = sharedModel()
-        local arena = shared and shared:FindFirstChild("TurkeyArena", true)
-        local spawn = arena and arena:FindFirstChild("TurkeySpawn", true)
-        if not model or not spawn or not spawn:IsA("BasePart") then return false end
-        local record = {character=character, humanoid=humanoid, root=root, plot=plot, model=model,
-            original=character:GetPivot(), targets={}, encounter=encounterKey(shared)}
-        visit = record
-        local ok, problem = pcall(function()
-            pause(record)
-            clearFarmTargets(state)
-            -- Đợi các worker đã tắt thoát khỏi lượt đang thực hiện rồi mới rời đảo.
-            task.wait(0.35)
-            local missingSince
-            local nextAssign, nextTap = 0, 0
-            local nextBoardCheck, partner, aloneSince, waitingCleared = 0, false, nil, false
-            while controller.active and turkeyEnabled and isInEvent() and live(shared)
-                and player.Character == character and humanoid.Health > 0 and root.Parent == character
-                and tycoon.Feature("Island").Plot() == plot and plot:GetModel() == model do
-                if encounterKey(shared) ~= record.encounter then break end
-                local boss = target()
-                local position = boss and boss.position or spawn.Position
-                local flat = Vector3.new(root.Position.X-position.X, 0, root.Position.Z-position.Z)
-                local direction = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(1,0,0)
-                local height = root.Size.Y/2 + humanoid.HipHeight + 0.5
-                local leg = humanoid.RigType == Enum.HumanoidRigType.R6 and character:FindFirstChild("Left Leg")
-                if leg then height += leg.Size.Y end
-                if (root.Position-position).Magnitude > 28 then
-                    local offset = root.CFrame:ToObjectSpace(character:GetPivot())
-                    root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
-                    character:PivotTo(CFrame.new(position + direction*22 + Vector3.new(0,height,0))
-                        * root.CFrame.Rotation * offset)
-                end
-                local now = os.clock()
-                if now >= nextBoardCheck then
-                    partner = hasPartner(shared)
-                    nextBoardCheck = now + 0.5
-                end
-                controller.waitingForPartner = not partner
-                if partner then
-                    aloneSince = nil
-                    waitingCleared = false
-                else
-                    aloneSince = aloneSince or now
-                    if now - aloneSince >= 30 then
-                        session.skipped = {shared=shared, key=record.encounter}
-                        break
-                    end
-                end
-                if boss then
-                    missingSince = nil
-                    record.lastUid = boss.uid
-                    record.targets[boss.uid] = true
-                    if not partner and not waitingCleared then
-                        clearTurkeyTargets(record)
-                        waitingCleared = true
-                    end
-                    if partner and now >= nextAssign then
-                        local batch = {}
-                        for _, pet in pairs(playerPet.GetByPlayer(player) or {}) do
-                            if pet.euid then batch[pet.euid] = boss.uid end
-                        end
-                        if next(batch) then network.Fire("Breakables_JoinPetBulk", batch) end
-                        nextAssign = now + 1
-                    end
-                    if partner and now >= nextTap then
-                        local power = enchantCmds.GetPower("Swift Taps")
-                        local taps = type(power) == "number" and power > 0 and math.min(8*(1+power/100),16) or 8
-                        nextTap = now + 1/taps
-                        network.UnreliableFire("Breakables_PlayerDealDamage", boss.uid)
-                    end
-                else
-                    local last = record.lastUid and breakables.Get(record.lastUid)
-                    if record.lastUid and (not last or last.health <= 0) then break end
-                    if partner then
-                        missingSince = missingSince or now
-                        if now-missingSince > 10 then break end
-                    else missingSince = nil end
-                end
-                task.wait(0.05)
-            end
-        end)
-        finish(false)
-        nextTryAt = os.clock() + (ok and 1 or 5)
-        if not ok then warn("[Auto Turkey] " .. tostring(problem)) end
-        return true
-    end
-
-    controller.stop = function(reloading)
-        controller.active, turkeyEnabled = false, false
-        finish(reloading == true)
-    end
-    env.RobloxHubEventTurkey = controller
-    features.EventAutoTurkey = {
-        -- Lựa chọn bật/tắt mới trong khi đánh sẽ áp dụng khi trở về.
-        deferControl = function(flag, on)
-            if not controller.busy or not gameplay(flag) then return false end
-            if visit then visit.paused[flag] = on == true end
-            return true
-        end,
-        duy = function(on, shared)
-            if not controller.active then return end
-            if type(shared) == "table" then sharedFeatures = shared end
-            turkeyEnabled = on == true
-            if turkeyEnabled then startWorker() end
-        end,
-    }
-end
-
--- Auto Hunt Pet riêng: ném vợt từng lượt, tùy chọn chỉ nằm trong launcher.
-do
-    local huntUtil = require(library.Util.PumpkinTycoonHunt)
-    local wildUtil = require(library.Util.PumpkinTycoonWild)
-    local wildTypes = require(library.Types.PumpkinTycoon.Wild)
-    local miscItem = require(library.Items.MiscItem)
-    local flags = require(library.Universal.FFlags)
-    local env = type(getgenv) == "function" and getgenv() or _G
-    local previous = env.RobloxHubEventHunt
-    if type(previous) == "table" and type(previous.stop) == "function" then previous.stop() end
-    local session = type(previous) == "table" and type(previous.session) == "table" and previous.session or {}
-    local controller = {active = true, enabled = false, session = session}
-    local rules = huntUtil.Default()
-    local variants = {}
-    local species = {}
-    local lastError
-    local checkInterval
-    local visit
-    local finishPatrol
-    local minNames = {any=0, common=0, uncommon=1, rare=2, epic=3, huge=4}
-    local validVariants = {normal=true,golden=true,rainbow=true,shiny=true,shinygolden=true,shinyrainbow=true}
-
-    local function variantName(value)
-        local name = tostring(value):lower():gsub("[%s_%-]", "")
-        if name == "gold" then name = "golden" end
-        if name == "goldshiny" or name == "goldenshiny" then name = "shinygolden" end
-        if name == "rainbowshiny" then name = "shinyrainbow" end
-        return name
-    end
-
-    local function configure(config)
-        config = config or {}
-        assert(type(config) == "table", "eventHunt phải là bảng")
-        local minimum = config.minRarity
-        if minimum == nil then minimum = config.Min or 0 end
-        if type(minimum) == "string" then minimum = minNames[minimum:lower():gsub("[%s+]", "")] end
-        assert(type(minimum) == "number" and minimum >= 0 and minimum <= 4 and minimum % 1 == 0,
-            "eventHunt.minRarity: Any/Common/Uncommon/Rare/Epic/Huge hoặc 0..4")
-        local only = config.onlyVariants
-        if only == nil then only = config.Variant end
-        local ultra = config.ultraOnHuge
-        if ultra == nil then ultra = config.UltraOnHuge end
-        assert(only == nil or type(only) == "boolean", "onlyVariants cần true/false")
-        assert(ultra == nil or type(ultra) == "boolean", "ultraOnHuge cần true/false")
-        local selected = config.rarities or {}
-        if type(selected) == "string" then selected = selected == "" and {} or {selected} end
-        assert(type(selected) == "table", "eventHunt.rarities cần chuỗi hoặc danh sách")
-        local whitelist = {}
-        for _, value in ipairs(selected) do
-            local name = variantName(value)
-            assert(validVariants[name], "Biến thể không hợp lệ: " .. tostring(value))
-            whitelist[name] = true
-        end
-        rules = huntUtil.Clean({On=true,Min=minimum,Variant=only==true,UltraOnHuge=ultra~=false})
-        variants = whitelist
-        local interval = config.checkInterval
-        assert(interval == nil or (type(interval) == "number" and interval == interval
-            and interval >= 10 and interval < math.huge), "eventHunt.checkInterval cần số giây >= 10")
-        checkInterval = interval
-        session.nextPatrolAt = 0
-    end
-
-    local function matchesVariant(entry)
-        local name = entry.R == true and "rainbow" or entry.G == true and "golden" or "normal"
-        if entry.S == true then name = name == "normal" and "shiny" or "shiny" .. name end
-        return not next(variants) or variants[name] == true
-    end
-
-    local function metadata(entry)
-        local zone = entry.Z
-        if not species[zone] then
-            local byPet = {}
-            for _, row in ipairs(wildTypes.Species(zone)) do byPet[row.PetId] = row end
-            species[zone] = byPet
-        end
-        return species[zone][entry.P]
-    end
-
-    local function step(root, visited)
-        if not controller.active or not controller.enabled or session.inFlight or rebirthWaiting
-            or not isInEvent() or not tycoon.Part2() or not tycoon.OwnPlotPart2() or not wildUtil.Enabled() then return "stop" end
-        local plot = tycoon.Feature("Island").Plot()
-        local model = plot and not plot:IsDestroyed() and plot:GetModel()
-        if not model or plot:GetOwner() ~= player or not root or not root.Parent then return "stop" end
-        local cf, size = model:GetBoundingBox()
-        if not tycoonTypes.OnIsland(cf, size, root.Position) then return "stop" end
-
-        -- Chỉ tắt On; giữ nguyên bộ lọc native, chờ save xác nhận trước khi ném.
-        local native = tycoon.Feature("Hunt")
-        local saved = plot:Save(tycoonTypes.VAR.Hunt)
-        if (type(saved) == "table" and saved.On == true) or native.Saved().On or native.On() then
-            if os.clock() >= (session.nextDisable or 0) then
-                session.nextDisable = os.clock() + 3
-                native.Set({On=false})
-            end
-            return "wait"
-        end
-        if os.clock() < (session.nextThrow or 0) then return "wait" end
-        local netCount = miscItem(wildTypes.NET_ORDER[1]):CountExact()
-        local ultraCount = miscItem(wildTypes.NET_ORDER[2]):CountExact()
-        if netCount <= 0 and ultraCount <= 0 then return "noNets" end
-        local reach = flags.Get(flags.Keys.PumpkinTycoon_ThrowReach)
-        if type(reach) ~= "number" or reach <= 0 then reach = 150 end
-        local range = math.min(huntUtil.Range(), reach)
-        local wild = tycoon.Feature("Wild")
-        local owned = plot:Save(tycoonTypes.VAR.Buttons)
-        local candidates = {}
-        for slot, physical in pairs(wild.All()) do
-            local entry = physical.Entry
-            local part = physical.CustomPet and physical.CustomPet.primaryPart
-            local zone = type(entry) == "table" and tycoonTypes.ZONES[entry.Z]
-            if type(slot) == "number" and not (visited and visited[slot]) and zone and part and part.Parent
-                and not physical.Catching and not physical.AttemptingCatch
-                and buttons.Owned(owned, zone.Section .. "_Zone")
-                and (part.Position - root.Position).Magnitude <= range and matchesVariant(entry) then
-                local row = metadata(entry)
-                if row and not (row.Huge and wildUtil.SoldOut(entry.P)) then
-                    candidates[#candidates+1] = {slot=slot,entry=entry,tier=row.Tier or 0,huge=row.Huge==true,physical=physical}
-                end
-            end
-        end
-        local target, net = huntUtil.Pick(rules, candidates, netCount, ultraCount)
-        if not target then return "empty" end
-        local physical = wild.Physical(target.slot)
-        if not controller.active or not controller.enabled or physical ~= target.physical
-            or physical.Entry ~= target.entry or physical.Catching or physical.AttemptingCatch
-            or tycoon.Feature("Island").Plot() ~= plot or rebirthWaiting then return "stop" end
-
-        if visited then visited[target.slot] = true end
-        session.nextThrow = os.clock() + math.max(wildUtil.ThrowSeconds(), 0.5)
-        session.inFlight = true
-        physical.AttemptingCatch = true
-        local ok, accepted, reason, result = pcall(plot.Invoke, plot, tycoonTypes.NET.CatchWild, target.slot, net)
-        physical.AttemptingCatch = false
-        -- Có kết quả thật thì luôn hoàn tất hiển thị native, kể cả người dùng vừa tắt toggle.
-        if ok and accepted == true and type(result) == "table" then
-            local rendered, problem = pcall(function()
-                local nets = tycoon.Feature("Nets")
-                if wild.Physical(target.slot) == physical and physical.Entry == target.entry then
-                    nets.Throw(target.slot, result)
-                elseif result.outcome ~= "soldout" then
-                    -- Slot đã thay pet do replication: không phát hoạt ảnh lên pet mới.
-                    nets.Play(nil, result)
-                end
-            end)
-            session.inFlight = false
-            session.nextThrow = os.clock() + math.max(wildUtil.ThrowSeconds(), 0.5)
-            if not rendered then error("Hoạt ảnh bắt pet: " .. tostring(problem)) end
-            lastError = nil
-            return "caught"
-        else
-            session.inFlight = false
-            session.nextThrow = os.clock() + math.max(wildUtil.ThrowSeconds(), 3)
-            error(tostring(ok and (reason or "Game từ chối lượt bắt.") or accepted))
-        end
-    end
-
-
-    -- Đây là thời gian đổi pet trung bình, không phải giờ hồi chính xác của từng slot.
-    local function intervalSeconds()
-        local key = flags.Keys.PumpkinTycoon_WildRefreshSeconds
-        local refresh = key and flags.Get(key)
-        local known = type(refresh) == "number" and refresh == refresh and refresh >= 0 and refresh < math.huge
-        local interval = checkInterval or (known and refresh > 0 and math.max(30, refresh) or 180)
-        return interval, known and refresh or nil
-    end
-
-    -- Thu thập vùng của chính đảo, không lưu tọa độ cố định theo server.
-    local function collectPoints(wild, owned)
-        local reach = flags.Get(flags.Keys.PumpkinTycoon_ThrowReach)
-        if type(reach) ~= "number" or reach <= 0 then reach = 150 end
-        local range = math.max(1, math.min(huntUtil.Range(), reach))
-        local points, seen = {}, {}
-        for zone = 1, lastEventZone() do
-            local definition = tycoonTypes.ZONES[zone]
-            if buttons.Owned(owned, definition.Section .. "_Zone") then
-                for _, area in ipairs(wild.Areas(zone)) do
-                    if area:IsA("BasePart") and area.Parent and not seen[area] then
-                        seen[area] = true
-                        -- Vùng rộng chia nhiều điểm để góc xa vẫn nằm trong tầm ném.
-                        local nx = math.max(1, math.ceil(area.Size.X / (range * 1.2)))
-                        local nz = math.max(1, math.ceil(area.Size.Z / (range * 1.2)))
-                        for x = 1, nx do
-                            for z = 1, nz do
-                                points[#points+1] = {zone=zone, area=area, localPosition=Vector3.new(
-                                    ((x-0.5)/nx-0.5)*area.Size.X, area.Size.Y/2,
-                                    ((z-0.5)/nz-0.5)*area.Size.Z)}
-                            end
-                        end
-                    end
-                end
-            end
-        end
-        return points
-    end
-
-    finishPatrol = function(record)
-        if visit ~= record then return end
-        visit = nil
-        controller.patrolling = false
-        local ok, problem = pcall(function()
-            if controller.active and isInEvent() and player.Character == record.character
-                and record.humanoid.Health > 0 and record.root.Parent == record.character
-                and tycoon.Feature("Island").Plot() == record.plot and not record.plot:IsDestroyed()
-                and record.plot:GetModel() == record.model and record.model.Parent
-                and record.plot:Save(tycoonTypes.VAR.Rebirths) == record.rebirths then
-                record.root.AssemblyLinearVelocity, record.root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
-                record.character:PivotTo(record.original)
-            end
-        end)
-        if not ok then warn("[Auto Hunt Pet] Trả vị trí: " .. tostring(problem)) end
-    end
-
-    local function patrol(character, humanoid, root)
-        local island = tycoon.Feature("Island")
-        local plot = island.Plot()
-        local model = plot and not plot:IsDestroyed() and plot:GetModel()
-        if not model or plot:GetOwner() ~= player then return end
-        if session.patrolPlot ~= plot or session.patrolModel ~= model then
-            session.patrolPlot, session.patrolModel, session.nextPatrolAt = plot, model, 0
-        end
-        if os.clock() < (session.nextPatrolAt or 0) then return step(root) end
-        if not controller.enabled or not controller.active or session.inFlight or rebirthWaiting
-            or not isInEvent() or not tycoon.Part2() or not tycoon.OwnPlotPart2() or not wildUtil.Enabled()
-            or not character or player.Character ~= character or humanoid.Health <= 0 or root.Parent ~= character
-            or (turkeyPending and turkeyPending()) or readyRebirthPlot() then return end
-        -- Hết vợt thì chờ mua, không đi vòng quanh vô ích.
-        if miscItem(wildTypes.NET_ORDER[1]):CountExact() <= 0
-            and miscItem(wildTypes.NET_ORDER[2]):CountExact() <= 0 then return end
-        local wild = tycoon.Feature("Wild")
-        local points = collectPoints(wild, plot:Save(tycoonTypes.VAR.Buttons))
-        local interval, refresh = intervalSeconds()
-        controller.patrolInfo = {points=points, refreshSeconds=refresh, interval=interval}
-        if #points == 0 then session.nextPatrolAt = os.clock()+15; return end
-        local record = {character=character, humanoid=humanoid, root=root, plot=plot, model=model,
-            original=character:GetPivot(), rebirths=plot:Save(tycoonTypes.VAR.Rebirths)}
-        visit, controller.patrolling = record, true
-        local visited = {}
-        local function valid()
-            return visit == record and controller.active and controller.enabled and not rebirthWaiting
-                and isInEvent() and player.Character == character and humanoid.Health > 0 and root.Parent == character
-                and island.Plot() == plot and not plot:IsDestroyed() and plot:GetModel() == model and model.Parent
-                and plot:Save(tycoonTypes.VAR.Rebirths) == record.rebirths and tycoon.OwnPlotPart2()
-                and not (turkeyPending and turkeyPending()) and not readyRebirthPlot()
-        end
-        local function waitFor(seconds)
-            local untilAt = os.clock()+seconds
-            repeat
-                if not valid() then return false end
-                task.wait(0.1)
-            until os.clock() >= untilAt
-            return valid()
-        end
-        local complete = true
-        local ok, problem = pcall(function()
-            for _, point in ipairs(points) do
-                if not valid() then complete=false; break end
-                if not point.area.Parent or not buttons.Owned(plot:Save(tycoonTypes.VAR.Buttons),
-                    tycoonTypes.ZONES[point.zone].Section .. "_Zone") then continue end
-                local floor = point.area.CFrame:PointToWorldSpace(point.localPosition)
-                local height = root.Size.Y/2 + humanoid.HipHeight + 0.5
-                local leg = humanoid.RigType == Enum.HumanoidRigType.R6 and character:FindFirstChild("Left Leg")
-                if leg then height += leg.Size.Y end
-                local offset = root.CFrame:ToObjectSpace(character:GetPivot())
-                root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
-                character:PivotTo(CFrame.new(floor + Vector3.new(0,height,0))*root.CFrame.Rotation*offset)
-                if not waitFor(0.75) then complete=false; break end
-                local deadline = os.clock()+60
-                local emptyChecks = 0
-                while valid() and os.clock() < deadline do
-                    -- Mỗi slot chỉ một lần/chuyến, kể cả nó đổi pet ngay sau lượt ném.
-                    local caught, outcome = pcall(step, root, visited)
-                    if not caught then
-                        if outcome ~= lastError then warn("[Auto Hunt Pet] " .. tostring(outcome)); lastError=outcome end
-                        emptyChecks=0
-                    elseif outcome == "stop" or outcome == "noNets" then
-                        complete=false
-                        return
-                    elseif outcome == "empty" then
-                        emptyChecks+=1
-                        if emptyChecks >= 3 then break end
-                    else emptyChecks=0 end
-                    if not waitFor(0.25) then complete=false; return end
-                end
-            end
-            if not valid() then complete=false end
-        end)
-        finishPatrol(record)
-        -- Turkey/rebirth ngắt chuyến: thử lại sớm sau khi nhiệm vụ ưu tiên kết thúc.
-        session.nextPatrolAt = os.clock() + (ok and complete and interval or 5)
-        if not ok then error(problem) end
-    end
-
-    local function tick(character, humanoid, root)
-        local ok, problem = pcall(patrol, character, humanoid, root)
-        if not ok and problem ~= lastError then warn("[Auto Hunt Pet] " .. tostring(problem)); lastError=problem end
-    end
-    controller.stop = function()
-        controller.enabled = false
-        if visit then finishPatrol(visit) end
-        controller.active = false
-        huntTick = nil
-    end
-    env.RobloxHubEventHunt = controller
-    features.EventAutoHuntPet = {
-        configure = configure,
-        duy = function(on)
-            if not controller.active then return end
-            controller.enabled = on == true
-            huntTick = controller.enabled and tick or nil
-            if controller.enabled then startWorker() end
-        end,
-    }
-end
-
--- Quét riêng PumpkinTycoonPads để bỏ qua các nút thưởng trong PumpkinTycoonIslands.
-features.EventAutoOpenMap = {
-    duy = function(on)
-        if enabled == on then return end
-        enabled = on
-        generation += 1
-        if on then startWorker() end
-    end,
-}
-
--- Auto Pumpkin / Đồng bộ Lock và chế độ My Pumpkin trên đảo của mình.
-local pumpkinSettingsJob
-
--- Dùng trạng thái đã lưu của game để chỉ gửi lệnh khi cần sửa.
-local function syncPumpkinSettings(state)
-    if rebirthWaiting then return end
-    local island = tycoon.Feature("Island")
-    local plot = island.Plot()
-    if not plot then return end
-    if state.plot ~= plot then
-        state.plot = plot
-        table.clear(state.retryAt)
-    end
-
-    local stock = tycoon.Feature("Stock")
-    if island.Get(nil, stock.AUTO_PLACE_VAR) == false and os.clock() >= (state.retryAt.auto or 0)
-        and isMyPumpkinOpen(tycoon.Feature("Merchant")) then
-        state.retryAt.auto = os.clock() + 2
-        plot:Invoke(stock.VERB_AUTO_PLACE, true)
-    end
-
-    if not pumpkinEnabled or island.Plot() ~= plot then return end
-    local lock = tycoon.Feature("Lock")
-    for index = 1, tycoonTypes.MAX_PEDESTALS do
-        if not pumpkinEnabled or island.Plot() ~= plot then return end
-        if lock.Locked(index) then
-            if os.clock() >= (state.retryAt[index] or 0) then
-                state.retryAt[index] = os.clock() + 2
-                plot:Invoke(lock.VERB_LOCK, index, false)
-            end
-        else
-            state.retryAt[index] = nil
-        end
-    end
-    if island.Get(nil, stock.AUTO_PLACE_VAR) ~= false then state.retryAt.auto = nil end
-end
-
--- Theo dõi cài đặt ngay cả khi vòng đánh bí ngô đang chạy.
-local function startPumpkinSettings()
-    if pumpkinSettingsJob then return end
-    pumpkinSettingsJob = task.defer(function()
-        local state = { retryAt = {} }
-        while pumpkinEnabled do
-            local ok, err = pcall(syncPumpkinSettings, state)
-            if not ok then warn("[Auto Pumpkin] " .. tostring(err)) end
-            task.wait(ok and 0.25 or 2)
-        end
-        pumpkinSettingsJob = nil
-    end)
-end
-
--- Bật đánh bí ngô và giữ cài đặt tự động.
-features.EventAutoPumpkin = {
-    duy = function(on)
-        pumpkinEnabled = on
-        if on then
-            startPumpkinSettings()
-            startWorker()
-        end
-    end,
-}
-
--- Fast Farm chỉ đánh khu hiện tại, không điều khiển vị trí hoặc mở trứng.
-features.EventFastFarm = {
-    duy = function(on)
-        fastFarmEnabled = on
-        if on then startWorker() end
-    end,
-}
-
--- Auto Buy Pumpkin / Cùng một toggle mua bí ngô và Pet Net/Ultra Pet Net.
-do
-    local merchantData = require(library.Types.PumpkinTycoon.Merchant)
-    local netStoreData = require(library.Util.PumpkinTycoonStore)
-    local env = type(getgenv) == "function" and getgenv() or _G
-    local previous = env.RobloxHubEventBuy
-    if type(previous) == "table" and type(previous.stop) == "function" then previous.stop() end
-    local session = type(previous) == "table" and type(previous.session) == "table" and previous.session or {}
-    local controller = {active = true, session = session}
-    local buying = false
-    local nextCheckAt = 0
-    local nextKind = "nets"
-    local lastError
-
-    local function active()
-        return controller.active and buying and isInEvent() and not rebirthWaiting
-    end
-
-    -- Một request tại một thời điểm, kể cả vừa exec lại module.
-    local function purchase(action)
-        session.inFlight = true
-        local ok, accepted, reason = pcall(action)
-        session.inFlight = false
-        if not ok then error(accepted) end
-        if accepted ~= true then
-            local problem = tostring(reason or "Game chưa chấp nhận lượt mua.")
-            if problem ~= lastError then warn("[Auto Buy Pumpkin/Net] " .. problem) end
-            lastError = problem
-        else
-            lastError = nil
-        end
-        return accepted == true
-    end
-
-
-    -- Chỉ mở chuỗi tiên quyết của đúng quầy; không tự nhận thưởng/rebirth.
-    local function unlockShop(id, character, humanoid, root)
-        local owned = tycoon.Feature("Buttons").State()
-        if type(owned) ~= "table" then return false, 2 end
-        local seen = {}
-        local function missing(key)
-            if buttons.Owned(owned, key) or seen[key] then return end
-            seen[key] = true
-            local definition = buttons.Get(key)
-            if not definition then return end
-            for _, prerequisite in ipairs(definition.Required or {}) do
-                if not buttons.Owned(owned, prerequisite) then return missing(prerequisite) end
-            end
-            if buttons.CanBuy(owned, key, lastEventZone(), tycoon.Part2()) then return key end
-        end
-        local key = missing(id)
-        local folder = workspace:FindFirstChild("PumpkinTycoonPads")
-        local pad = key and folder and folder:FindFirstChild(key)
-        if not pad or not active() then return false, 2 end
-        local delay = pressPad(folder, pad, character, humanoid, root, generation)
-        return delay ~= nil, delay or 2
-    end
-
-    -- Điều phối chung giữ các tính năng di chuyển khác chờ tới khi mua xong.
-    local function visitShop(plot, machine, character, humanoid, root, action)
-        local model = plot:GetModel()
-        local pad = model and buttons.MachinePad(model, machine)
-        if not pad or not pad.Parent then return false, 2 end
-        local function valid()
-            return active() and player.Character == character and humanoid.Health > 0
-                and root.Parent == character and tycoon.Feature("Island").Plot() == plot
-                and plot:GetModel() == model and model.Parent ~= nil and pad.Parent ~= nil
-        end
-        if not valid() then return false, 2 end
-        local original = character:GetPivot()
-        local offset = root.CFrame:ToObjectSpace(original)
-        local height = root.Size.Y / 2 + humanoid.HipHeight + pad.Size.Y / 2 + 0.5
-        local leg = humanoid.RigType == Enum.HumanoidRigType.R6 and character:FindFirstChild("Left Leg")
-        if leg then height += leg.Size.Y end
-        session.inFlight = true
-        local ok, attempted, delay = pcall(function()
-            root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
-            character:PivotTo(CFrame.new(pad.Position + Vector3.new(0, height, 0)) * root.CFrame.Rotation * offset)
-            task.wait(0.35)
-            if not valid() or not buttons.AtPad(pad, root.Position, 12) then return false, 2 end
-            return action()
-        end)
-        -- Kể cả vừa tắt nút vẫn trả về, nhưng controller cũ không dịch chuyển bản chạy mới.
-        local restored, restoreError = pcall(function()
-            if controller.active and isInEvent() and not rebirthWaiting
-                and player.Character == character and humanoid.Health > 0 and root.Parent == character
-                and tycoon.Feature("Island").Plot() == plot and plot:GetModel() == model and model.Parent then
-                root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
-                character:PivotTo(original)
-            end
-        end)
-        session.inFlight = false
-        if not restored then warn("[Auto Buy Pumpkin/Net] Trả vị trí: " .. tostring(restoreError)) end
-        if not ok then error(attempted) end
-        return attempted, delay
-    end
-
-    -- Chọn cấp bí ngô cao nhất còn hàng và đủ xu.
-    local function chooseBand(items, coins)
-        local config = merchantData.Config()
-        for index = #merchantData.BANDS, 1, -1 do
-            local band = merchantData.BANDS[index]
-            local offer = config[band]
-            if offer and (items[band] or 0) > 0 and coins >= offer.Price then return band end
-        end
-    end
-
-    local function buyPumpkin(character, humanoid, root, arrived)
-        local merchant = tycoon.Feature("Merchant")
-        if not merchant.Enabled() then return false, 2 end
-        if not merchant.Unlocked() then return unlockShop(merchantData.BUTTON, character, humanoid, root) end
-        local island = tycoon.Feature("Island")
-        local plot = island.Plot()
-        if not plot then return false, 2 end
-        local stock = merchantData.CleanStock(island.Get(nil, tycoonTypes.VAR.Stock))
-        if #stock >= merchant.Slots() then return false, 2 end
-        local offers = merchantData.Clean(island.Get(nil, tycoonTypes.VAR.Merchant))
-        local coins = currency.Get(tycoonTypes.COIN)
-        if not offers or type(coins) ~= "number" then return false, 2 end
-        local band = chooseBand(offers.Items, coins)
-        if not band or not active() or island.Plot() ~= plot then return false, 2 end
-        if not arrived then
-            return visitShop(plot, merchantData.MACHINE, character, humanoid, root, function()
-                return buyPumpkin(character, humanoid, root, true)
-            end)
-        end
-        local success = purchase(function() return plot:Invoke(merchantData.VERB_BUY, band) end)
-        return true, success and 1 or 3
-    end
-
-    local function buyPetNet(character, humanoid, root, arrived)
-        if not tycoon.Part2() or not tycoon.OwnPlotPart2() then return false, 2 end
-        local store = tycoon.Feature("Store")
-        if not store.TabOpen() then return unlockShop("PetNetStore", character, humanoid, root) end
-        if store.AutoOn() then return false, 2 end
-        local island = tycoon.Feature("Island")
-        local plot = island.Plot()
-        local shelf = store.Shelf()
-        if not plot or not shelf or type(shelf.seed) ~= "number" or type(shelf.offers) ~= "table" then return false, 2 end
-        if session.plot ~= plot or session.seed ~= shelf.seed then
-            session.plot, session.seed, session.purchased = plot, shelf.seed, {}
-        end
-        local coins = currency.Get(tycoonTypes.COIN)
-        if type(coins) ~= "number" then return false, 2 end
-        local selected
-        for _, id in ipairs({netStoreData.ULTRA_NET, netStoreData.NET}) do
-            for _, offer in ipairs(shelf.offers) do
-                if offer.item == id and type(offer.slot) == "number" and offer.slot >= 1 and offer.slot % 1 == 0
-                    and type(offer.left) == "number" and offer.left > 0
-                    and type(offer.price) == "number" and offer.price >= 0 and coins >= offer.price
-                    and session.purchased[offer.slot] ~= offer.left then
-                    if not selected or offer.price < selected.price
-                        or (offer.price == selected.price and offer.slot < selected.slot) then selected = offer end
-                end
-            end
-            if selected then break end
-        end
-        if not selected or not active() or island.Plot() ~= plot then return false, 2 end
-        if not arrived then
-            return visitShop(plot, netStoreData.MERCHANT, character, humanoid, root, function()
-                return buyPetNet(character, humanoid, root, true)
-            end)
-        end
-        -- Shelf seed/slot là dữ liệu quầy native, không dùng vị trí dòng đã gộp trên UI.
-        local selectedSeed, selectedSlot, selectedLeft = shelf.seed, selected.slot, selected.left
-        local purchased = session.purchased
-        local success = purchase(function()
-            return network.Invoke("Merchant_RequestPurchase", netStoreData.MERCHANT, selectedSlot, false, selectedSeed)
-        end)
-        if success then purchased[selectedSlot] = selectedLeft end
-        return true, success and 1 or 3
-    end
-
-    -- Luân phiên để cả kho bí ngô lẫn vợt đều được xét; nhóm không mua được không chặn nhóm kia.
-    local function buySupplies(character, humanoid, root)
-        if not active() or session.inFlight then return 2 end
-        local first, second
-        if nextKind == "nets" then
-            nextKind = "pumpkin"
-            first, second = buyPetNet, buyPumpkin
-        else
-            nextKind = "nets"
-            first, second = buyPumpkin, buyPetNet
-        end
-        local attempted, delay = first(character, humanoid, root)
-        if not attempted and active() then attempted, delay = second(character, humanoid, root) end
-        return delay or 2
-    end
-
-    controller.stop = function()
-        controller.active, buying = false, false
-        buyTick = nil
-    end
-    env.RobloxHubEventBuy = controller
-    features.EventAutoBuyPumpkin = {
-        duy = function(on)
-            if not controller.active then return end
-            buying = on == true
-            if not buying then buyTick = nil; return end
-            buyTick = function(character, humanoid, root)
-                if not active() or os.clock() < nextCheckAt then return end
-                nextCheckAt = os.clock() + 2
-                local ok, delay = pcall(buySupplies, character, humanoid, root)
-                if not ok and delay ~= lastError then warn("[Auto Buy Pumpkin/Net] " .. tostring(delay)); lastError = delay end
-                nextCheckAt = os.clock() + (ok and delay or 3)
-            end
-            startWorker()
-        end,
-    }
-end
-
--- Auto Hot Coca / Đổi Patch Coins lấy thời gian boost tại Hot Cocoa Stand.
-do
-    local cocoaData = require(library.Util.PumpkinTycoonCocoa)
-    local boosts = require(client.BoostCmds)
-    local minimumCoins = 40_000_000_000
-    local environment = type(getgenv) == "function" and getgenv() or _G
-    local runToken = {}
-    environment.RobloxHubHotCocoaRun = runToken
-    local offers = {}
-    local axes = {"Coins", "Damage", "IslandLuck"}
-    local nextIndex = 1
-    local enabled = false
-    local nextCheckAt = 0
-    local lastError
-
-    -- Chỉ phiên vừa nạp được phép chạy Auto Hot Coca.
-    local function isActive()
-        return enabled and environment.RobloxHubHotCocoaRun == runToken
-    end
-
-    -- Lấy đủ ba offer Coin, Damage và Island Luck từ cấu hình quầy.
-    for _, offer in ipairs(cocoaData.OFFERS) do
-        if offer.Axis == "Coins" or offer.Axis == "Damage" or offer.Axis == "IslandLuck" then
-            offers[offer.Axis] = offer
-        end
-    end
-
-    -- Báo một lần cho mỗi lỗi liên tiếp để dễ kiểm tra trên mobile.
-    local function reportFailure(reason)
-        reason = tostring(reason or "Game từ chối lượt mua.")
-        if lastError == reason then return end
-        lastError = reason
-        warn("[Auto Hot Coca] " .. reason)
-    end
-
-    -- Xét timer riêng cho cả ba nhóm khi số dư trên 40B.
-    local function buyCocoa(character, humanoid, root)
-        if not isActive() or not isInEvent() then return 5 end
-        local cocoa = tycoon.Feature("Cocoa")
-        local coins = cocoa.Coins()
-        if type(coins) ~= "number" or not (coins > minimumCoins) then return 5 end
-        if not cocoa.Enabled() or not cocoa.Unlocked() then
-            reportFailure("Hot Cocoa Stand chưa mở hoặc chưa sẵn sàng.")
-            return 5
-        end
-        local offer, selectedIndex
-        for offset = 0, #axes-1 do
-            local index = (nextIndex+offset-1) % #axes + 1
-            local candidate = offers[axes[index]]
-            if candidate and boosts.GetTimer(candidate.Id) == 0 then
-                offer, selectedIndex = candidate, index
-                break
-            end
-        end
-        if not offer then return 5 end
-
-        local plot = tycoon.Feature("Island").Plot()
-        if not plot then return 5 end
-        local model = plot:GetModel()
-        local pad = model and buttons.MachinePad(model, cocoaData.MACHINE)
-        if not pad then
-            reportFailure("Chưa tải được vị trí Hot Cocoa Stand trên đảo.")
-            return 5
-        end
-        local costPerMinute = cocoaData.CostPerMinute(offer.Tier)
-        if type(costPerMinute) ~= "number" or costPerMinute <= 0 then return 15 end
-
-        -- Đổi tối đa một phần ba số dư theo phút nguyên và sức chứa của quầy.
-        local budget = math.floor(coins / 3)
-        local minutes = math.floor(budget / costPerMinute)
-        local quote = cocoaData.Quote(offer, 0, minutes)
-        if quote.reason or quote.seconds < 60 or quote.cost > budget then return 15 end
-
-        local original
-        local ok, accepted, reason = pcall(function()
-            -- Ghé quầy khi đứng ngoài phạm vi tương tác của game.
-            if (root.Position - pad.Position).Magnitude >= cocoaData.Range() then
-                original = character:GetPivot()
-                local rootOffset = root.CFrame:ToObjectSpace(original)
-                local height = root.Size.Y / 2 + humanoid.HipHeight + 0.5
-                local leg = humanoid.RigType == Enum.HumanoidRigType.R6 and character:FindFirstChild("Left Leg")
-                if leg then height += leg.Size.Y end
-                root.AssemblyLinearVelocity = Vector3.zero
-                character:PivotTo(CFrame.new(pad.Position + Vector3.new(0, height, 0)) * root.CFrame.Rotation * rootOffset)
-                task.wait(0.35)
-            end
-
-            -- Đọc lại số dư và timer sau khi đứng cạnh quầy.
-            local currentCoins = cocoa.Coins()
-            if not isActive() or not isInEvent() or player.Character ~= character or humanoid.Health <= 0
-                or tycoon.Feature("Island").Plot() ~= plot or not pad.Parent
-                or type(currentCoins) ~= "number" or not (currentCoins > minimumCoins)
-                or quote.cost > math.floor(currentCoins / 3) or boosts.GetTimer(offer.Id) ~= 0 then return end
-            nextIndex = selectedIndex % #axes + 1
-            local bought, message = plot:Invoke(cocoaData.VERB_BUY, offer.Key, quote.seconds // 60)
-            return bought == true, message
-        end)
-        if original and player.Character == character and humanoid.Health > 0 and root.Parent == character and isInEvent() then
-            root.AssemblyLinearVelocity = Vector3.zero
-            character:PivotTo(original)
-        end
-        if not ok then reportFailure(accepted)
-        elseif accepted == false then reportFailure(reason)
-        elseif accepted then
-            lastError = nil
-            print(("[Auto Hot Coca] Đã mua %s trong %d phút."):format(offer.Axis, quote.seconds // 60))
-        end
-        return 15
-    end
-
-    -- Ghép lượt ghé quầy vào vòng Event để không tranh vị trí với farm.
-    features.EventAutoHotCoca = {
-        duy = function(on)
-            enabled = on
-            if not isActive() then
-                cocoaTick = nil
-                return
-            end
-            nextCheckAt = 0
-            lastError = nil
-            cocoaTick = function(character, humanoid, root)
-                if not isActive() then
-                    cocoaTick = nil
-                    return
-                end
-                if os.clock() < nextCheckAt then return end
-                local ok, delay = pcall(buyCocoa, character, humanoid, root)
-                if not ok then reportFailure(delay) end
-                nextCheckAt = os.clock() + (ok and delay or 15)
-            end
-            startWorker()
-        end,
-    }
-end
-
--- Auto Gift Huge / Gửi pet Huge có thể giao dịch theo từng UID.
-do
-    local save = require(client.Save)
-    local items = require(library.Items)
-    local petDirectory = require(library.Directory.Pets)
-    local recipient = ""
-    local enabled = false
-    local job
-    local onStop
-    local status = {}
-
-    -- Dừng gửi và đồng bộ toggle khi thiếu kim cương trả phí.
-    local function stopForFee()
-        enabled = false
-        warn("[Auto Gift Huge] Dừng gửi vì không đủ kim cương trả phí mail.")
-        if onStop then onStop() end
-    end
-
-    -- Đọc lỗi mail để phân biệt thiếu phí và pet không thể giao dịch.
-    local function classifyFailure(message)
-        local reason = string.lower(tostring(message or ""))
-        if reason:find("diamond", 1, true) and (reason:find("not enough", 1, true)
-            or reason:find("n't have enough", 1, true) or reason:find("insufficient", 1, true)
-            or reason:find("need more", 1, true)) then
-            return "fee"
-        end
-        if reason:find("untradable", 1, true) or reason:find("untradeable", 1, true)
-            or reason:find("not tradable", 1, true) or reason:find("not tradeable", 1, true)
-            or reason:find("cannot be traded", 1, true) or reason:find("can't be traded", 1, true) then
-            return "pet"
-        end
-        return tonumber(reason:match("please wait (%d+) seconds?"))
-    end
-
-    -- Đọc xác nhận từ kho trước khi thử gửi thêm từ cùng stack.
-    local function refreshStatus(inventory)
-        for uid, state in pairs(status) do
-            local pet = inventory[uid]
-            if not pet or (state.sentAmount and (pet._am or 1) < state.sentAmount) then
-                status[uid] = nil
-            end
-        end
-    end
-
-    -- Chọn pet Huge theo dữ liệu thật của game và bỏ qua pet đang khóa.
-    local function findHuge(inventory)
-        local now = os.clock()
-        for uid, entry in pairs(inventory) do
-            local state = status[uid]
-            if state and (state.blocked or state.sentAmount or state.retryAt > now) then continue end
-            local definition = rawget(petDirectory, entry.id)
-            if definition and definition.huge == true and not definition.titanic and not definition.gargantuan
-                and not entry._lk and (entry._am or 1) > 0 then
-                local ok, tradable = pcall(function()
-                    return items.From("Pet", table.clone(entry)):IsTradable()
-                end)
-                if ok and tradable then return uid, entry._am or 1 end
-            end
-        end
-    end
-
-    -- Gửi một pet và giãn lần thử lại nếu server từ chối.
-    local function sendHuge(getFee)
-        local target = recipient
-        if target == "" or target:lower() == player.Name:lower() then return 5 end
-        local data = save.Get()
-        local inventory = data and data.Inventory and data.Inventory.Pet
-        if not inventory then return 5 end
-        refreshStatus(inventory)
-        local uid, amount = findHuge(inventory)
-        if not uid then return 5 end
-        local diamonds = currency.Get("Diamonds")
-        if type(diamonds) ~= "number" then return 5 end
-        if diamonds < getFee(data) then
-            stopForFee()
-            return 5
-        end
-        if not enabled or recipient ~= target then return 2 end
-
-        local ok, accepted, message = pcall(network.Invoke, "EF_Relay", target, "", "Pet", uid, 1)
-        if ok and accepted then
-            status[uid] = { sentAmount = amount }
-            return 2
-        end
-        local failure = classifyFailure(message or accepted)
-        if failure == "fee" then
-            if enabled then stopForFee() end
-        elseif failure == "pet" then
-            status[uid] = { blocked = true }
-        else
-            status[uid] = { retryAt = os.clock() + 5 }
-        end
-        return type(failure) == "number" and math.max(failure, 2) or 2
-    end
-
-    -- Nhận tên người nhận từ ô nhập hoặc launcher.
-    features.EventAutoGiftHuge = {
-        setRecipient = function(value)
-            recipient = type(value) == "string" and value:match("^%s*(.-)%s*$") or ""
-        end,
-        setStopCallback = function(callback) onStop = callback end,
-        duy = function(on, allFeatures)
-            enabled = on
-            local mailGift = allFeatures and allFeatures.MailAutoGift
-            if not on or job or not (mailGift and mailGift.getFee) then return end
-            job = task.defer(function()
-                while enabled do
-                    local ok, delay = pcall(sendHuge, mailGift.getFee)
-                    task.wait(ok and delay or 5)
-                end
-                job = nil
-            end)
-        end,
-    }
-end
-
--- Auto Pumpkin Upgrade / Nâng cấp các mục đã chọn trong máy.
-do
-    local definitions = require(library.Types.PumpkinTycoon.Upgrades)
-    local eventUpgrades = require(library.Directory.EventUpgrades)
-    local upgradeUtil = require(library.Util.PumpkinTycoonUpgrades)
-    -- Giữ thứ tự cũ; tự thêm track mới từ ROWS khi game cập nhật.
-    local catalog = {
-        { name = "Spawn Luck", track = "SpawnLuck" },
-        { name = "Patch Coin Payout", track = "PumpkinCoins" },
-        { name = "Pumpkin Damage", track = "PumpkinDamage" },
-        { name = "Faster Spawns", track = "RespawnSpeed" },
-        { name = "Merchant Stock", track = "StockSlots" },
-        { name = "Pumpkin Chase Odds", track = "ChaseOdds" },
-        { name = "Island Luck", track = "EggLuck" },
-        { name = "Merchant Luck", track = "MerchantLuck" },
-        { name = "Auto Break", track = "AutoBreakRules" },
-    }
-    local known, additions = {}, {}
-    for _, entry in ipairs(catalog) do known[entry.track] = true end
-    for track, definition in pairs(definitions.ROWS) do
-        if not known[track] and type(definition) == "table" and type(definition.Powers) == "table" then
-            additions[#additions + 1] = {name = definition.Name or track, track = track}
-        end
-    end
-    table.sort(additions, function(a, b) return a.track < b.track end)
-    for _, entry in ipairs(additions) do catalog[#catalog + 1] = entry end
-    local options, tracksByName = {}, {}
-    local selected = {}
-    local retryAt = {}
-    local upgrading = false
-    local upgradeJob
-
-    -- Dùng cùng tên cho dropdown và cấu hình launcher.
-    for _, entry in ipairs(catalog) do
-        table.insert(options, entry.name)
-        tracksByName[entry.name] = entry.track
-    end
-
-    -- Tìm một cấp đã chọn mà ví Pumpkin Tokens trả được.
-    local function upgradeOne()
-        if rebirthWaiting or not isInEvent() or not next(selected) then return end
-        local upgrades = tycoon.Feature("Upgrades")
-        if not upgrades.Enabled() or not upgrades.Unlocked() then return end
-        local plot = tycoon.Feature("Island").Plot()
-        if not plot then return end
-
-        local tokens = upgrades.Tokens()
-        local now = os.clock()
-        for _, entry in ipairs(catalog) do
-            local track = entry.track
-            if not selected[track] or now < (retryAt[track] or 0) then continue end
-            local definition = definitions.ROWS[track]
-            -- Bỏ qua mục chưa được game đăng ký để các nâng cấp khác vẫn chạy.
-            if not definition or not rawget(eventUpgrades, instanceId .. track) then continue end
-            local tier = upgrades.Tier(track)
-            local cap = upgradeUtil.MaxTier(track, player)
-            if tier >= cap or (entry.tier and tier >= entry.tier) or upgrades.Capped(track, tier) then continue end
-            local cost = upgrades.Cost(track, tier + 1)
-            if cost and tokens >= cost then
-                local success = plot:Invoke(upgrades.VERB_BUY, track)
-                if success ~= true then retryAt[track] = os.clock() + 5 end
-                return
-            end
-        end
-    end
-
-    -- Chỉ lưu các mục hợp lệ từ dropdown hoặc launcher.
-    local function setSelection(values)
-        table.clear(selected)
-        for _, name in ipairs(type(values) == "table" and values or {}) do
-            local track = tracksByName[name]
-            if track then selected[track] = true end
-        end
-    end
-
-    -- Giữ một vòng nâng cấp và đọc lại giá sau mỗi lượt.
-    features.EventAutoPumpkinUpgrade = {
-        configureCatalog = function(values)
-            assert(type(values) == "table", "lists.pumpkinUpgrades phải là bảng")
-            local aliases = {}
-            for _, entry in ipairs(catalog) do aliases[entry.name] = entry.track end
-            local entries, names, tracks = {}, {}, {}
-            for _, value in ipairs(values) do
-                local raw = type(value) == "table" and (value.id or value.name) or value
-                local track = aliases[raw] or raw
-                assert(type(track) == "string" and definitions.ROWS[track], "ID nâng cấp không hợp lệ: " .. tostring(raw))
-                local tier = type(value) == "table" and value.tier or nil
-                assert(not tier or (type(tier) == "number" and tier >= 1 and tier % 1 == 0 and tier <= #definitions.ROWS[track].Powers), "Mốc cấp nâng cấp không hợp lệ")
-                local name = type(value) == "table" and (value.name or track) or raw
-                entries[#entries+1] = {name=name, track=track, tier=tier}
-                names[#names+1], tracks[name] = name, track
-            end
-            catalog, options, tracksByName = entries, names, tracks
-            table.clear(selected)
-        end,
-        getOptions = function() return table.clone(options) end,
-        setSelection = setSelection,
-        duy = function(on)
-            upgrading = on
-            if not on or upgradeJob then return end
-            upgradeJob = task.defer(function()
-                while upgrading do
-                    local ok, err = pcall(upgradeOne)
-                    if not ok then warn("[Auto Pumpkin Upgrade] " .. tostring(err)) end
-                    task.wait(ok and 1 or 3)
-                end
-                upgradeJob = nil
-            end)
-        end,
-    }
-end
-
--- Auto Flannel Gift / Mở từng hộp Flannel Gift bằng API của game.
-do
-    local giftId = "Flannel Gift"
-    local inventory = require(client.InventoryCmds)
-    local lootboxItem = require(library.Items.LootboxItem)
-    local lootboxCmds = require(client.LootboxCmds)
-    local opening = false
-    local job
-
-    -- Chỉ lấy stack Lootbox mang đúng ID Flannel Gift.
-    local function openOne()
-        if not inventory.Container() then return 1 end
-        local matches = lootboxItem(giftId):FindAny()
-        local item = matches and matches[1]
-        if not item or item:GetId() ~= giftId or item:GetAmount() < 1 then return 1 end
-        local success = lootboxCmds.Open(item, 1)
-        return success and 1 or 3
-    end
-
-    -- Chạy một vòng mở để mỗi lần chỉ gửi một yêu cầu.
-    features.EventAutoFlannelGift = {
-        duy = function(on)
-            opening = on
-            if not on or job then return end
-            job = task.defer(function()
-                while opening do
-                    local ok, delay = pcall(openOne)
-                    task.wait(ok and delay or 3)
-                end
-                job = nil
-            end)
-        end,
-    }
-end
-
--- Auto Equip Boost / Dùng hết mọi cấp đã chọn, không chờ timer cũ hết.
-do
-    local boostUtil = require(library.Util.PumpkinTycoonBoosts)
-    local save = require(client.Save)
-    local directory = require(library.Directory).Consumables
-    local catalog = {
-        { name = "Patch Coin Boost III", id = "Patch Coin Boost", family = "Coins", tier = 3 },
-        { name = "Patch Coin Boost II", id = "Patch Coin Boost", family = "Coins", tier = 2 },
-        { name = "Patch Coin Boost I", id = "Patch Coin Boost", family = "Coins", tier = 1 },
-        { name = "Pumpkin Damage Boost III", id = "Pumpkin Damage Boost", family = "Damage", tier = 3 },
-        { name = "Pumpkin Damage Boost II", id = "Pumpkin Damage Boost", family = "Damage", tier = 2 },
-        { name = "Pumpkin Damage Boost I", id = "Pumpkin Damage Boost", family = "Damage", tier = 1 },
-        { name = "Island Luck Boost III", id = "Island Luck Boost", family = "IslandLuck", tier = 3 },
-        { name = "Island Luck Boost II", id = "Island Luck Boost", family = "IslandLuck", tier = 2 },
-        { name = "Island Luck Boost I", id = "Island Luck Boost", family = "IslandLuck", tier = 1 },
-    }
-    local options, selected = {}, {}
-    local env = type(getgenv) == "function" and getgenv() or _G
-    local previous = env.RobloxHubEventBoost
-    if type(previous) == "table" and type(previous.stop) == "function" then previous.stop() end
-    local session = type(previous) == "table" and type(previous.session) == "table" and previous.session or {}
-    session.pending = session.pending or {}
-    session.retryAt = session.retryAt or {}
-    session.batchLimit = session.batchLimit or {}
-    local controller = {active=true, session=session}
-    local enabled = false
-    local job
-    local axes, nextIndex = {"Coins", "Damage", "IslandLuck"}, 1
-    for _, entry in ipairs(catalog) do table.insert(options, entry.name) end
-
-    local function active()
-        return controller.active and enabled and not rebirthWaiting and isInEvent()
-            and boostUtil.Enabled(player)
-    end
-
-    -- Nhận mọi cấp được chọn; stack đang chờ replica không chặn các stack khác.
-    local function chooseBoost(inventory, family)
-        local bestUid, bestItem
-        for uid, item in pairs(inventory) do
-            if session.pending[uid] or item._lk or (item._am or 1)<=0
-                or not boostUtil.Allowed(player,item.tn or 1) then continue end
-            for _, entry in ipairs(catalog) do
-                if selected[entry.name] and entry.family == family and entry.id == item.id
-                    and (not entry.tier or entry.tier == (item.tn or 1)) then
-                    local definition = directory[entry.id]
-                    if definition and (not definition.Requirement or definition.Requirement(player)) then
-                        if not bestUid or (item.tn or 1) > (bestItem.tn or 1)
-                            or ((item.tn or 1) == (bestItem.tn or 1) and tostring(uid)<tostring(bestUid)) then
-                            bestUid,bestItem=uid,item
-                        end
-                    end
-                end
-            end
-        end
-        return bestUid,bestItem
-    end
-
-    local function equipBoost()
-        if not active() or session.inFlight then return end
-        local data = save.Get()
-        local inventory = data and data.Inventory and data.Inventory.Consumable
-        if not inventory then return end
-        for uid, pending in pairs(session.pending) do
-            local item = inventory[uid]
-            if not item or item.id~=pending.id or (item.tn or 1)~=pending.tier
-                or (item._am or 1)~=pending.amount then session.pending[uid]=nil end
-        end
-        for offset=0,#axes-1 do
-            local index=(nextIndex+offset-1) % #axes+1
-            local family=axes[index]
-            if os.clock()<(session.retryAt[family] or 0) then continue end
-            local uid,item=chooseBoost(inventory,family)
-            if not uid or session.pending[uid] then continue end
-            local amount=item._am or 1
-            local quantity=math.min(amount, session.batchLimit[uid] or amount)
-            if not active() then return end
-            nextIndex=index % #axes+1
-            session.retryAt[family]=os.clock()+1
-            session.inFlight=true
-            local ok,accepted=pcall(network.Invoke,"Consumables_Consume",uid,quantity)
-            session.inFlight=false
-            if ok and accepted==true then
-                session.pending[uid]={id=item.id,tier=item.tn or 1,amount=amount}
-                session.batchLimit[uid]=nil
-            else
-                -- Nếu server từ chối lô lớn, hạ số lượng; luôn giữ nguyên cấp đã chọn.
-                session.batchLimit[uid]=math.max(1,math.floor(quantity/2))
-                session.retryAt[family]=os.clock()+10
-                if not ok then error(accepted) end
-            end
-            return
-        end
-    end
-
-    controller.stop=function()controller.active,enabled=false,false end
-    env.RobloxHubEventBoost=controller
-
-    -- Đọc tên không có hậu tố như lựa chọn mọi cấp trong catalog (III -> II -> I).
-    local function resolveSelection(values)
-        local names = {}
-        if type(values) ~= "table" then return names end
-        for _, entry in ipairs(catalog) do
-            if table.find(values, entry.name) or table.find(values, entry.id) then
-                table.insert(names, entry.name)
-            end
-        end
-        return names
-    end
-
-    -- Đồng bộ lựa chọn từ dropdown hoặc launcher.
-    features.EventAutoEquipBoost = {
-        configureCatalog = function(values, resolve)
-            local families = {}
-            for _, entry in ipairs(catalog) do families[entry.id] = entry.family end
-            local entries, labels = resolve({Consumables=directory}, "Consumable", values)
-            for _, entry in ipairs(entries) do
-                local family = entry.family or families[entry.id]
-                assert(family == "Coins" or family == "Damage" or family == "IslandLuck",
-                    "Boost cần family Coins/Damage/IslandLuck: " .. entry.id)
-                entry.family = family
-            end
-            catalog, options = entries, labels
-            table.clear(selected)
-        end,
-        getOptions = function() return table.clone(options) end,
-        resolveSelection = resolveSelection,
-        setSelection = function(values)
-            table.clear(selected)
-            for _, name in ipairs(resolveSelection(values)) do
-                selected[name] = true
-            end
-        end,
-        duy = function(on)
-            if not controller.active then return end
-            enabled = on == true
-            if not enabled or job then return end
-            job = task.defer(function()
-                while enabled and controller.active do
-                    local ok, err = pcall(equipBoost)
-                    if not ok then warn("[Auto Equip Boost] " .. tostring(err)) end
-                    task.wait(ok and 1 or 3)
-                end
-                job = nil
-            end)
-        end,
-    }
-end
-
--- Optimize Event / Chỉ thay đổi hiển thị của Pumpkin Tycoon.
-do
-    local job
-    local owners = {}
-    local original = setmetatable({}, { __mode = "k" })
-    local invisible = NumberSequence.new(1)
-    local touchClient = game:GetService("UserInputService").TouchEnabled
-    local frameBudget = touchClient and 0.001 or 0.002
-    local optimizing = false
-    local nextWatchAt = 0
-    local watched = {}
-    local queue, first, last = {}, 1, 0
-    local hatchEnvironment, originalHatchAnimation, skipHatchAnimation
-    local hatching = require(client.HatchingCmds)
-    local signal = require(library.Signal)
-    local protectedGeometry = {
-        breaks_zones = true,
-        break_zones = true,
-        safety_net = true,
-        interactable = true,
-        spawnposition = true,
-    }
-
-    -- Bỏ animation trước khi game dựng trứng và màn hình Click to open.
-    local function suppressHatchAnimation()
-        if skipHatchAnimation or type(getsenv) ~= "function" then return end
-        local playerScripts = player:FindFirstChild("PlayerScripts")
-        local scripts = playerScripts and playerScripts:FindFirstChild("Scripts")
-        local gameScripts = scripts and scripts:FindFirstChild("Game")
-        local frontend = gameScripts and gameScripts:FindFirstChild("Egg Opening Frontend")
-        if not frontend then return end
-        local ok, environment = pcall(getsenv, frontend)
-        if not ok or type(environment) ~= "table" then return end
-        local play = environment.PlayNormalEggAnimation
-        if type(play) ~= "function" then return end
-
-        local function skip(eggName, ...)
-            local instance = instancing.Get()
-            if not next(owners) or not instance or instance.instanceID ~= instanceId then
-                return play(eggName, ...)
-            end
-
-            -- Tiếp tục Auto Hatch của game sau khi callback nhận pet chạy xong.
-            local egg = hatching.GetEggDirectory()
-            if hatching.IsHatching() and egg and (egg._id == eggName or egg._id == "Infinity Egg") then
-                task.defer(function()
-                    local current = instancing.Get()
-                    if current ~= instance or not hatching.IsHatching() or hatching.GetEggDirectory() ~= egg then return end
-                    signal.Fire("Hatching", eggName)
-                    hatching.AttemptHatch()
-                end)
-            end
-            return nil
-        end
-
-        ok = pcall(function() environment.PlayNormalEggAnimation = skip end)
-        if ok then
-            hatchEnvironment, originalHatchAnimation, skipHatchAnimation = environment, play, skip
-        end
-    end
-
-    -- Trả lại hàm animation khi tắt Optimize Event hoặc rời event.
-    local function restoreHatchAnimation()
-        if hatchEnvironment and hatchEnvironment.PlayNormalEggAnimation == skipHatchAnimation then
-            hatchEnvironment.PlayNormalEggAnimation = originalHatchAnimation
-        end
-        hatchEnvironment, originalHatchAnimation, skipHatchAnimation = nil, nil, nil
-    end
-
-    -- Lưu thuộc tính gốc trước khi đổi hiển thị.
-    local function hideProperty(object, property, value)
-        local previous = object[property]
-        if previous == value then return end
-        local record = original[object] or {}
-        if not record[property] then
-            record[property] = { previous = previous, hidden = value }
-            original[object] = record
-        end
-        object[property] = value
-    end
-
-    -- Khôi phục theo lô để lúc rời sự kiện không dồn việc vào một frame.
-    local function restoreBatch()
-        local deadline = os.clock() + frameBudget
-        local object, record = next(original)
-        for _ = 1, 100 do
-            if not object or os.clock() >= deadline then break end
-            if object.Parent then
-                for property, saved in pairs(record) do
-                    if object[property] == saved.hidden then object[property] = saved.previous end
-                end
-            end
-            original[object] = nil
-            object, record = next(original, object)
-        end
-        if not next(original) then table.clear(original) end
-    end
-
-    -- Giữ viền farm, nút thưởng và các part mở khóa.
-    local function hideVisual(object, scope, mode, debrisPosition)
-        local isPart = object:IsA("BasePart")
-        local isSurface = object:IsA("Decal") or object:IsA("Texture")
-        local isParticle = object:IsA("ParticleEmitter")
-        local isExplosion = object:IsA("Explosion")
-        local isAtmosphere = object:IsA("Atmosphere")
-        local isLightingEffect = object:IsA("PostEffect") or object:IsA("Clouds")
-        local isEffect = isParticle or object:IsA("Beam") or object:IsA("Trail")
-            or object:IsA("Light") or object:IsA("Smoke") or object:IsA("Fire")
-            or object:IsA("Sparkles") or object:IsA("Highlight")
-        if not (isPart or isSurface or isEffect or isExplosion or isAtmosphere or isLightingEffect) then return end
-
-        local keepGeometry = mode ~= "scenery"
-        local debrisPart
-        local parent = object
-        while parent and parent ~= scope do
-            local name = string.lower(parent.Name)
-            if name == "buttons" or name == "press" or name == "touch"
-                or name:find("completionreward", 1, true) or name:find("breakzoneline", 1, true)
-                or name:find("pumpkinbreakline", 1, true) or name:find("pumpkinsign", 1, true)
-                or name:find("pumpkintimer", 1, true) then
-                return
-            end
-            if protectedGeometry[name] then keepGeometry = true end
-            if mode == "breakers" and parent.Parent == scope
-                and parent:GetAttribute("ParentID") ~= instanceId then return end
-            if mode == "debris" and not debrisPart and parent:IsA("BasePart") then debrisPart = parent end
-            parent = parent.Parent
-        end
-
-        if mode == "lighting" then
-            if isAtmosphere then
-                hideProperty(object, "Density", 0)
-                hideProperty(object, "Haze", 0)
-                hideProperty(object, "Glare", 0)
-            elseif isLightingEffect then
-                hideProperty(object, "Enabled", false)
-            end
-            return
-        elseif mode == "debris" then
-            local position = isExplosion and object.Position or (debrisPart and debrisPart.Position)
-            if not (isEffect or isExplosion) or not position or not debrisPosition
-                or (position - debrisPosition).Magnitude > 220 then return end
-        elseif not keepGeometry and isPart then
-            -- Ẩn cả part đang fade để nó không hiện lại khi tải xong.
-            hideProperty(object, "LocalTransparencyModifier", 1)
-            if touchClient then hideProperty(object, "Transparency", 1) end
-        elseif not keepGeometry and isSurface then
-            hideProperty(object, "Transparency", 1)
-        end
-
-        -- Tắt bóng của vật thể event để giảm render mà vẫn thấy breaker.
-        if keepGeometry and isPart and object.Transparency < 1 then hideProperty(object, "CastShadow", false) end
-        if isEffect then hideProperty(object, "Enabled", false) end
-        if isParticle then hideProperty(object, "Transparency", invisible) end
-        if isExplosion then hideProperty(object, "Visible", false) end
-    end
-
-    -- Xếp object vào hàng đợi để xử lý theo ngân sách mỗi frame.
-    local function enqueue(object, scope, binding, walk)
-        local pending = binding.pending[object]
-        if pending then
-            pending.walk = pending.walk or walk
-            return
-        end
-        last += 1
-        local entry = {object = object, scope = scope, binding = binding, walk = walk}
-        queue[last] = entry
-        binding.pending[object] = entry
-    end
-
-    -- Gỡ listener và dọn hàng đợi khi rời sự kiện hoặc tắt tối ưu.
-    local function clearWatches()
-        for _, binding in pairs(watched) do binding.connection:Disconnect() end
-        table.clear(watched)
-        table.clear(queue)
-        first, last = 1, 0
-    end
-
-    -- Gắn listener cho từng cây map khi cây đó xuất hiện.
-    local function updateWatches()
-        local instance = instancing.Get()
-        if not instance or instance.instanceID ~= instanceId then
-            if skipHatchAnimation then restoreHatchAnimation() end
-            if next(watched) then clearWatches() end
-            return false
-        end
-        suppressHatchAnimation()
-        local roots = {}
-        local function add(root, mode)
-            if root then roots[root] = mode end
-        end
-        add(instance.model, "scenery")
-        add(workspace:FindFirstChild("PumpkinTycoonIslands"), "scenery")
-        local plot = tycoon.Feature("Island").Plot()
-        add(plot and plot:GetModel(), "scenery")
-        add(workspace:FindFirstChild("PumpkinTycoonPumpkins"), "effects")
-        local things = workspace:FindFirstChild("__THINGS")
-        add(things and things:FindFirstChild("Breakables"), "breakers")
-        add(things and things:FindFirstChild("AnimatedBreakables"), "breakers")
-        add(things and things:FindFirstChild("__FAKE_INSTANCE_GROUND"), "scenery")
-        add(things and things:FindFirstChild("VFX"), "debris")
-        add(things and things:FindFirstChild("VictoryScene"), "debris")
-        add(workspace:FindFirstChild("__DEBRIS"), "debris")
-        add(game:GetService("Lighting"), "lighting")
-        add(workspace:FindFirstChildOfClass("Terrain"), "lighting")
-
-        -- Dùng cây cha nếu cây con có cùng cách ẩn.
-        for root, mode in pairs(roots) do
-            local parent = root.Parent
-            while parent do
-                if roots[parent] == mode then
-                    roots[root] = nil
-                    break
-                end
-                parent = parent.Parent
-            end
-        end
-
-        for root, binding in pairs(watched) do
-            if not roots[root] then
-                binding.connection:Disconnect()
-                table.clear(binding.pending)
-                watched[root] = nil
-            end
-        end
-        for root, mode in pairs(roots) do
-            if not watched[root] then
-                local binding = {mode = mode, pending = {}}
-                watched[root] = binding
-                binding.connection = root.DescendantAdded:Connect(function(object)
-                    if watched[root] == binding then enqueue(object, root, binding, false) end
-                end)
-                enqueue(root, root, binding, true)
-            end
-        end
-        return true
-    end
-
-    -- Dàn lượt quét đầu ra nhiều frame rồi chỉ xử lý object mới.
-    local function processQueue()
-        local deadline = os.clock() + frameBudget
-        local rootPart = player.Character and player.Character.PrimaryPart
-        local position = rootPart and rootPart.Position
-        for _ = 1, 100 do
-            if first > last or os.clock() >= deadline then break end
-            local entry = queue[first]
-            queue[first] = nil
-            first += 1
-            local object, scope = entry.object, entry.scope
-            entry.binding.pending[object] = nil
-            if watched[scope] == entry.binding and (object == scope or object:IsDescendantOf(scope)) then
-                if object ~= scope then hideVisual(object, scope, entry.binding.mode, position) end
-                if entry.walk and (entry.binding.mode ~= "breakers" or object.Parent ~= scope
-                    or object:GetAttribute("ParentID") == instanceId) then
-                    for _, child in ipairs(object:GetChildren()) do
-                        enqueue(child, scope, entry.binding, true)
-                    end
-                end
-            end
-        end
-    end
-
-    -- Thu gọn bộ nhớ hàng đợi theo lô nhẹ mỗi ba giây.
-    local function trimQueue()
-        local remaining = last - first + 1
-        if remaining > 128 then return end
-        if first == 1 and remaining > 0 then return end
-        local compact = {}
-        for index = 1, remaining do compact[index] = queue[first + index - 1] end
-        queue, first, last = compact, 1, remaining
-    end
-
-    -- Chia sẻ Optimize Event giữa toggle riêng và Stats Event.
-    local function request(owner, on)
-        local wasEnabled = next(owners) ~= nil
-        owners[owner] = on and true or nil
-        local isEnabled = next(owners) ~= nil
-        if wasEnabled and not isEnabled then
-            optimizing = false
-            restoreHatchAnimation()
-            clearWatches()
-        end
-        if isEnabled and not wasEnabled then nextWatchAt = 0 end
-        if job or not isEnabled then return end
-        job = task.defer(function()
-            local nextTrimAt = os.clock() + 3
-            while next(owners) or next(original) do
-                local now = os.clock()
-                if next(owners) and now >= nextWatchAt then
-                    optimizing = updateWatches()
-                    nextWatchAt = now + 0.5
-                end
-                if optimizing then
-                    if first <= last then processQueue() end
-                elseif next(original) then
-                    restoreBatch()
-                end
-                if now >= nextTrimAt then
-                    trimQueue()
-                    nextTrimAt = now + 3
-                end
-                if first <= last or (not optimizing and next(original)) then
-                    task.wait()
-                elseif next(owners) then
-                    task.wait(0.1)
-                end
-            end
-            job = nil
-        end)
-    end
-
-    features.EventOptimize = {
-        duy = function(on) request("toggle", on) end,
-        request = request,
-    }
-end
-
--- Stats Event / Số dư, zone, kho bí ngô và pet trên nền đen.
-do
-    local save = require(client.Save)
-    local leaderboard = require(client.LeaderboardCmds)
-    local contests = require(library.Util.PumpkinTycoonContests)
-    local boostUtil = require(library.Util.PumpkinTycoonBoosts)
-    local items = require(library.Items)
-    local petDirectory = require(library.Directory.Pets)
-    local calcPetPower = require(library.Balancing.CalcPetPower)
-    local petConstants = require(library.Balancing.Constants)
-    local merchant = require(library.Types.PumpkinTycoon.Merchant)
-    local runService = game:GetService("RunService")
-    local activeGui
-    local onQuickClose
-    local accent = Color3.fromRGB(255, 191, 105)
-    local petRefreshInterval = 12
-
-    -- Hạng toàn cầu từ dữ liệu game đã nhận, không suy ra từ thứ tự trong server.
-    local function leaderboardText()
-        local board = leaderboard.Get(contests.BOARD_ID)
-        local own = type(board) == "table" and board.LocalPlayer
-        local rank = type(own) == "table" and tonumber(own.GlobalRank)
-        if rank and rank == rank and rank > 0 and rank < math.huge and rank % 1 == 0 then
-            return ("TOP BẮT PET · #%.0f"):format(rank)
-        end
-        if rank == 0 then return "TOP BẮT PET · Chưa xếp hạng" end
-        return "TOP BẮT PET · Đang cập nhật"
-    end
-
-    -- Tổng rebirth của nhân vật từ save đảo; không đếm riêng phiên chạy script.
-    local function rebirthText()
-        local count = isInEvent() and tycoon.Feature("Island").Get(nil, tycoonTypes.VAR.Rebirths)
-        if type(count) ~= "number" or count < 0 or count ~= count or count == math.huge then
-            return "Số lần rebirth · —"
-        end
-        return ("Số lần rebirth · %.0f"):format(math.floor(count))
-    end
-
-    -- Hiện rebirth và phần trăm hiệu lực của ba boost Pumpkin Tycoon.
-    local function eventBoostText()
-        local available = isInEvent() and boostUtil.Enabled(player)
-        local function status(family)
-            local power = available and boostUtil.Power(player, family)
-            if type(power) ~= "number" or power <= 0 then return "Tắt" end
-            return ("+%g%%"):format(power)
-        end
-        return table.concat({
-            rebirthText(),
-            "",
-            "BOOST EVENT",
-            "Patch Coin Boost · " .. status("Coins"),
-            "Pumpkin Damage Boost · " .. status("Damage"),
-            "Island Luck Boost · " .. status("IslandLuck"),
-        }, "\n")
-    end
-
-    -- Đọc các zone đã mua và tên trong cấu hình sự kiện.
-    local function zoneText(data)
-        local lines = { "ZONE ĐÃ MỞ" }
-        local owned = isInEvent() and tycoon.Feature("Buttons").State()
-        local event = data.InstanceVars and data.InstanceVars[instanceId]
-        local paid = event and event.ZonePaid
-        for index, zone in ipairs(tycoonTypes.ZONES) do
-            if (owned and buttons.Owned(owned, zone.Section .. "_Zone"))
-                or (paid and (paid[tostring(index)] or paid[index])) then
-                table.insert(lines, ("%d · %s"):format(index, zone.DisplayName))
-            end
-        end
-        if #lines == 1 then table.insert(lines, "—") end
-        return table.concat(lines, "\n")
-    end
-
-    -- Đọc số bí ngô chờ mọc theo cấp trong My Pumpkin.
-    local function stockText()
-        if not isInEvent() then return "MY PUMPKIN\n—" end
-        local stock = tycoon.Feature("Stock")
-        local held = stock.Stock()
-        local offers = merchant.Config()
-        local lines = { ("MY PUMPKIN · %d/%d"):format(#held, stock.Slots()) }
-        for _, row in ipairs(stock.Grouped(held)) do
-            local offer = offers[row.band]
-            table.insert(lines, ("%s ×%d"):format(offer and offer.Display or row.band, row.count))
-        end
-        return table.concat(lines, "\n")
-    end
-
-    -- Lọc pet cần hiển thị bằng Directory trước khi tạo PetItem.
-    local function petRows(inventory, gui)
-        local byName, rows = {}, {}
-        local bestEntry, bestPower
-        local scanned = 0
-        for _, entry in pairs(inventory and table.clone(inventory) or {}) do
-            scanned += 1
-            if scanned % 64 == 0 then
-                task.wait()
-                if activeGui ~= gui then return nil end
-            end
-            local definition = rawget(petDirectory, entry.id)
-            if not definition then continue end
-            local kind = definition.gargantuan == true and "Gargantuan"
-                or definition.titanic == true and "Titanic"
-                or definition.huge == true and "Huge"
-            if kind then
-                local pet = items.From("Pet", table.clone(entry))
-                local name, icon = pet:GetName(), pet:GetIcon()
-                local key = kind .. name .. tostring(icon)
-                if not byName[key] then
-                    byName[key] = { kind = kind, name = name, icon = icon, amount = 0 }
-                    table.insert(rows, byName[key])
-                end
-                byName[key].amount += entry._am or 1
-            elseif (definition.exclusiveLevel or 0) == 0 then
-                local multiplier = petConstants.DamageMultipliers[entry.pt or 0] or 1
-                if entry.sh == true then multiplier *= petConstants.ShinyDamageMultiplier end
-                local power = calcPetPower(definition, multiplier)
-                if not bestPower or power > bestPower then bestEntry, bestPower = entry, power end
-            end
-        end
-        table.sort(rows, function(a, b)
-            if a.kind ~= b.kind then return a.kind < b.kind end
-            if a.name ~= b.name then return a.name < b.name end
-            return tostring(a.icon) < tostring(b.icon)
-        end)
-        if bestEntry then
-            local best = items.From("Pet", table.clone(bestEntry))
-            table.insert(rows, 1, { kind = "Pet thường mạnh nhất", name = best:GetName(), icon = best:GetIcon(), amount = 1 })
-        end
-        return rows
-    end
-
-    -- Tạo nhãn chữ cho từng vùng của bảng thống kê.
-    local function label(parent, position, size, alignment, textSize)
-        local object = Instance.new("TextLabel")
-        object.Position, object.Size = position, size
-        object.BackgroundTransparency = 1
-        object.Font = Enum.Font.GothamBold
-        object.TextColor3 = Color3.fromRGB(245, 245, 245)
-        object.TextSize = textSize
-        object.TextWrapped = true
-        object.TextXAlignment = alignment
-        object.Text = ""
-        object.Parent = parent
-        return object
-    end
-
-    -- Định dạng số dư đầy đủ theo nhóm ba chữ số.
-    local function formatBalance(value)
-        if type(value) ~= "number" then return "—" end
-        local reversed = string.reverse(("%.0f"):format(value))
-        return string.reverse((reversed:gsub("(%d%d%d)", "%1."):gsub("%.$", "")))
-    end
-
-    -- Tách tên tiền và số dư để mỗi dòng tự co chữ trên mobile.
-    local function balanceRow(parent, name, y)
-        local heading = label(parent, UDim2.fromScale(0.08, y), UDim2.fromScale(0.84, 0.045), Enum.TextXAlignment.Center, 16)
-        heading.Text = name
-        local value = label(parent, UDim2.fromScale(0.08, y + 0.045), UDim2.fromScale(0.84, 0.08), Enum.TextXAlignment.Center, 24)
-        value.Text = "—"
-        for _, object in ipairs({ heading, value }) do
-            object.TextWrapped = false
-            object.TextScaled = true
-            local constraint = Instance.new("UITextSizeConstraint")
-            constraint.MinTextSize = 1
-            constraint.MaxTextSize = object.TextSize
-            constraint.Parent = object
-        end
-        return value
-    end
-
-    -- Hiện thời gian chạy script theo giờ, phút và giây.
-    local function uptimeText()
-        local seconds = math.floor(os.clock() - scriptStartedAt)
-        return ("Thời gian hoạt động · %02d:%02d:%02d"):format(
-            math.floor(seconds / 3600), math.floor(seconds / 60) % 60, seconds % 60)
-    end
-
-    -- Xóa overlay để chạy phần phục hồi hiển thị.
-    local function stop()
-        if activeGui then activeGui:Destroy() end
-    end
-
-    -- Dựng overlay và cập nhật dữ liệu theo thời gian.
-    local function start()
-        if activeGui then return end
-        local playerGui = player:FindFirstChildOfClass("PlayerGui")
-        if not playerGui then return end
-        local gui = Instance.new("ScreenGui")
-        gui.Name = "PumpkinTycoonStats"
-        gui.ResetOnSpawn = false
-        gui.DisplayOrder = 1000
-        gui.ClipToDeviceSafeArea = false
-        gui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets
-        local cover = Instance.new("Frame")
-        cover.BackgroundColor3 = Color3.new(0, 0, 0)
-        cover.BorderSizePixel = 0
-        cover.Position = UDim2.fromOffset(-256, -256)
-        cover.Size = UDim2.new(1, 512, 1, 512)
-        cover.Parent = gui
-        local content = Instance.new("Frame")
-        content.Size = UDim2.fromScale(1, 1)
-        content.BackgroundTransparency = 1
-        content.Parent = gui
-
-        local close = Instance.new("TextButton")
-        close.Position = UDim2.fromOffset(12, 12)
-        close.Size = UDim2.fromOffset(70, 40)
-        close.BackgroundColor3 = Color3.fromRGB(38, 38, 38)
-        close.TextColor3 = Color3.new(1, 1, 1)
-        close.Font = Enum.Font.GothamBold
-        close.TextSize = 14
-        close.Text = "Tắt Stats"
-        close.Parent = content
-        close.Activated:Connect(function()
-            stop()
-            if onQuickClose then onQuickClose() end
-        end)
-
-        local zones = label(content, UDim2.fromScale(0.03, 0.48), UDim2.fromScale(0.43, 0.49), Enum.TextXAlignment.Left, 14)
-        zones.TextYAlignment = Enum.TextYAlignment.Bottom
-        zones.TextScaled = true
-        local zoneTextSize = Instance.new("UITextSizeConstraint")
-        zoneTextSize.MinTextSize = 1
-        zoneTextSize.MaxTextSize = 14
-        zoneTextSize.Parent = zones
-        local diamonds = balanceRow(content, "Diamonds", 0.30)
-        local coins = balanceRow(content, "Pumpkin Coins", 0.44)
-        local uptime = label(content, UDim2.fromScale(0.03, 0.15), UDim2.fromScale(0.43, 0.045), Enum.TextXAlignment.Left, 14)
-        uptime.Text = uptimeText()
-        uptime.TextScaled, uptime.TextWrapped = true, false
-        local uptimeSize = Instance.new("UITextSizeConstraint")
-        uptimeSize.MinTextSize, uptimeSize.MaxTextSize = 1, 14
-        uptimeSize.Parent = uptime
-        local top = label(content, UDim2.fromScale(0.03, 0.21), UDim2.fromScale(0.43, 0.075), Enum.TextXAlignment.Left, 26)
-        top.Text, top.TextColor3 = leaderboardText(), accent
-        top.TextScaled, top.TextWrapped = true, false
-        local topSize = Instance.new("UITextSizeConstraint")
-        topSize.MinTextSize, topSize.MaxTextSize = 1, 26
-        topSize.Parent = top
-        local stock = label(content, UDim2.fromScale(0.49, 0.03), UDim2.fromScale(0.48, 0.26), Enum.TextXAlignment.Right, 14)
-        stock.TextYAlignment = Enum.TextYAlignment.Top
-        local title = label(content, UDim2.fromScale(0.49, 0.59), UDim2.fromScale(0.48, 0.045), Enum.TextXAlignment.Right, 14)
-        title.Text, title.TextColor3 = "PET TRONG KHO", accent
-
-        local list = Instance.new("ScrollingFrame")
-        list.Position = UDim2.fromScale(0.49, 0.64)
-        list.Size = UDim2.fromScale(0.48, 0.33)
-        list.BackgroundTransparency = 1
-        list.BorderSizePixel = 0
-        list.ScrollBarThickness = 3
-        list.CanvasSize = UDim2.new()
-        list.AutomaticCanvasSize = Enum.AutomaticSize.Y
-        list.Parent = content
-        Instance.new("UIListLayout", list).SortOrder = Enum.SortOrder.LayoutOrder
-
-        local previousRows
-        local nextPetsAt = 0
-        local function refresh()
-            uptime.Text = uptimeText()
-            top.Text = leaderboardText()
-            diamonds.Text = formatBalance(currency.Get("Diamonds"))
-            coins.Text = formatBalance(currency.Get(tycoonTypes.COIN))
-            local data = save.Get()
-            if not data then return end
-            zones.Text, stock.Text = eventBoostText() .. "\n\n" .. zoneText(data), stockText()
-            if os.clock() < nextPetsAt then return end
-            nextPetsAt = os.clock() + petRefreshInterval
-            local rows = petRows(data.Inventory and data.Inventory.Pet, gui)
-            if not rows then return end
-            local keys = {}
-            for _, row in ipairs(rows) do
-                table.insert(keys, table.concat({ row.kind, row.name, row.icon or "", row.amount }, "|"))
-            end
-            local signature = table.concat(keys, "\n")
-            if signature == previousRows then return end
-            previousRows = signature
-            for _, child in ipairs(list:GetChildren()) do
-                if child:IsA("Frame") then child:Destroy() end
-            end
-            for index, row in ipairs(rows) do
-                local card = Instance.new("Frame")
-                card.Size = UDim2.new(1, -6, 0, 44)
-                card.BackgroundTransparency = 1
-                card.LayoutOrder = index
-                local icon = Instance.new("ImageLabel")
-                icon.AnchorPoint = Vector2.new(1, 0)
-                icon.Position = UDim2.fromScale(1, 0)
-                icon.Size = UDim2.fromOffset(42, 42)
-                icon.BackgroundTransparency = 1
-                icon.Image = row.icon or ""
-                icon.Parent = card
-                local caption = label(card, UDim2.new(), UDim2.new(1, -46, 1, 0), Enum.TextXAlignment.Right, 12)
-                caption.Text = ("%s\n%s%s"):format(row.kind, row.name, row.amount > 1 and (" ×" .. row.amount) or "")
-                card.Parent = list
-            end
-        end
-
-        activeGui = gui
-        local rendered = pcall(function() runService:Set3dRenderingEnabled(false) end)
-        if not rendered then features.EventOptimize.request(gui, true) end
-        gui.Destroying:Connect(function()
-            activeGui = nil
-            if rendered then
-                pcall(function() runService:Set3dRenderingEnabled(true) end)
-            else
-                features.EventOptimize.request(gui, false)
-            end
-        end)
-        gui.Parent = playerGui
-        task.defer(function()
-            while activeGui == gui do
-                local ok, err = pcall(refresh)
-                if not ok then warn("[Stats Event] " .. tostring(err)) end
-                task.wait(ok and 1 or 5)
-            end
-        end)
-    end
-
-    features.EventStatsGui = {
-        setQuickClose = function(callback) onQuickClose = callback end,
-        duy = function(on)
-            if on then start() else stop() end
-        end,
-    }
-end
-
 return features
