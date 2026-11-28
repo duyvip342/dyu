@@ -399,19 +399,24 @@ end
 
 -- ============================================================================
 -- [MS-STOCK] Luôn mở khóa bán; keepBoxes chỉ giới hạn ghép. Không sửa CanStock.
-local function stockStep(c)
+local function unlockStockStep(c)
     local flag="EventStoreAutoStock"
     if not enabled(flag) then return false end
-    if enabled("EventStoreAutoCombine") and combineChoice(c) then return false end
     for rung=c.api.definitions.LOCKABLE_FROM,c.api.boxes.Count() do
-        local box=c.api.boxes.Box(rung)
         local locked=false
         if c.api.definitions.BoxLocked(c.own.BoxLocks,rung)~=locked then
             return dispatch(c,flag,{kind="unlock",key="boxlock:"..rung..":"..tostring(locked),rung=rung,locked=locked},
                 function(f)return f.plot:Invoke(f.api.definitions.NET.LockBox,rung,locked)end,
-                function()return true end)
+                function(f)return f.api.definitions.BoxLocked(f.own.BoxLocks,rung) end)
         end
     end
+    return false
+end
+local function stockStep(c)
+    local flag="EventStoreAutoStock"
+    if not enabled(flag) then return false end
+    if unlockStockStep(c) then return true end
+    if enabled("EventStoreAutoCombine") and combineChoice(c) then return false end
     if c.api.pad.BoothFull() or os.clock()<(controller.nextStock or 0) then return false end
     local count=0
     for _,item in pairs(inventory(c.data,"Lootbox")) do
@@ -717,7 +722,7 @@ end
 -- [MS-WORKERS] Main tuần tự; farm/gift/boost riêng, không bị animation giữ vòng chính.
 local function mainStep(c)
     if waiting("main",c) or lease then return end
-    if levelStep(c) or registerStep(c) or decorStep(c) or combineStep(c) or merchantStep(c) or stockStep(c) then return end
+    if unlockStockStep(c) or levelStep(c) or registerStep(c) or decorStep(c) or combineStep(c) or merchantStep(c) or stockStep(c) then return end
     if enabled("EventStoreFastFarm") and not lease and not c.api.pad.OnPad() then
         local landing=c.api.base.ZoneLanding(c.plot)
         if landing and (c.root.Position-landing.Position).Magnitude>12 then
