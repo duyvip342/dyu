@@ -7,6 +7,45 @@ local environment = type(getgenv) == "function" and getgenv() or _G
 local launchConfig = environment.RobloxHubConfig
 environment.RobloxHubConfig = nil
 if type(launchConfig) ~= "table" then launchConfig = nil end
+-- Flag Pumpkin Tycoon đã nghỉ: bỏ qua riêng cấu hình cũ, không gán sang event mới.
+local retiredEventControls = {
+    EventAutoOpenMap = true,
+    EventAutoRebirth = true,
+    EventAutoHuntPet = true,
+    EventAutoTurkey = true,
+    EventAutoPumpkin = true,
+    EventAutoBuyPumpkin = true,
+    EventAutoHotCoca = true,
+    EventAutoFlannelGift = true,
+    EventAutoGiftHuge = true,
+    EventOptimize = true,
+    EventFastFarm = true,
+    EventStatsGui = true,
+    EventAutoPumpkinUpgrade = true,
+    EventAutoEquipBoost = true,
+    EventHugeGiftRecipient = true,
+    EventPumpkinUpgradeSelection = true,
+    EventBoostSelection = true,
+}
+if launchConfig then
+    local cleaned = {}
+    for key, value in pairs(launchConfig) do cleaned[key] = value end
+    if type(launchConfig.controls) == "table" then
+        cleaned.controls = {}
+        for flag, value in pairs(launchConfig.controls) do
+            if not retiredEventControls[flag] then cleaned.controls[flag] = value end
+        end
+    end
+    if type(launchConfig.actions) == "table" then
+        cleaned.actions = {}
+        for _, action in ipairs(launchConfig.actions) do
+            local flag = type(action) == "table" and (action.set or action.press)
+            if not retiredEventControls[flag] then table.insert(cleaned.actions, action) end
+        end
+    end
+    launchConfig = cleaned
+end
+
 local launchToggles = launchConfig and type(launchConfig.toggles) == "table" and launchConfig.toggles or {}
 local startupActions = {}
 
@@ -65,8 +104,6 @@ do
         environment.RobloxHubAntiAfkConnection = runService.Heartbeat:Connect(function()
             local now = os.clock()
             if now < nextInputAt then return end
-            local turkey = environment.RobloxHubEventTurkey
-            if turkey and turkey.busy then return end
             nextInputAt = now + 60
 
             if input:GetFocusedTextBox() or (useNativeInput and type(isrbxactive) == "function" and not isrbxactive()) then
@@ -155,8 +192,7 @@ if launchConfig and type(launchConfig.lists) == "table" then
     local resolve = loadRemoteModule("https://raw.githubusercontent.com/duyvip342/dyu/main/item_catalog.lua", "item_catalog.lua")()
     local targets = {
         {"mail", "MailAutoGift"}, {"enchants", "AutoEquipEnchant"},
-        {"gifts", "AutoOpenGifts"}, {"pumpkinUpgrades", "EventAutoPumpkinUpgrade"},
-        {"boosts", "EventAutoEquipBoost"},
+        {"gifts", "AutoOpenGifts"},
     }
     for _, entry in ipairs(targets) do
         local feature = features[entry[2]]
@@ -166,13 +202,6 @@ if launchConfig and type(launchConfig.lists) == "table" then
             feature.configureCatalog(lists[entry[1]], resolve)
         end
     end
-end
-
--- Auto Hunt chỉ có một toggle UI; các bộ lọc đọc từ launcher.
-if features.EventAutoHuntPet then
-    features.EventAutoHuntPet.configure(launchConfig and launchConfig.eventHunt)
-elseif launchConfig and launchConfig.eventHunt then
-    error("event.lua chưa hỗ trợ eventHunt; cần cập nhật module cùng UI")
 end
 
 -- 3. Tạo cửa sổ và các tab
@@ -224,8 +253,6 @@ local function createToggle(tab, name, flag)
         local feature = features[flag]
         if feature and (not launchConfig or applied ~= enabled) then
             applied = enabled
-            local turkey = features.EventAutoTurkey
-            if turkey and turkey.deferControl and turkey.deferControl(flag, enabled) then return end
             feature.duy(enabled, features)
         end
     end
@@ -419,93 +446,16 @@ end
 -- TAB: Event
 -- ============================================================================
 do
-    createToggle(event, "auto open map event", "EventAutoOpenMap")
-    createToggle(event, "Auto Rebirth Event (100%)", "EventAutoRebirth")
-    createToggle(event, "Auto Hunt Pet", "EventAutoHuntPet")
-    createToggle(event, "Auto Turkey", "EventAutoTurkey")
-    createToggle(event, "auto pumpkin", "EventAutoPumpkin")
-    createToggle(event, "Auto Buy Pumpkin + Pet Net", "EventAutoBuyPumpkin")
-    createToggle(event, "Auto Hot Coca", "EventAutoHotCoca")
-    createToggle(event, "auto fannel gift", "EventAutoFlannelGift")
-    local hugeGift = features.EventAutoGiftHuge
-    if hugeGift then
-        local inputFlag = "EventHugeGiftRecipient"
-        local inputs = launchConfig and launchConfig.inputs
-        local preset = launchConfig and (
-            launchConfig.eventHugeGiftRecipient
-            or launchConfig[inputFlag]
-            or (type(inputs) == "table" and inputs[inputFlag])
-            or launchToggles[inputFlag]
-        )
-        if launchConfig and type(launchConfig.controls) == "table" and launchConfig.controls[inputFlag] ~= nil then
-            preset = launchConfig.controls[inputFlag]
-        end
-        local recipient = type(preset) == "string" and preset:match("^%s*(.-)%s*$") or ""
-        local input = event:CreateInput({
-            name = "Gift Huge User Name",
-            flag = inputFlag,
-            value = recipient,
-            placeholder = "Roblox username",
-            callback = hugeGift.setRecipient,
-        })
-        -- Đồng bộ ô tên và module trước khi launcher bật Auto Gift Huge.
-        if launchConfig then
-            table.insert(startupActions, function()
-                input:Set(recipient, true)
-                hugeGift.setRecipient(recipient)
-            end)
-        end
-        local control = createToggle(event, "Auto Gift Huge", "EventAutoGiftHuge")
-        hugeGift.setStopCallback(function() control:Set(false) end)
-    end
-    createToggle(event, "optimize event", "EventOptimize")
-    createToggle(event, "fast farm event", "EventFastFarm")
-    local stats = features.EventStatsGui
-    if stats then
-        local control = createToggle(event, "stats event", "EventStatsGui")
-        stats.setQuickClose(function() control:Set(false) end)
-    end
-
-    -- Chọn các mục nâng cấp Pumpkin Tycoon.
-    local upgrade = features.EventAutoPumpkinUpgrade
-    if upgrade then
-        local options = upgrade.getOptions()
-        local initial = selectedOptions(options, launchConfig and launchConfig.pumpkinUpgrades)
-        event:CreateDropdown({
-            name = "Pumpkin Upgrades",
-            flag = "EventPumpkinUpgradeSelection",
-            options = options,
-            multiSelect = true,
-            value = initial,
-            callback = upgrade.setSelection,
-        })
-        if launchConfig then upgrade.setSelection(initial) end
-        createToggle(event, "auto pumpkin upgrade", "EventAutoPumpkinUpgrade")
-    end
-
-    -- Chọn boost dùng tự động trong Pumpkin Tycoon.
-    local boost = features.EventAutoEquipBoost
-    if boost then
-        local options, initial = boost.getOptions(), {}
-        local preset = launchConfig and launchConfig.boosts
-        if boost.resolveSelection then
-            initial = boost.resolveSelection(preset)
-        else
-            initial = selectedOptions(options, preset)
-        end
-        event:CreateDropdown({
-            name = "Boosts",
-            flag = "EventBoostSelection",
-            options = options,
-            multiSelect = true,
-            value = initial,
-            callback = boost.setSelection,
-        })
-        if launchConfig then boost.setSelection(initial) end
-        createToggle(event, "auto equip boost", "EventAutoEquipBoost")
-    end
+    event:CreateSection({name="Mystery Store"})
+    createToggle(event,"Fast Farm Event","EventStoreFastFarm")
+    createToggle(event,"Auto Upgrade Register","EventStoreAutoRegister")
+    createToggle(event,"Auto Upgrade House","EventStoreAutoLevel")
+    createToggle(event,"Auto Place Best Decor","EventStoreAutoDecor")
+    createToggle(event,"Auto Stock Booth + Unlock Boxes","EventStoreAutoStock")
+    createToggle(event,"Auto Open Squishy Gift","EventStoreAutoGift")
+    createToggle(event,"Auto Buy Decor Merchant","EventStoreAutoMerchant")
+    createToggle(event,"Auto Upgrade Boxes","EventStoreAutoCombine")
 end
-
 -- ============================================================================
 -- TAB: farm
 -- ============================================================================
