@@ -740,7 +740,41 @@ local function stopJobs()
     pcall(releaseLease)
     pcall(clearFarm)
 end
-controller.Stop=function()controller.active=false;stopJobs();restoreVisuals()end
+controller.Stop=function()
+    controller.active=false
+    if controller.entryJob then pcall(task.cancel,controller.entryJob);controller.entryJob=nil end
+    stopJobs();restoreVisuals()
+end
+-- Một luồng vào event dùng chung, kể cả khi chỉ bật Optimize từ launcher.
+local function ensureEntry()
+    if controller.entryJob then return end
+    controller.entryJob=task.defer(function()
+        local nextAttempt=0
+        while controller.active do
+            local wanted=false
+            for _,on in pairs(controller.flags)do if on then wanted=true;break end end
+            if not wanted then break end
+            local ok,problem=pcall(function()
+                local library=game:GetService("ReplicatedStorage"):FindFirstChild("Library")
+                local client=library and library:FindFirstChild("Client")
+                local module=client and client:FindFirstChild("InstancingCmds")
+                if not module then return end
+                local instancing=require(module)
+                if not controller.active then return end
+                local stillWanted=false
+                for _,on in pairs(controller.flags)do if on then stillWanted=true;break end end
+                if not stillWanted or instancing.GetInstanceID()=="MysteryStore" or os.clock()<nextAttempt then return end
+                nextAttempt=os.clock()+10
+                if instancing.DoesMeetRequirement("MysteryStore") then
+                    instancing.Enter("MysteryStore")
+                end
+            end)
+            if not ok then report("entry",problem) end
+            task.wait(1)
+        end
+        controller.entryJob=nil
+    end)
+end
 local function worker(name,delay,step)
     controller.jobs[name]=task.defer(function()
         while controller.active and anyEnabled() do
@@ -761,6 +795,7 @@ local function setToggle(flag,on,shared)
     if not controller.active then return end
     controller.flags[flag]=on==true
     controller.shared=shared or controller.shared
+    if on then ensureEntry() end
     if flag=="EventStoreOptimize" then
         if on then
             local ok,problem=pcall(installVisuals)
