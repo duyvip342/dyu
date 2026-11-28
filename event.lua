@@ -460,6 +460,7 @@ local function merchantChoice(c,shelf)
     end
     local owned=ownedDecor(c)
     local best
+    local missing,inStock,affordable,reserved=0,0,0,0
     for slot,offer in pairs(shelf.Offers) do
         local item,price=offer.ItemData,offer.PriceData
         local id=item and item.data and item.data.id
@@ -469,13 +470,26 @@ local function merchantChoice(c,shelf)
             and price and price.class=="Currency" and money and money.id=="MysteryStoreCoins" then
             local cost=money._am or 1
             local value=c.api.decor.Value(id) or 0
+            missing+=1
+            inStock+=offer.Stock
+            if cost>0 and cost<=c.coins then
+                affordable+=1
+                if cost>math.max(0,c.coins-reserve) then reserved+=1 end
+            end
             if cost>0 and cost<=math.max(0,c.coins-reserve) and (not best or value>best.value) then
                 best={kind="merchant",key="merchant:"..shelf.Seed..":"..slot,slot=tonumber(slot),
                     seed=shelf.Seed,id=id,stock=offer.Stock,before=amount(c.data,"Misc",id),cost=cost,value=value}
             end
         end
     end
-    return best
+    if best then return best end
+    if reserved>0 then
+        return nil,("Đang dành %s xu cho nhà cấp %d. Tắt Auto Upgrade House nếu muốn dùng số xu này mua decor.")
+            :format(tostring(reserve),c.level+1)
+    end
+    if missing==0 or inStock==0 then return nil,"Không có decor còn thiếu và còn hàng để mua." end
+    if affordable==0 then return nil,"Chưa đủ xu mua decor còn thiếu." end
+    return nil,"Chưa có decor phù hợp để mua."
 end
 local function merchantStep(c)
     local flag="EventStoreAutoMerchant"
@@ -502,8 +516,9 @@ local function merchantStep(c)
         report("merchant","Đang chờ danh sách hàng và seed do game gửi.")
         return moved
     end
-    local choice=merchantChoice(c,shelf)
-    if not choice then controller.nextOffers=os.clock()+3;return false end
+    local choice,reason=merchantChoice(c,shelf)
+    if not choice then controller.nextOffers=os.clock()+3;report("merchant",reason);return false end
+    report("merchant",nil)
     return dispatch(c,flag,choice,function(f)
         return f.api.network.Invoke("Merchant_RequestPurchase","MysteryStoreDecorMerchant",choice.slot,false,choice.seed)
     end,function(f)
