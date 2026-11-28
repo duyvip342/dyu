@@ -398,24 +398,24 @@ local function combineStep(c)
 end
 
 -- ============================================================================
--- [MS-STOCK] Giữ khóa bán loại có reserve; còn lại unlock. Không sửa CanStock.
+-- [MS-STOCK] Luôn mở khóa bán; keepBoxes chỉ giới hạn ghép. Không sửa CanStock.
 local function stockStep(c)
     local flag="EventStoreAutoStock"
     if not enabled(flag) then return false end
     if enabled("EventStoreAutoCombine") and combineChoice(c) then return false end
     for rung=c.api.definitions.LOCKABLE_FROM,c.api.boxes.Count() do
         local box=c.api.boxes.Box(rung)
-        local locked=(boxKeep[box.Id] or 0)>0
+        local locked=false
         if c.api.definitions.BoxLocked(c.own.BoxLocks,rung)~=locked then
             return dispatch(c,flag,{kind="unlock",key="boxlock:"..rung..":"..tostring(locked),rung=rung,locked=locked},
                 function(f)return f.plot:Invoke(f.api.definitions.NET.LockBox,rung,locked)end,
-                function()return ((boxKeep[box.Id] or 0)>0)==locked end)
+                function()return true end)
         end
     end
     if c.api.pad.BoothFull() or os.clock()<(controller.nextStock or 0) then return false end
     local count=0
     for _,item in pairs(inventory(c.data,"Lootbox")) do
-        if not item._lk and c.api.boxes.Index(item.id) and (boxKeep[item.id] or 0)==0 then count+=item._am or 1 end
+        if not item._lk and c.api.boxes.Index(item.id) then count+=item._am or 1 end
     end
     if count==0 then return false end
     local pad=c.model:FindFirstChild("StockPad")
